@@ -1,0 +1,9 @@
+bin/
+obj/
+.artifacts/
+TestResults/
+.venv/
+spikes/**/data/
+spikes/**/models/
+*.user
+spikes/**/onnx_model/
