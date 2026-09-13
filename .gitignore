@@ -9,3 +9,8 @@ spikes/**/models/
 spikes/**/onnx_model/
 data/
 /appsettings.json
+dev/**/*
+
+appsettings.Development.json
+
+.zed/
