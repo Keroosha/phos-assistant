@@ -49,13 +49,13 @@ module Transport =
     /// Maps WTelegramClient config keys to credentials. Only the four keys a bot
     /// needs are answered; phone/code/2FA keys return `null` and are never
     /// requested, so a bot-only login never enters the user auth flow.
-    let configProvider (config: TelegramConfig) (key: string) : string =
+    let configProvider (config: TelegramConfig) (key: string) : string | null =
         match key with
         | "api_id" -> config.ApiId.ToString()
         | "api_hash" -> config.ApiHash
         | "bot_token" -> config.BotToken
         | "session_pathname" -> config.SessionPath
-        | _ -> Unchecked.defaultof<string>
+        | _ -> null
 
     /// Sets a Unix file mode on a path, ignoring failures (e.g. non-POSIX FS).
     let private setUnixMode (path: string) (mode: UnixFileMode) : unit =
@@ -65,7 +65,7 @@ module Transport =
             ()
 
     /// Creates the session directory (0700) for the given session path.
-    let ensureSessionDir (sessionPath: string) : unit =
+    let ensureSessionDir (sessionPath: string | null) : unit =
         match Path.GetDirectoryName(sessionPath) with
         | null -> ()
         | "" -> ()

@@ -18,8 +18,16 @@ type TelegramTransport(config: TelegramConfig) =
     let peers = PeerCache()
 
     let client: WTelegram.Client =
+        // `configProvider` returns `string | null`; a null result means "not
+        // configured" to WTelegramClient. phone/code/2FA keys are never answered,
+        // so null must cross the interop boundary untouched.
         new WTelegram.Client(
-            Func<string, string>(fun key -> Transport.configProvider config key),
+            Func<string, string>(fun key ->
+                match Transport.configProvider config key with
+                | null -> Unchecked.defaultof<string>
+                | s -> s),
+            // No in-memory session key: the session file is located via the
+            // `session_pathname` config key, and no save callback is needed.
             Unchecked.defaultof<byte[]>,
             Unchecked.defaultof<Action<byte[]>>
         )

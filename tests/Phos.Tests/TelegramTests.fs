@@ -129,10 +129,9 @@ type FakeTransport() =
 // ---------------------------------------------------------------------------
 
 // The WTelegramClient config callback must return `null` for unknown keys
-// (phone/code/2FA are never configured for a bot login), so this test compares
-// against null and suppresses the F# nullness warning for that interop case.
-#nowarn "3261"
-
+// (phone/code/2FA are never configured for a bot login), so this test asserts
+// that `configProvider` returns null for them. `configProvider` is annotated
+// `string | null`, so the null comparison is nullness-safe.
 [<Fact>]
 let ``login config provider only answers the four bot keys`` () =
     let config =
@@ -148,12 +147,10 @@ let ``login config provider only answers the four bot keys`` () =
     Transport.configProvider config "session_pathname"
     |> should equal "/tmp/phos.session"
 
-    (Transport.configProvider config "phone" :> obj) |> isNull |> should be True
-    (Transport.configProvider config "code" :> obj) |> isNull |> should be True
-    (Transport.configProvider config "password" :> obj) |> isNull |> should be True
-    (Transport.configProvider config "2fa" :> obj) |> isNull |> should be True
-
-#warnon "3261"
+    Transport.configProvider config "phone" |> isNull |> should be True
+    Transport.configProvider config "code" |> isNull |> should be True
+    Transport.configProvider config "password" |> isNull |> should be True
+    Transport.configProvider config "2fa" |> isNull |> should be True
 
 // ---------------------------------------------------------------------------
 // Update handler
@@ -984,14 +981,10 @@ let ``ensureSessionDir creates the session directory`` () =
     finally
         deleteDir dir
 
-#nowarn "3261" // session path may be null
-
 [<Fact>]
 let ``ensureSessionDir handles null and dirless paths`` () =
     Transport.ensureSessionDir null
     Transport.ensureSessionDir "bot.session"
-
-#warnon "3261"
 
 [<Fact>]
 let ``secureSessionFile sets the mode without throwing`` () =
@@ -1222,8 +1215,6 @@ let ``update model maps an opus voice message`` () =
     mapped |> Option.isSome |> should be True
     mapped.Value.Voice |> Option.isSome |> should be True
 
-#nowarn "3261" // WTelegramClient fields may be null in the interop layer
-
 [<Fact>]
 let ``update model treats a null mime type as non-voice`` () =
     let peer = TL.PeerUser()
@@ -1233,6 +1224,8 @@ let ``update model treats a null mime type as non-voice`` () =
     from.user_id <- 1L
 
     let doc = TL.Document()
+    // `mime_type` is an external WTelegramClient property; the interop type is
+    // unannotated so a literal null is accepted without a nullness warning.
     doc.mime_type <- null
     doc.access_hash <- 3L
 
@@ -1261,13 +1254,13 @@ let ``update model maps a null message text to None`` () =
     m.id <- 91
     m.peer_id <- peer
     m.from_id <- from
+    // `message` is an external WTelegramClient property; the interop type is
+    // unannotated so a literal null is accepted without a nullness warning.
     m.message <- null
 
     let mapped = UpdateModel.tryMapMessage m
     mapped |> Option.isSome |> should be True
     mapped.Value.Text |> should equal None
-
-#warnon "3261"
 
 [<Fact>]
 let ``extractBotInfo handles a user without a username`` () =
