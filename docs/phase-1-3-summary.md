@@ -45,6 +45,30 @@
 - `ToolPolicy.rank`: `[<MethodImpl(NoInlining)>]` — иначе F# инлайнит match и coverlet атрибутирует ветки 0% на определении (артефакт).
 - Удалены мёртвые ветки: `OutboxDelivery` idempotency-guard (NextPending не возвращает Sent), `UpdateDedupe` null-ветка (инвариант capacity ≥ 1).
 
+## Хардненинг (2026-09-13): Nullable, FluentMigrator, high-perf logging, suppressions
+
+Работа — 3 параллельных саб-агента в отдельных worktree-ветках (`feat/nullable-f9`, `feat/logging-hp`, `feat/migrations-fluent`), смёржены в `feat/phases-1-3`. `bash scripts/ci.sh` → **EXIT 0** (157 тестов, 0 warnings, gate PASS: total line 97.8% / branch 94.3%; Core 94.6%, Storage 94.4%, Telegram 93.7%).
+
+### F# 9 nullability (док: null-values#null-values-starting-with-f-9)
+- `<Nullable>enable</Nullable>` → `--checknulls+` подтверждён эмпирически (probe: `let bad (s: string) : string = null` → FS3261 = ошибка; SDK-маппинг не документирован, но работает).
+- `Transport.configProvider` → возврат `string | null` (неизвестный ключ → `null`), `Transport.ensureSessionDir` → параметр `string | null` — по аннотациям F# 9.
+- `TelegramTransport`: явный мост `Func<string,string>` (`match ... | null -> Unchecked.defaultof<string> | s -> s`) — null обязан пересечь границу (WTelegramClient трактует null как «не настроено»; phone/code/2FA не отвечаются).
+- **Удалены все in-place suppressions**: 3 пары `#nowarn "3261"`/`#warnon "3261"` в TelegramTests.fs и `fsharplint:disable-next-line FL0095` в StorageExecutor.fs (последний — переходом на `IDisposable`: dispose чисто синхронный, асинхронности нет). NoWarn-конфиг не понадобился.
+- Оставшиеся `Unchecked.defaultof` — только с комментариями-обоснованиями (мост `Func`, `byte[]`/`Action` ctor-аргументы WTelegram.Client, out-param `Dictionary.TryGetValue` в UpdateDedupe).
+
+### FluentMigrator (v8.0.1)
+- Ручной `Schema.migrate`/`Migration`-record удалён (чистый cutover). Вместо него — 6 классов `[<Migration(1..6)>]` (F#), те же таблицы/колонки/UNIQUE-семантика; composite UNIQUE/составные PK — уникальные индексы (SQLite не даёт ALTER TABLE для table-level constraint).
+- API: `Schema.run/migrateUp/migrateDown (options: StorageOptions)`; runner-соединения — `Foreign Keys=True` + `DefaultTimeout=BusyTimeout` (паритет с executor); WAL ставится `StorageExecutor.Create`.
+- Тесты миграций адаптированы (Fresh/Replay/Empty+Partial) + новый rollback-тест `migrate down rolls back the schema executing every Down` (покрывает `Down()`).
+
+### High-performance logging (док: high-performance-logging)
+- `[LoggerMessage]` source generator требует C#-partial-методов — в F# недоступен; выбран документированный high-perf путь для F#: кэшированные `LoggerMessage.Define<T...>`-делегаты (шаблон парсится один раз, аргументы боксируются только при активном sink).
+- `src/Phos.Telegram/PhosLog.fs`: `sentOutbox` (Info, EventId 1), `floodWait` (Warning, EventId 2), `deliveryFailed` (Warning, EventId 3, с реальным исключением).
+- `OutboxDelivery` ctor: `log: string -> unit` → `ILogger`; sprintf-логи заменены; тест `flood wait logs a warning event 2 with the wait seconds` (capturing ILogger).
+
+### Инструменты
+- `scripts/ci.sh`: добавлена очистка `tests/*/TestResults` перед прогоном — ранее stale XML от частичных прогонов суммировались гейтом (неидемпотентный CI; поймано на интеграции: 8266 строк = 2 XML).
+
 ## Открытые пункты (не блокеры фазы)
 
 1. Реальные Telegram-тесты (`/start` → `/ping` на живом боте, voice через MTProto) — **integration/nightly** по v2 §2.8; fast CI — fake transport.

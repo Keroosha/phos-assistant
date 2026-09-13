@@ -20,6 +20,8 @@ type UpdateDedupe(capacity: int) =
     /// `false` when it is a duplicate.
     member _.TryAdd(updateId: int64) : bool =
         lock gate (fun () ->
+            // Unchecked.defaultof: F# out-param placeholder for Dictionary.TryGetValue;
+            // the value is only read when TryGetValue returns true (non-null).
             let mutable node = Unchecked.defaultof<LinkedListNode<int64>>
 
             if cache.TryGetValue(updateId, &node) then
