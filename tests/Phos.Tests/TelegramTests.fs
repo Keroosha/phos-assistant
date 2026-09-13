@@ -6,6 +6,8 @@ open System.Threading
 open System.Threading.Tasks
 open Xunit
 open FsUnit.Xunit
+open Microsoft.Extensions.Logging
+open Microsoft.Extensions.Logging.Abstractions
 open Phos.Core.DomainTypes
 open Phos.Core.Whitelist
 open Phos.Core.Chunker
@@ -123,6 +125,27 @@ type FakeTransport() =
 
         member _.EditMessage _ _ _ _ = Task.FromResult(())
         member _.DownloadVoice _ = task { return voiceBytes }
+
+/// Capturing ILogger that records (level, eventId, message) for each log call.
+type CapturingLogger() =
+    let entries = ResizeArray<LogLevel * EventId * string>()
+
+    member _.Entries = List.ofSeq entries
+
+    interface ILogger with
+        member _.Log<'TState>
+            (
+                logLevel: LogLevel,
+                eventId: EventId,
+                state: 'TState,
+                ex: Exception | null,
+                formatter: Func<'TState, Exception | null, string>
+            ) : unit =
+            entries.Add(logLevel, eventId, formatter.Invoke(state, ex))
+
+        member _.IsEnabled(_: LogLevel) : bool = true
+
+        member _.BeginScope<'TState when 'TState: not null>(_: 'TState) : IDisposable | null = null
 
 // ---------------------------------------------------------------------------
 // Login contract
@@ -329,7 +352,7 @@ let ``ping is accepted and pong is delivered with the same random id`` () =
                 let e = entry.Value
 
                 let transport = FakeTransport()
-                let delivery = OutboxDelivery(outbox, transport, ignore)
+                let delivery = OutboxDelivery(outbox, transport, NullLogger.Instance)
                 let! processed = delivery.DeliverOnceAsync(CancellationToken.None)
                 processed |> should be True
 
@@ -480,7 +503,7 @@ let ``outbox retry after failure keeps the same random id`` () =
 
                 let transport = FakeTransport()
                 transport.FailNext 1
-                let delivery = OutboxDelivery(outbox, transport, ignore)
+                let delivery = OutboxDelivery(outbox, transport, NullLogger.Instance)
                 let! _ = delivery.DeliverOnceAsync(CancellationToken.None)
                 let! _ = delivery.DeliverOnceAsync(CancellationToken.None)
 
@@ -511,7 +534,7 @@ let ``flood wait retries later with the same random id`` () =
 
                 let transport = FakeTransport()
                 transport.FloodNext 1
-                let delivery = OutboxDelivery(outbox, transport, ignore)
+                let delivery = OutboxDelivery(outbox, transport, NullLogger.Instance)
                 let! _ = delivery.DeliverOnceAsync(CancellationToken.None)
                 let! _ = delivery.DeliverOnceAsync(CancellationToken.None)
 
@@ -521,6 +544,42 @@ let ``flood wait retries later with the same random id`` () =
                 let! sent = outbox.GetByRandomId 888L
                 sent |> Option.isSome |> should be True
                 sent.Value.Status |> should equal Out.Sent
+            finally
+                dispose exec
+        }
+    finally
+        deleteDir dir
+
+[<Fact>]
+let ``flood wait logs a warning event 2 with the wait seconds`` () =
+    let dir = makeTempDir ()
+    let dbPath = Path.Combine(dir, "phos.db")
+
+    try
+        task {
+            let exec = createExecutor dbPath
+
+            try
+                let _, outbox, _ = mkRepos exec
+                let! _ = outbox.Insert 1L 0 testChat.Id 888L "hello"
+                let! entry = outbox.NextPending()
+                let e = entry.Value
+
+                let transport = FakeTransport()
+                transport.FloodMessage <- "FLOOD_WAIT_1"
+                transport.FloodNext 1
+                let logger = CapturingLogger()
+                let delivery = OutboxDelivery(outbox, transport, logger)
+                let! _ = delivery.DeliverOnceAsync(CancellationToken.None)
+
+                logger.Entries |> should haveLength 1
+                let level, eventId, message = logger.Entries.[0]
+                level |> should equal LogLevel.Warning
+                eventId.Id |> should equal 2
+                eventId.Name |> should equal "FloodWait"
+                message.Contains("Flood/Slowmode wait 1s") |> should be True
+                message.Contains(string e.Id) |> should be True
+                message.Contains(string e.RandomId) |> should be True
             finally
                 dispose exec
         }
@@ -542,7 +601,7 @@ let ``slowmode wait also retries later with the same random id`` () =
 
                 let transport = FakeTransport()
                 transport.SlowmodeNext 1
-                let delivery = OutboxDelivery(outbox, transport, ignore)
+                let delivery = OutboxDelivery(outbox, transport, NullLogger.Instance)
                 let! _ = delivery.DeliverOnceAsync(CancellationToken.None)
                 let! _ = delivery.DeliverOnceAsync(CancellationToken.None)
 
@@ -574,7 +633,7 @@ let ``flood wait without underscore is retried with the same random id`` () =
                 let transport = FakeTransport()
                 transport.FloodMessage <- "FLOOD_WAIT5"
                 transport.FloodNext 1
-                let delivery = OutboxDelivery(outbox, transport, ignore)
+                let delivery = OutboxDelivery(outbox, transport, NullLogger.Instance)
                 let! _ = delivery.DeliverOnceAsync(CancellationToken.None)
                 let! _ = delivery.DeliverOnceAsync(CancellationToken.None)
 
@@ -601,7 +660,7 @@ let ``deliver once returns false when outbox is empty`` () =
             try
                 let _, outbox, _ = mkRepos exec
                 let transport = FakeTransport()
-                let delivery = OutboxDelivery(outbox, transport, ignore)
+                let delivery = OutboxDelivery(outbox, transport, NullLogger.Instance)
                 let! processed = delivery.DeliverOnceAsync(CancellationToken.None)
                 processed |> should be False
             finally
@@ -624,7 +683,7 @@ let ``run async delivers a pending entry until cancelled`` () =
                 let! _ = outbox.Insert 1L 0 testChat.Id 999L "hello"
 
                 let transport = FakeTransport()
-                let delivery = OutboxDelivery(outbox, transport, ignore)
+                let delivery = OutboxDelivery(outbox, transport, NullLogger.Instance)
 
                 use cts = new CancellationTokenSource()
                 let runTask = delivery.RunAsync(cts.Token)
@@ -660,7 +719,7 @@ let ``run async with no pending entries stops on cancellation`` () =
             try
                 let _, outbox, _ = mkRepos exec
                 let transport = FakeTransport()
-                let delivery = OutboxDelivery(outbox, transport, ignore)
+                let delivery = OutboxDelivery(outbox, transport, NullLogger.Instance)
 
                 use cts = new CancellationTokenSource()
                 let runTask = delivery.RunAsync(cts.Token)
@@ -691,7 +750,7 @@ let ``run async exits immediately when already cancelled`` () =
             try
                 let _, outbox, _ = mkRepos exec
                 let transport = FakeTransport()
-                let delivery = OutboxDelivery(outbox, transport, ignore)
+                let delivery = OutboxDelivery(outbox, transport, NullLogger.Instance)
 
                 use cts = new CancellationTokenSource()
                 cts.Cancel()
