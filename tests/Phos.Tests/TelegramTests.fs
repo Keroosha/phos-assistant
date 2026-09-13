@@ -823,6 +823,57 @@ let ``update model maps a text message`` () =
     mapped.Value.From.Id |> should equal (UserId 1L)
 
 [<Fact>]
+let ``update model derives sender from peer when from_id is missing in private chat`` () =
+    // Telegram omits from_id for private-chat messages: peer_id is the sender.
+    let peer = TL.PeerUser()
+    peer.user_id <- 393314434L
+
+    let m = TL.Message()
+    m.id <- 50
+    m.peer_id <- peer
+    m.from_id <- null
+    m.message <- "/ping"
+
+    let mapped = UpdateModel.tryMapMessage m
+    mapped |> Option.isSome |> should be True
+    mapped.Value.Text |> should equal (Some "/ping")
+    mapped.Value.Chat.Kind |> should equal Private
+    mapped.Value.Chat.Id |> should equal (ChatId 393314434L)
+    mapped.Value.From.Id |> should equal (UserId 393314434L)
+
+[<Fact>]
+let ``update model prefers from_id over peer in private chat`` () =
+    let peer = TL.PeerUser()
+    peer.user_id <- 1L
+
+    let from = TL.PeerUser()
+    from.user_id <- 2L
+
+    let m = TL.Message()
+    m.id <- 51
+    m.peer_id <- peer
+    m.from_id <- from
+    m.message <- "forwarded"
+
+    let mapped = UpdateModel.tryMapMessage m
+    mapped |> Option.isSome |> should be True
+    mapped.Value.From.Id |> should equal (UserId 2L)
+
+[<Fact>]
+let ``update model drops group message without from_id`` () =
+    let peer = TL.PeerChat()
+    peer.chat_id <- 7L
+
+    let m = TL.Message()
+    m.id <- 52
+    m.peer_id <- peer
+    m.from_id <- null
+    m.message <- "anon"
+
+    let mapped = UpdateModel.tryMapMessage m
+    mapped |> Option.isNone |> should be True
+
+[<Fact>]
 let ``update model maps a voice message`` () =
     let peer = TL.PeerUser()
     peer.user_id <- 1L
@@ -1207,9 +1258,9 @@ let ``update model maps a channel chat`` () =
     mapped.Value.Chat.Id |> should equal (ChatId 8L)
 
 [<Fact>]
-let ``update model ignores messages with a non-user sender`` () =
-    let peer = TL.PeerUser()
-    peer.user_id <- 1L
+let ``update model ignores non-user senders in group chats`` () =
+    let peer = TL.PeerChat()
+    peer.chat_id <- 7L
 
     let from = TL.PeerChannel()
     from.channel_id <- 9L

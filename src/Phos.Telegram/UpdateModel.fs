@@ -63,9 +63,18 @@ module UpdateModel =
     /// the bot can act on. Service messages and channel posts are ignored.
     let tryMapMessage (message: TL.MessageBase) : IncomingUpdate option =
         match message with
-        | :? TL.Message as m when not (isNull m.peer_id) && not (isNull m.from_id) ->
+        | :? TL.Message as m when not (isNull m.peer_id) ->
             let chat = peerToChat m.peer_id
-            let fromId = peerToUserId m.from_id
+
+            // Telegram omits `from_id` for private-chat messages: the `peer_id`
+            // IS the sender. Groups/channels keep `from_id` when a user sends.
+            let fromId =
+                match peerToUserId m.from_id with
+                | Some uid -> Some uid
+                | None ->
+                    match chat with
+                    | Some { Id = ChatId uid; Kind = Private } -> Some(UserId uid)
+                    | _ -> None
 
             match chat, fromId with
             | Some chat, Some uid ->
