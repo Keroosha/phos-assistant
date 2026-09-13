@@ -4,6 +4,7 @@ open System
 open System.Text.RegularExpressions
 open System.Threading
 open System.Threading.Tasks
+open Microsoft.Extensions.Logging
 open Phos.Storage
 
 /// Delivers messages from the transactional outbox via the transport.
@@ -13,7 +14,7 @@ open Phos.Storage
 /// the SAME `random_id` (never a new message); on any other error the entry is
 /// marked failed with attempts+1. Before sending, `GetByRandomId` guards against
 /// re-sending a `random_id` that is already sent/sending.
-type OutboxDelivery(outbox: IMessageOutbox, transport: ITelegramTransport, log: string -> unit) =
+type OutboxDelivery(outbox: IMessageOutbox, transport: ITelegramTransport, logger: ILogger) =
     let tryFloodWaitSeconds (ex: exn) : int option =
         let m = Regex.Match(ex.Message, "(?:FLOOD_WAIT|SLOWMODE_WAIT)_?(\d+)")
 
@@ -42,7 +43,7 @@ type OutboxDelivery(outbox: IMessageOutbox, transport: ITelegramTransport, log: 
                 try
                     let! result = transport.SendMessage target
                     do! outbox.MarkSent entry.Id result.RemoteMessageId
-                    log (sprintf "sent outbox %d (random_id %d)" entry.Id entry.RandomId)
+                    PhosLog.sentOutbox.Invoke(logger, entry.Id, entry.RandomId, null)
                     return true
                 with ex ->
                     match tryFloodWaitSeconds ex with
@@ -52,12 +53,12 @@ type OutboxDelivery(outbox: IMessageOutbox, transport: ITelegramTransport, log: 
                         // not create a second message.
                         do! outbox.MarkFailed entry.Id
                         do! outbox.Retry entry.Id
-                        log (sprintf "flood wait %ds for outbox %d (random_id %d)" seconds entry.Id entry.RandomId)
+                        PhosLog.floodWait.Invoke(logger, seconds, entry.Id, entry.RandomId, null)
                         do! Task.Delay(TimeSpan.FromSeconds(float seconds), ct)
                         return true
                     | None ->
                         do! outbox.MarkFailed entry.Id
-                        log (sprintf "outbox %d failed: %s" entry.Id ex.Message)
+                        PhosLog.deliveryFailed.Invoke(logger, entry.Id, ex.Message, ex)
                         return true
         }
 

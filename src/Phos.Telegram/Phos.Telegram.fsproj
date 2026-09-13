@@ -12,11 +12,13 @@
     <Compile Include="UpdateDedupe.fs" />
     <Compile Include="EntitySend.fs" />
     <Compile Include="UpdateHandler.fs" />
+    <Compile Include="PhosLog.fs" />
     <Compile Include="OutboxDelivery.fs" />
   </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="FSharp.Core" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
     <PackageReference Include="WTelegramClient" />
   </ItemGroup>
 
