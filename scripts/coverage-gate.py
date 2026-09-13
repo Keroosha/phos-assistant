@@ -39,7 +39,7 @@ class Project:
 def src_dir_of(filename: str, src_root: str) -> str | None:
     """Map a source file path to its project directory under src_root."""
     normalized = filename.replace("\\", "/")
-    marker = f"{src_root}/"
+    marker = f"/{src_root}/"
     idx = normalized.find(marker)
     if idx < 0:
         return None
@@ -49,14 +49,34 @@ def src_dir_of(filename: str, src_root: str) -> str | None:
     return parts[0] if parts else None
 
 
+def resolve_class_path(sources: list[str], filename: str, src_root: str) -> str:
+    """Resolve a Cobertura class filename to a path containing src_root.
+
+    Coverlet emits filenames relative to each `<sources>` entry (e.g.
+    ``OutboxStateMachine.fs`` with ``<source>/abs/src/Phos.Core/</source>``),
+    not repo-root-relative paths. Join with every source entry and pick the
+    first candidate that lands under ``src_root``; absolute/root-relative
+    filenames are used as-is.
+    """
+    normalized = filename.replace("\\", "/")
+    if f"/{src_root}/" in normalized:
+        return normalized
+    for source in sources:
+        candidate = os.path.join(source, filename).replace("\\", "/")
+        if f"/{src_root}/" in candidate:
+            return candidate
+    return os.path.join(sources[0], filename) if sources else filename
+
+
 def collect(xml_path: str, src_root: str) -> dict[str, Project]:
     tree = ET.parse(xml_path)
     root = tree.getroot()
+    sources = [s.text or "" for s in root.iter("source")]
     projects: dict[str, Project] = {}
     for package in root.iter("package"):
         for cls in package.iter("class"):
             filename = cls.get("filename", "")
-            proj_dir = src_dir_of(filename, src_root)
+            proj_dir = src_dir_of(resolve_class_path(sources, filename, src_root), src_root)
             if proj_dir is None:
                 continue
             proj = projects.setdefault(proj_dir, Project(proj_dir))
@@ -66,7 +86,9 @@ def collect(xml_path: str, src_root: str) -> dict[str, Project]:
             branch_rate = float(cls.get("branch-rate", "0"))
             for line in cls.iter("line"):
                 line_count += 1
-                if line.get("branch") == "true":
+                # Coverlet writes the attribute capitalized ("True"/"False");
+                # the Cobertura spec uses lowercase.
+                if (line.get("branch") or "false").lower() == "true":
                     branch_count += 1
             proj.lines += line_count
             proj.lines_covered += line_rate * line_count

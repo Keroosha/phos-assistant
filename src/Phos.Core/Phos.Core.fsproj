@@ -5,8 +5,20 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="FSharp.Core" />
+    <Compile Include="DomainTypes.fs" />
+    <Compile Include="Whitelist.fs" />
+    <Compile Include="ToolPolicy.fs" />
+    <Compile Include="PromptBudget.fs" />
+    <Compile Include="Chunker.fs" />
+    <Compile Include="Rrf.fs" />
+    <Compile Include="SchedulePolicy.fs" />
+    <Compile Include="InboxStateMachine.fs" />
+    <Compile Include="OutboxStateMachine.fs" />
   </ItemGroup>
 
+  <ItemGroup>
+    <PackageReference Include="FSharp.Core" />
+    <PackageReference Include="Cronos" />
+  </ItemGroup>
 
 </Project>
