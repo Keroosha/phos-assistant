@@ -9,7 +9,7 @@
 
 ## 0. Итог аудита
 
-**Решение:** OMP — это готовый Claude-Code-класс харнесс с in-process SDK (Bun/TS) и кросс-языковым RPC-режимом (JSONL over stdio). Для F#-хоста правильная граница — RPC: `omp --mode rpc`, child process на пользователя, host tools (`set_host_tools`) и host URI schemes (`set_host_uri_schemes`) как мост к Telegram. Устанавливаемый OMP 18.1.19 == npm `@oh-my-pi/pi-coding-agent@18.1.19` (проверено: registry + `omp --version`).
+**Решение:** OMP — это готовый Claude-Code-класс харнесс с in-process SDK (Bun/TS) и кросс-языковым RPC-режимом (JSONL over stdio). Для F#-хоста правильная граница — RPC: `omp --mode rpc`, **один профиль `phos` на всех** + per-user workspace (cwd) для изоляции сессий/памяти/персональности, host tools (`set_host_tools`) и host URI schemes (`set_host_uri_schemes`) как мост к Telegram. Устанавливаемый OMP 18.1.19 == npm `@oh-my-pi/pi-coding-agent@18.1.19` (проверено: registry + `omp --version`).
 
 Что **переезжает в OMP** (не пишем сами):
 
@@ -18,7 +18,7 @@
 | LLM-слой: agent loop, tool calling, streaming, retry, compaction | OMP (провайдер vanbukin/DeepSeek уже настроен в `~/.omp/profiles/deepseek`) |
 | MCP-клиент + OAuth (ModelContextProtocol, RFC 9728/8414/8707/9207) | OMP: `mcp.json` (stdio/http/sse), `/mcp list/add/reload/test/reauth`, хранилище кредов в `agent.db` |
 | Память: SQLite FTS5 + multilingual-e5 + RRF | OMP memory backend (`mnemopi` — локальный SQLite, tools `recall`/`retain`/`reflect`/`memory_edit`; `local` — сводки) |
-| Persona/skills движок | OMP: `PERSONALITY.md`, `SYSTEM.md`/`APPEND_SYSTEM.md`, `skills/`, `--profile` на пользователя |
+| Persona/skills движок | OMP: `PERSONALITY.md` (общий), `SYSTEM.md`/`APPEND_SYSTEM.md`, `skills/`; per-user через workspace (cwd) |
 | Per-chat coordinator, fair dispatcher, mailbox pipeline | OMP сессия (file-backed) + простой host-роутер user → RPC-процесс |
 | Пишущая сторона агента (edit/write/bash) | По умолчанию **отключена** (`--tools read,grep,glob,web_search`); мутирующие тулзы — per-user opt-in |
 
@@ -28,7 +28,7 @@
 - STT голосовых (OMP `app.stt` — терминальный push-to-talk, файлы не транскрибирует);
 - scheduler (Cronos + durable registry);
 - durable inbox/outbox + crash-семантика доставки;
-- бэкапы (включая данные OMP: профили, сессии, память);
+- бэкапы (включая данные OMP: профиль, сессии, память);
 - секреты (bot token, API key провайдера), F# quality gates.
 
 **Зафиксированный scope:** личный проект с доверенным провайдером и конфигурируемым whitelist. In-app consent/privacy flow не реализуется.
@@ -51,10 +51,10 @@
 |---|---|---|---|
 | Host runtime | F# на .NET 10, Generic Host | SDK фиксируется `global.json` | [OK] |
 | Telegram | Прямой MTProto bot login | WTelegramClient 4.4.8, MIT | [OK] |
-| Агент | OMP 18.1.19, `--mode rpc`, per-user `--profile` | `omp` (установлен; npm `@oh-my-pi/pi-coding-agent@18.1.19`) | [SPIKE] F# RPC-клиент |
+| Агент | OMP 18.1.19, `--mode rpc`, один профиль `phos` + per-user workspace (cwd) | `omp` (установлен; npm `@oh-my-pi/pi-coding-agent@18.1.19`) | [SPIKE] F# RPC-клиент |
 | LLM | Провайдер vanbukin (openai-completions, tools, 500k ctx) | `models.yml` + `.env` в OMP-профиле | [OK] — конфиг переносится |
 | MCP | OMP встроенный (stdio/http/sse, OAuth) | — | [OK] + phos HTTPS-прокси OAuth-колбэка |
-| Память | OMP `memory.backend: mnemopi` | локальный SQLite, per agent dir | [OK] |
+| Память | OMP `memory.backend: mnemopi`, `scoping: per-project` | локальный SQLite, банк из cwd → per-user | [OK] |
 | Голос | GigaAM v3 CTC int8 + Whisper fallback | sherpa-onnx 1.13.8; Whisper.net 1.9.1 | [SPIKE] benchmark |
 | Admission/queue | SQLite `command_inbox`/`message_outbox` (упрощённый) | Microsoft.Data.Sqlite 10.x | [OK] |
 | Расписание | Cronos + собственный durable registry | Cronos 0.13.0, MIT | [OK] |
@@ -167,50 +167,58 @@ SDK `@oh-my-pi/pi-coding-agent` (`createAgentSession()` → `session.prompt()` �
 
 ```bash
 omp --mode rpc \
-    --profile tg-<user_id> \        # изолированный профиль: auth, sessions, settings, caches
-    --session-dir ~/.phos/sessions/<user_id> \
+    --profile phos \                # один профиль на всех: auth, settings, caches
     --tools read,grep,glob,web_search \  # allowlist; мутирующие тулзы по умолчанию выключены
     --approval-mode yolo            # или always-ask/write; policy решает host
     --max-time 1h                   # сторожевой таймер
+# cwd процесса = ~/.phos/workspace/<user_id> — из него выводятся сессия, проект-конфиг и банк памяти
 ```
 
 - `--resume <id|path>` / `--continue` — восстановить сессию пользователя после рестарта.
 - `--no-session` — эфемерная сессия (не для v1; персистентность нужна).
 - `--config <file>` — оверлей конфига; `--no-lsp` — LSP в v1 не нужен.
+- Session file по умолчанию выводится из cwd + agent dir — отдельный `--session-dir` не нужен при per-user workspace.
 
-#### Per-user архитектура
+#### Per-user архитектура (один профиль, изоляция через workspace)
 
-- **Профиль на пользователя**: `omp --profile tg-<uid>` → `~/.omp/profiles/tg-<uid>/agent/` (свои `models.yml`, `.env`, `PERSONALITY.md`, `SYSTEM.md`, `skills/`, `mcp.json`, память, сессии). Провижининг: шаблон `~/.omp/profiles/phos-template/` копируется при первом контакте пользователя; API-key провайдера — общий, из systemd credential в `.env` шаблона.
-- **Рабочая директория на пользователя**: `~/.phos/workspace/<uid>/` (cwd OMP-процесса) — проектный `mcp.json`, контекст-файлы, AGENTS.md per-user.
-- **Idle-политика**: процесс живёт, пока есть активный turn; по таймауту (настраиваемый, например 30 мин) — SIGTERM, при следующем сообщении — respawn с `--resume`.
-- Альтернатива «один процесс на всех» отклонена: persona/skills/память/MCP живут в профиле, а не в сессии — общий процесс не даёт изоляции.
+- **Один профиль на всех**: `omp --profile phos` → `~/.omp/profiles/phos/agent/` — общие креды (`models.yml`, `.env`), базовые настройки, общий `PERSONALITY.md` (пресет), user-level `mcp.json`, память (`mnemopi`). Провижининг — однократный, при установке phos.
+- **Per-user изоляция — через cwd (workspace)**: `~/.phos/workspace/<uid>/` как рабочая директория процесса:
+  - сессия (session file выводится из cwd) — отдельный разговор на пользователя;
+  - проект-скоуп конфиг: `.omp/SYSTEM.md` / `APPEND_SYSTEM.md` (персональность), `.omp/skills/` (навыки), `.omp/mcp.json` (MCP), `AGENTS.md` и context files;
+  - память: `mnemopi.scoping: per-project` (default) — банк выводится из cwd (basename + стабильный hash abs path) → **автоматически per-user**; `per-project-tagged` — общий глобальный банк + per-user.
+- **Процесс**: один RPC-процесс на пользователя (сессия OMP = один разговор); spawn/respawn с `--resume`; idle-политика: процесс живёт, пока есть активный turn; по таймауту (настраиваемый, например 30 мин) — SIGTERM, при следующем сообщении — respawn с `--resume`.
+- Альтернатива «один процесс на всех» отклонена: сессия OMP = один разговор; общий процесс смешивает пользователей. Если per-user persona/память не нужны — можно свести к одному процессу (после измерений, см. риски).
 
-**Phase 0 spike подтверждает**: провижининг профиля из шаблона, `--resume` в RPC, `set_host_tools` roundtrip, событие `agent_end` с `isTerminal`, `/stop`.
+**Phase 0 spike подтверждает**: разовый провижининг профиля `phos`, изоляция workspace (сессии/банки памяти/проект-конфиг), `--resume` в RPC, `set_host_tools` roundtrip, событие `agent_end` с `isTerminal`, `/stop`.
 
 ### 2.3. Персональность и skills — OMP
 
 Три слоя v1 (persona → skills → per-user выбор) реализуются штатными механизмами OMP:
 
-- `PERSONALITY.md` в agent dir профиля — заменяет выбранный preset `personality` (default/friendly/pragmatic/none). Один файл = одна «персональность»; смена persona = запись файла + `new_session` (или respawn профиля).
-- `SYSTEM.md` / `APPEND_SYSTEM.md` — проект-первый, потом user (`<cwd>/.omp/`, `~/.omp/profiles/<name>/agent/`). `SYSTEM.md` заменяет дефолтный шаблон инструкций, но сохраняет context files/skills/rules; `APPEND_SYSTEM.md` — добавить к дефолтному.
-- `skills/` — `<root>/<skill>/SKILL.md` (нерекурсивно), metadata в system prompt + содержимое через `read skill://...`, `/skill:<name>`. Провайдеры: native `.omp`, managed (autolearn), claude/codex/agents и др.
-- Установка/изменение — только owner/admin, через phos (host пишет файлы профиля) или через OMP-сессию с разрешённым `write` (по policy). Навыки из сети не устанавливаются самим LLM без review — host-политика, не доверяем агенту.
+- `PERSONALITY.md` — **только agent dir профиля** (`~/.omp/profiles/phos/agent/PERSONALITY.md`), т.е. общий пресет для всех; смена базовой persona = запись файла + `new_session`. Per-user «персональность» — через проект-скоуп workspace:
+  - `.omp/SYSTEM.md` в `~/.phos/workspace/<uid>/` — полная замена шаблона инструкций (context files/skills/rules сохраняются);
+  - `.omp/APPEND_SYSTEM.md` — добавка к дефолтному промпту (меньше ломает харнесс-инструкции) — рекомендуемый путь для persona per-user;
+  - либо context file (`AGENTS.md`/`.omp/context.md`) с описанием persona.
+- `SYSTEM.md` / `APPEND_SYSTEM.md` — проект-первый, потом user (`<cwd>/.omp/`, `~/.omp/profiles/phos/agent/`). `SYSTEM.md` заменяет дефолтный шаблон инструкций, но сохраняет context files/skills/rules; `APPEND_SYSTEM.md` — добавить к дефолтному.
+- `skills/` — `<root>/<skill>/SKILL.md` (нерекурсивно), metadata в system prompt + содержимое через `read skill://...`, `/skill:<name>`. Провайдеры: native `.omp` (user = профиль, project = workspace), managed (autolearn), claude/codex/agents и др. Общие навыки — в профиле, per-user — в workspace.
+- Установка/изменение — только owner/admin, через phos (host пишет файлы профиля/workspace) или через OMP-сессию с разрешённым `write` (по policy). Навыки из сети не устанавливаются самим LLM без review — host-политика, не доверяем агенту.
 
 ### 2.4. Память и state — OMP
 
-- Бэкенд: `memory.backend: mnemopi` — локальный SQLite per agent dir, tools `recall`/`retain`/`reflect`/`memory_edit` (рабочая + эпизодическая память, авто-запоминание завершённых ходов, `memory://<id>` полные строки). Альтернатива `local` — сводки/уроки из сессий (`MEMORY.md`, `learned.md`, `skills/`).
-- Изоляция: per-user профиль → per-user память автоматически. Общая память между профилями — только через явный обмен файлами (не в v1).
+- Бэкенд: `memory.backend: mnemopi` — локальный SQLite, tools `recall`/`retain`/`reflect`/`memory_edit` (рабочая + эпизодическая память, авто-запоминание завершённых ходов, `memory://<id>` полные строки). Альтернатива `local` — сводки/уроки из сессий (`MEMORY.md`, `learned.md`, `skills/`).
+- Изоляция: `mnemopi.scoping: per-project` (default) — банк выводится из cwd (basename + hash abs path) → **per-user банк автоматически**, один профиль на всех. `per-project-tagged` — запись в project-банк + recall из общего global-банка (общие факты ассистента + per-user). `global` — общая память на всех (только если пользователи доверенные/семья; по умолчанию нет).
+- Embeddings: `mnemopi.embeddingVariant: multilingual` (multilingual-e5-large 1024d, RU) — либо `noEmbeddings: true` (FTS-only) для экономии CPU/RAM; выбор — по benchmark.
 - Conversation history отделена от long-term memory (сообщение не становится фактом автоматически) — модель OMP.
-- «Запоминать и вспоминать» = `learn`/`retain`/`recall`/`reflect` в харнессе; host не пишет свою память. Данные бэкапятся с профилем.
+- «Запоминать и вспоминать» = `learn`/`retain`/`recall`/`reflect` в харнессе; host не пишет свою память. Данные бэкапятся с профилем (банки — в `mnemopi/`-директории).
 
 ### 2.5. MCP: конфиг и OAuth — OMP + phos-прокси
 
-- Конфиг: user-scope per profile — `~/.omp/profiles/<name>/agent/mcp.json` (OMP-owned); project-scope — `.omp/mcp.json` в cwd (per-user workspace). Транспорты: `stdio` (default), `http` (Streamable HTTP), `sse` (legacy).
+- Конфиг: user-scope — `~/.omp/profiles/phos/agent/mcp.json` (OMP-owned, **общий для всех**); project-scope — `.omp/mcp.json` в cwd (per-user workspace). Внутри native-источника проект-конфиг идёт раньше user-конфига — общие серверы в профиле, per-user дополнения/переопределения в workspace. Транспорты: `stdio` (default), `http` (Streamable HTTP), `sse` (legacy).
 - Управление: `/mcp add` (wizard), `/mcp list`, `/mcp enable/disable`, `/mcp reload`, `/mcp test`, `/mcp reconnect`, `/mcp reauth`, `/mcp unauth`. В RPC всё это — через `prompt` (slash commands), либо phos пишет JSON напрямую и шлёт `/mcp reload`.
 - **«Бот сам подключает MCP»**: агент может предложить сервер; исполняет только owner/admin. Phos (или разрешённая сессия) пишет `mcp.json` → `/mcp reload`. `disabledServers` — верхнеприоритетный denylist.
 - **OAuth**: OMP сам — authorization code + PKCE, хранит refresh-материал в `agent.db` профиля (`mcp_oauth:profile:<profile>:<url>`), колбэк-слушатель на loopback (`callbackPort`/`callbackPath`; default порт 3000). Проблема: пользователь в Telegram не имеет доступа к loopback хоста → **phos поднимает публичный HTTPS-endpoint (одноразовый, короткий TTL, state-bound), который проксирует на OMP loopback-слушатель**; `oauth.redirectUri` = публичный URL. Полный redirect URL с code не пересылается через Telegram (paste-flow — только dev fallback с немедленной redaction).
 - **SSRF на прокси**: HTTPS-only (кроме loopback dev), reject loopback/private/link-local/cloud-metadata, DNS-resolve + connect-time validation, лимиты редиректов/размера/времени, exact redirect URI + state/issuer.
-- **Security stdio**: `mcp.json` = arbitrary command execution → только доверенные конфиги, профильная изоляция, review чужого `mcp.json` перед запуском профиля с кредами; `${VAR}`/`!command` резолв — знать и валидировать.
+- **Security stdio**: `mcp.json` = arbitrary command execution → только доверенные конфиги; профиль `phos` отделён от остальных OMP-профилей; `stdio`-серверы из per-user workspace — только по host-policy (owner/admin), review чужого `mcp.json`; `${VAR}`/`!command` резолв — знать и валидировать.
 
 ### 2.6. Задачи по расписанию
 
@@ -273,7 +281,7 @@ SQLite поддерживает concurrency, но только одного writ
 1. Telegram handler валидирует whitelist и классифицирует control command (`/stop`, `/schedule_add`, ...).
 2. Через storage executor — короткая транзакция dedupe + INSERT `pending`.
 3. Роутер пробуждается (coalescing wake-channel; его переполнение не критично — периодический скан `pending`).
-4. Роутер: пользователь без процесса → spawn `omp --mode rpc --profile tg-<uid> --resume ...`; команда → `prompt` (или `abort` для `/stop`; `streamingBehavior: "followUp"` если turn идёт).
+4. Роутер: пользователь без процесса → spawn `omp --mode rpc --profile phos` с cwd=`~/.phos/workspace/<uid>` и `--resume`; команда → `prompt` (или `abort` для `/stop`; `streamingBehavior: "followUp"` если turn идёт).
 
 Admission имеет короткий configurable DB timeout (2 s). Если durable commit не состоялся, команда **не считается принятой**: best-effort «хранилище занято, повторите», alert, метрика.
 
@@ -315,7 +323,7 @@ flowchart LR
     DBX --> DB[(SQLite: users, inbox, outbox, jobs)]
     ADMIT -->|wake| ROUTER[Session router: user -> OMP process]
     DBX --> ROUTER
-    ROUTER -->|JSONL prompt/abort| OMP[omp --mode rpc --profile tg-uid]
+    ROUTER -->|JSONL prompt/abort| OMP[omp --mode rpc --profile phos\ncwd = workspace/uid]
     OMP -->|events| STREAM[Event -> Telegram formatter]
     STREAM --> OUT[Transactional outbox]
     OUT --> TG
@@ -337,7 +345,7 @@ Phos.sln
 ├─ src/Phos.Storage
 ├─ src/Phos.Telegram
 ├─ src/Phos.Speech
-├─ src/Phos.Omp          # RPC-клиент, session manager, host tools, профили
+├─ src/Phos.Omp          # RPC-клиент, session manager, host tools, workspaces
 ├─ src/Phos.Scheduler
 ├─ src/Phos.Backup
 └─ src/Phos.App
@@ -349,7 +357,7 @@ tests/
 **Ключевая схема данных:**
 
 ```sql
-users(user_id PK, username, role, omp_profile, timezone, created_at, updated_at);
+users(user_id PK, username, role, workspace_path, timezone, created_at, updated_at);
 command_inbox(id PK, origin, external_key UNIQUE, user_id, chat_id, payload,
               priority, status, lease_until, heartbeat_at, attempts, created_at, updated_at);
 message_outbox(id PK, command_id, chunk_index, chat_id, random_id UNIQUE, payload,
@@ -362,7 +370,7 @@ schedule_runs(job_id, scheduled_for, status, command_id,
 backup_log(id PK, started_at, finished_at, path, checksum, status, error);
 ```
 
-Удалено из v1: `personas`, `state`, `conversation_messages`, `memories`, `mcp_servers`, `mcp_tokens`, `oauth_pending` — всё это живёт в OMP (профили, session-файлы, `agent.db`).
+Удалено из v1: `personas`, `state`, `conversation_messages`, `memories`, `mcp_servers`, `mcp_tokens`, `oauth_pending` — всё это живёт в OMP (профиль, session-файлы, `agent.db`).
 
 ---
 
@@ -372,8 +380,8 @@ backup_log(id PK, started_at, finished_at, path, checksum, status, error);
 
 - Pin SDK/packages; WarningAsErrors, nullable, Fantomas, FSharpLint, coverage gates.
 - Throwaway spikes:
-  - **OMP RPC клиент**: spawn `omp --mode rpc` (профиль phos-spike из шаблона), `prompt` → `agent_end` (`isTerminal`), `set_host_tools` roundtrip, `abort`, `--resume`, `/stop`; замер старта процесса и p95 первого токена;
-  - **профиль-провижининг**: копия шаблона (`models.yml`, `.env`, `PERSONALITY.md`) → `omp --profile` работает с изолированными кредами/сессиями/памятью;
+  - **OMP RPC клиент**: разовый провижининг профиля `phos` (копия базового конфига: `models.yml`, `.env`, `PERSONALITY.md`, `memory.backend`), spawn `omp --mode rpc --profile phos`, `prompt` → `agent_end` (`isTerminal`), `set_host_tools` roundtrip, `abort`, `--resume`, `/stop`; замер старта процесса и p95 первого токена;
+  - **workspace-изоляция**: два разных cwd → отдельные session-файлы и банки памяти (`mnemopi` per-project), проект-конфиг (`.omp/SYSTEM.md`, `.omp/mcp.json`) применяется только в своём cwd, профиль один;
   - GigaAM v3 CTC через sherpa-onnx + CPU benchmark (наследуется из v1 spike-03).
 - **Acceptance:** все spikes имеют записанный фактический вывод; любой failed blocker меняет выбор технологии до production code.
 
@@ -403,9 +411,9 @@ backup_log(id PK, started_at, finished_at, path, checksum, status, error);
 
 ### Phase 5 — OMP session manager
 
-- F# RPC-клиент (JSONL, v2 chunking, id-корреляция); profile provisioning; spawn/respawn/`--resume`; idle-таймаут; роутер user → процесс; `prompt`/`abort`/`followUp`; event → outbox-форматтер; host tools (`tg_send_message`, `tg_edit_message`, `stt_transcribe`); host URI (`tg://`); `/stop`.
+- F# RPC-клиент (JSONL, v2 chunking, id-корреляция); разовый провижининг профиля `phos`; workspace per-user (создание, изоляция, очистка); spawn/respawn/`--resume`; idle-таймаут; роутер user → процесс; `prompt`/`abort`/`followUp`; event → outbox-форматтер; host tools (`tg_send_message`, `tg_edit_message`, `stt_transcribe`); host URI (`tg://`); `/stop`.
 - Интеграционные тесты против реального `omp` с fake LLM endpoint; контрактные тесты на wire-протокол.
-- **Acceptance:** два пользователя → два изолированных профиля/сессии; `agent_end` дожидается `isTerminal`; `/stop` прерывает ход; убийство процесса → respawn + resume без потери и без дубля; переполнение очереди не теряет команду.
+- **Acceptance:** два пользователя → один профиль, изолированные workspace (сессии, банки памяти, персональность); `agent_end` дожидается `isTerminal`; `/stop` прерывает ход; убийство процесса → respawn + resume без потери и без дубля; переполнение очереди не теряет команду.
 
 ### Phase 6 — Scheduler
 
@@ -414,8 +422,8 @@ backup_log(id PK, started_at, finished_at, path, checksum, status, error);
 
 ### Phase 7 — Backups
 
-- SQLite snapshot + OMP-профили/сессии; manifest/checksums; age recipient encryption; off-host copy; retention; automated restore.
-- **Acceptance:** disposable restore возвращает `integrity_check: ok`, корректные схему и данные; восстанавливаются OMP-профили (модель, память, сессии); corrupt/truncated backup rejected.
+- SQLite snapshot + OMP-профиль/сессии/банки памяти; manifest/checksums; age recipient encryption; off-host copy; retention; automated restore.
+- **Acceptance:** disposable restore возвращает `integrity_check: ok`, корректные схему и данные; восстанавливается OMP-профиль (модель, банки памяти, сессии); corrupt/truncated backup rejected.
 
 ### Phase 8 — Hardening и load
 
@@ -432,15 +440,16 @@ backup_log(id PK, started_at, finished_at, path, checksum, status, error);
 | Риск | Severity | Митигация / решение |
 |---|---|---|
 | OMP — большой сторонний харнесс; RPC-протокол/поведение меняется между версиями | high | pin 18.1.19; контрактные тесты на wire-формат; update-runbook с прогоном integration suite; никакого auto-update |
-| MCP stdio = arbitrary code execution | critical | только доверенные `mcp.json`; профильная изоляция; review чужих конфигов; `disabledServers`; host-политика на подключение |
+| MCP stdio = arbitrary code execution | critical | только доверенные `mcp.json`; профиль `phos` отделён от остальных OMP-профилей; `stdio`-серверы из per-user project-конфига — только по host-policy (owner/admin); review чужих конфигов; `disabledServers` |
 | Prompt injection из MCP/files/web | critical | untrusted-content граница OMP; `--approval-mode` для мутаций; мутирующие тулзы по умолчанию выключены; host-enforced policy |
 | OAuth-прокси: SSRF/DNS rebinding/утечка кода | high | HTTPS-only, address/redirect validation, короткий state, single-use, no production paste-flow |
+| Изоляция per-user держится на cwd — ошибка в workspace = утечка памяти/сессии между пользователями | high | workspace вычисляется из whitelist user_id (один источник правды), создаётся host-ом; интеграционный тест на изоляцию двух пользователей; смена cwd процесса в рантайме запрещена |
 | Per-user процессы: N × (bun + OMP) память/CPU | high | idle-timeout + respawn `--resume`; cap активных пользователей; метрики; при необходимости один процесс на группу с раздельной памятью — только после измерений |
 | Сессия OMP: после крэша хода состояние unknown | high | inbox lease + `needs_review` (не автоповтор); `agent_end` с `isTerminal` как единственный сигнал завершения |
 | SQLite synchronous I/O/single writer | high | dedicated executor, короткие транзакции, WAL, bounded admission timeout, метрики |
 | Не существует exactly-once для внешних side effects | high | outbox/idempotency; unknown → needs_review |
 | Утечка bot token/API-key провайдера/session | high | systemd credentials/secret store, 0600, rotation, redaction; ключ провайдера — в OMP-профиле (в бэкап не входит) |
-| Backup существует, restore не работает | high | checksums, automated restore drill (включая OMP-профили), off-host copies |
+| Backup существует, restore не работает | high | checksums, automated restore drill (включая OMP-профиль, сессии, банки памяти), off-host copies |
 | OMP STT не покрывает голосовые файлы | medium | остаётся собственный STT (GigaAM/Whisper); WER/RTF на target CPU |
 | STT цифры не переносятся на target CPU/voice domain | medium | собственные p50/p95 RTF/RSS/WER; no estimated SLA |
 | WTelegramClient single maintainer | medium | pin version, interface boundary, protocol smoke on upgrade |
