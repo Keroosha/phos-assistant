@@ -7,6 +7,7 @@
 
   <ItemGroup>
     <Compile Include="Config.fs" />
+    <Compile Include="HostedServices.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
 
@@ -14,6 +15,7 @@
     <PackageReference Include="FSharp.Core" />
     <PackageReference Include="FsToolkit.ErrorHandling" />
     <PackageReference Include="Microsoft.Extensions.Logging.Console" />
+    <PackageReference Include="Microsoft.Extensions.Hosting" />
   </ItemGroup>
 
   <ItemGroup>

@@ -17,6 +17,8 @@
     <!-- Logging: ILogger + LoggerMessage.Define (F# has no partial methods, so the [LoggerMessage] source generator is C#-only) -->
     <PackageVersion Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.12" />
     <PackageVersion Include="Microsoft.Extensions.Logging.Console" Version="10.0.12" />
+    <!-- Host: Generic Host (HostApplicationBuilder: DI, lifetime, hosted services) -->
+    <PackageVersion Include="Microsoft.Extensions.Hosting" Version="10.0.12" />
     <!-- Telegram: MTProto bot transport -->
     <PackageVersion Include="WTelegramClient" Version="4.4.8" />
     <!-- Test stack -->
