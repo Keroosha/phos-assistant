@@ -3,12 +3,14 @@
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
     <IsPackable>false</IsPackable>
+    <RunSettingsFilePath>coverlet.runsettings</RunSettingsFilePath>
   </PropertyGroup>
 
   <ItemGroup>
     <Compile Include="Tests.fs" />
     <Compile Include="CoreTests.fs" />
     <Compile Include="StorageTests.fs" />
+    <Compile Include="TelegramTests.fs" />
   </ItemGroup>
 
   <ItemGroup>
@@ -30,6 +32,7 @@
   <ItemGroup>
     <ProjectReference Include="../../src/Phos.Core/Phos.Core.fsproj" />
     <ProjectReference Include="../../src/Phos.Storage/Phos.Storage.fsproj" />
+    <ProjectReference Include="../../src/Phos.Telegram/Phos.Telegram.fsproj" />
   </ItemGroup>
 
 </Project>

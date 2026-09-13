@@ -730,3 +730,12 @@ let ``outbox retry never changes RandomId`` (attempts: int) (maxAttempts: int) (
     match Out.apply entry Out.BeginSend with
     | Ok next -> next.RandomId = entry.RandomId
     | Error _ -> true
+
+[<Fact>]
+let ``chunk with tiny maxUnits and fences makes progress without looping`` () =
+    // maxUnits < 7 cannot hold both fence markers and content; the chunker's
+    // safety net must still make forward progress (no infinite loop) and never
+    // emit a chunk larger than maxUnits.
+    let chunks = chunk 3 "```x```" []
+    chunks |> List.isEmpty |> should be False
+    chunks |> List.forall (fun c -> c.Text.Length <= 3) |> should be True

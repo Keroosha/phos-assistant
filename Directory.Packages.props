@@ -8,6 +8,8 @@
     <PackageVersion Include="Cronos" Version="0.13.0" />
     <!-- Storage: durable queue / SQLite persistence -->
     <PackageVersion Include="Microsoft.Data.Sqlite" Version="10.0.12" />
+    <!-- Telegram: MTProto bot transport -->
+    <PackageVersion Include="WTelegramClient" Version="4.4.8" />
     <!-- Test stack -->
     <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.10.0" />
     <PackageVersion Include="xunit" Version="2.9.3" />

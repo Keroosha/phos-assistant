@@ -121,10 +121,50 @@
 
 Acceptance: durable command переживает process kill (committed → закрыть без clean shutdown → переоткрыть → claimable); ключи отсутствуют в DB/логах; `bash scripts/ci.sh` EXIT 0 с гейтом (Storage branch ≥ 90% — Storage теперь в required-проектах v2).
 
-## Phase 3 (v2) — Telegram transport (контур, реализуется после Phase 2)
+## Phase 3 (v2) — Telegram transport (`src/Phos.Telegram`)
 
-- `src/Phos.Telegram`: bot login (WTelegramClient 4.4.8), UpdateManager, peer cache/access hashes, voice download, entity-safe send/edit/live draft, FLOOD_WAIT, random-id outbox delivery; whitelist до queue admission.
-- Acceptance: allowlisted `/start` → `/ping`; duplicate update один раз; voice bytes скачаны; phone/code/2FA не запрашиваются.
+Пакет: `WTelegramClient` 4.4.8 (pin в `Directory.Packages.props`). Проект `src/Phos.Telegram/Phos.Telegram.fsproj` (FSharp.Core + WTelegramClient), ProjectReference на `Phos.Core` и `Phos.Storage`. Добавить в `Phos.sln`.
+
+Файлы (порядок в fsproj):
+
+1. `Transport.fs` — граница, фейкабельная в тестах:
+   - `type BotInfo = { BotId: int64; Username: string option }`
+   - `type TelegramEntity = { Offset: int; Length: int; Kind: EntityKind }` (переиспользовать `Phos.Core.Chunker.EntityKind`; offsets UTF-16 — совпадает с Telegram)
+   - `type SendTarget = { ChatId: ChatId; RandomId: int64; Text: string; Entities: TelegramEntity list }`
+   - `type SendResult = { RemoteMessageId: int64 }`
+   - `type VoiceRef = { ChatId: ChatId; MessageId: int64; FileReference: byte[]; AccessHash: int64 }`
+   - `type ITelegramTransport =
+       abstract Login: unit -> Task<BotInfo>` (только bot token; телефон/код/2FA не запрашиваются)
+       `abstract SendMessage: SendTarget -> Task<SendResult>` (stable random_id)
+       `abstract EditMessage: ChatId -> int64 -> text: string -> entities: TelegramEntity list -> Task<unit>`
+       `abstract DownloadVoice: VoiceRef -> Task<byte[]>`
+   - `TelegramTransport` — реализация поверх WTelegramClient (см. `docs/research-plan.md` §2.1: `wtConfig` callback, `LoginBotIfNeeded`, MTProto-методы для ботов). Верифицировать API по `~/.nuget/packages/wtelegramclient/4.4.8/lib/*/WTelegramClient.xml`.
+
+2. `PeerCache.fs` — кэш peer/access hashes: `type PeerCache = ...` — `Get/Cache: ChatId -> InputPeer option`; потокобезопасный; access_hash из updates; для новых peer — refetch. НЕ хранит секреты.
+
+3. `UpdateModel.fs` — `type IncomingUpdate = { UpdateId: int64; Chat: Chat; From: User; Text: string option; Voice: VoiceRef option }` + маппер из TL-объектов WTelegramClient (message/update).
+
+4. `UpdateHandler.fs` — `type HandleResult = Accepted | Duplicate | Denied of DenialReason | AdmitFailed`
+   - `type UpdateHandler (whitelist: Whitelist, inbox: ICommandInbox, dedupe: UpdateDedupe, admit: CommandEnvelope -> Task<AdmitOutcome>)`
+   - `HandleAsync: IncomingUpdate -> Task<HandleResult>`: (1) dedupe по `UpdateId`; (2) **whitelist до queue admission** (`Whitelist.authorize`); (3) classify: `/start` → upsert user + приветствие через outbox; `/ping` → `pong` через outbox; обычный текст/voice → `CommandEnvelope` в `command_inbox` (через переданный admit). Никогда не ждёт LLM/OMP.
+
+5. `UpdateDedupe.fs` — bounded LRU по `UpdateId` (последние N=1000; после рестарта Telegram offset решает; документировать).
+
+6. `OutboxDelivery.fs` — `type OutboxDelivery (outbox: IMessageOutbox, transport: ITelegramTransport, logger)`
+   - `RunAsync: CancellationToken -> Task<unit>`: `NextPending` → `SendMessage` (stable random_id) → `MarkSent(remoteMessageId)`; `FLOOD_WAIT`/`SLOWMODE_WAIT` → отложить retry (не создавать новое сообщение); `MarkFailed` → attempts+1, retry тем же random_id; идемпотентность: `GetByRandomId` перед повторной отправкой.
+
+7. `EntitySend.fs` — `val chunkForSend: text: string -> entities: TelegramEntity list -> Chunk list` (обёртка над `Chunker.chunk` 4096); `val toTelegramEntities: Chunk -> TelegramEntity list` (rebased offsets); live-draft limits (20/5s, 40/30s — конфиг, константы).
+
+Тесты (`tests/Phos.Tests/TelegramTests.fs`), fake transport (реализует `ITelegramTransport`, записывает вызовы; fake `ICommandInbox`/`IMessageOutbox` — in-memory или temp SQLite):
+- allowlisted `/start` → accept + user upsert; `/ping` → outbox `pong` (fake transport получил `SendTarget` с текстом);
+- duplicate update (same UpdateId) → `Duplicate`, обработан один раз (один admit/send);
+- whitelist: не-whitelisted → `Denied`, admit НЕ вызван (проверка до admission);
+- voice update → admit с voice-маркером; `DownloadVoice` возвращает байты;
+- outbox delivery: `SendMessage` с тем же `random_id` при retry; `MarkSent` после успеха; FLOOD_WAIT → retry без второго сообщения;
+- chunk/entity: текст >4096 → несколько чанков ≤4096, entities rebased; entity-safe send;
+- login: контракт Login не запрашивает phone/code/2FA (fake config callback проверяет: только api_id/api_hash/bot_token/session_pathname).
+
+Acceptance (фаза): allowlisted `/start` → `/ping` (fake-transport контрактный тест; реальный Telegram — integration/nightly, см. research-plan §2.8); duplicate update один раз; voice bytes скачаны; phone/code/2FA не запрашиваются; `bash scripts/ci.sh` EXIT 0 (гейт: Core/Storage branch ≥90% уже enforced; Telegram не в required-списке, но в totals line ≥90%/branch ≥85%).
 
 ---
 

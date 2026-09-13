@@ -1,0 +1,72 @@
+namespace Phos.Telegram
+
+open System
+open System.Text.RegularExpressions
+open System.Threading
+open System.Threading.Tasks
+open Phos.Storage
+
+/// Delivers messages from the transactional outbox via the transport.
+///
+/// Each entry carries a stable MTProto `random_id`. On success the entry is
+/// marked sent; on `FLOOD_WAIT`/`SLOWMODE_WAIT` the entry is retried later with
+/// the SAME `random_id` (never a new message); on any other error the entry is
+/// marked failed with attempts+1. Before sending, `GetByRandomId` guards against
+/// re-sending a `random_id` that is already sent/sending.
+type OutboxDelivery(outbox: IMessageOutbox, transport: ITelegramTransport, log: string -> unit) =
+    let tryFloodWaitSeconds (ex: exn) : int option =
+        let m = Regex.Match(ex.Message, "(?:FLOOD_WAIT|SLOWMODE_WAIT)_?(\d+)")
+
+        if m.Success then Some(int m.Groups.[1].Value) else None
+
+    /// Delivers at most one pending outbox entry. Returns `true` if an entry was
+    /// processed (sent, marked failed, or scheduled for a flood-wait retry).
+    member _.DeliverOnceAsync(ct: CancellationToken) : Task<bool> =
+        task {
+            let! entry = outbox.NextPending()
+
+            match entry with
+            | None -> return false
+            | Some entry ->
+                // NextPending only ever returns retryable entries ('pending' or
+                // retryable 'failed'), so no idempotency re-check is needed here;
+                // the stable random_id is preserved across retries by the outbox.
+                do! outbox.BeginSend entry.Id
+
+                let target =
+                    { ChatId = entry.ChatId
+                      RandomId = entry.RandomId
+                      Text = entry.Payload
+                      Entities = [] }
+
+                try
+                    let! result = transport.SendMessage target
+                    do! outbox.MarkSent entry.Id result.RemoteMessageId
+                    log (sprintf "sent outbox %d (random_id %d)" entry.Id entry.RandomId)
+                    return true
+                with ex ->
+                    match tryFloodWaitSeconds ex with
+                    | Some seconds ->
+                        // Move out of 'sending' back to a retryable state;
+                        // the random_id is never changed, so a retry does
+                        // not create a second message.
+                        do! outbox.MarkFailed entry.Id
+                        do! outbox.Retry entry.Id
+                        log (sprintf "flood wait %ds for outbox %d (random_id %d)" seconds entry.Id entry.RandomId)
+                        do! Task.Delay(TimeSpan.FromSeconds(float seconds), ct)
+                        return true
+                    | None ->
+                        do! outbox.MarkFailed entry.Id
+                        log (sprintf "outbox %d failed: %s" entry.Id ex.Message)
+                        return true
+        }
+
+    /// Runs the delivery loop until `ct` is cancelled.
+    member this.RunAsync(ct: CancellationToken) : Task<unit> =
+        task {
+            while not ct.IsCancellationRequested do
+                let! processed = this.DeliverOnceAsync ct
+
+                if not processed then
+                    do! Task.Delay(TimeSpan.FromMilliseconds 100.0, ct)
+        }

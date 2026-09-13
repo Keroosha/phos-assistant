@@ -75,6 +75,14 @@ def collect(xml_path: str, src_root: str) -> dict[str, Project]:
     projects: dict[str, Project] = {}
     for package in root.iter("package"):
         for cls in package.iter("class"):
+            # F# `task`/`async` computation expressions compile into
+            # compiler-generated state-machine classes named
+            # `<StartupCode$...>...` whose branch attribution is unreliable
+            # (coverlet reports dozens of synthetic conditions). Per the repo
+            # policy (research-plan v2 §2.8) only generated code is excluded,
+            # so skip exactly these classes; hand-written code is still measured.
+            if (cls.get("name") or "").startswith("<StartupCode$"):
+                continue
             filename = cls.get("filename", "")
             proj_dir = src_dir_of(resolve_class_path(sources, filename, src_root), src_root)
             if proj_dir is None:

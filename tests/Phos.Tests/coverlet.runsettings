@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<RunSettings>
+  <DataCollectionRunSettings>
+    <DataCollectors>
+      <DataCollector friendlyName="XPlat Code Coverage">
+        <Configuration>
+          <!-- Exclusions per research-plan v2 §2.8 ("исключается только generated/interoperability code с review"):
+               TelegramTransport.fs — WTelegramClient interop wrapper; its methods only
+               delegate to a live Telegram connection and cannot be exercised without
+               real network access; the testable transport logic lives in `Transport.fs`.
+               F# compiler-generated state machines (`<StartupCode$...>` classes) are
+               filtered by scripts/coverage-gate.py. -->
+          <ExcludeByFile>**/TelegramTransport.fs</ExcludeByFile>
+        </Configuration>
+      </DataCollector>
+    </DataCollectors>
+  </DataCollectionRunSettings>
+</RunSettings>

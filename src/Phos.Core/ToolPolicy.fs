@@ -21,6 +21,10 @@ type Decision =
       MinRole: UserRole option }
 
 /// Numeric rank of a role in the Owner > Admin > User ordering.
+/// `NoInlining` keeps coverlet's sequence points on these lines; otherwise the
+/// compiler inlines the tiny match into `roleAtLeast` and the branches are
+/// attributed to the call site (measured 0% at the definition).
+[<System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)>]
 let private rank (role: UserRole) : int =
     match role with
     | Owner -> 2
