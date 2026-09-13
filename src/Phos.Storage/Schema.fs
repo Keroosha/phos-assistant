@@ -1,100 +1,350 @@
 module Phos.Storage.Schema
 
 open System
-open System.Threading.Tasks
+open FluentMigrator
+open FluentMigrator.Runner
+open Microsoft.Data.Sqlite
+open Microsoft.Extensions.DependencyInjection
 
-/// A single versioned schema migration step.
-type Migration =
-    { Version: int
-      Name: string
-      Sql: string }
+// ---------------------------------------------------------------------------
+// Migrations
+//
+// The schema is split into six versioned steps (v1..v6) so an existing
+// database can be upgraded by replaying the steps above its current version.
+// Each migration is a FluentMigrator step that creates (or drops) one table;
+// FluentMigrator tracks the applied version in its `VersionInfo` table, so
+// re-running `run` is idempotent.
+//
+// Column nullability is explicit (`.Nullable()` / `.NotNullable()`) because
+// FluentMigrator defaults to NOT NULL, which would otherwise silently change
+// nullable columns (e.g. `users.username`, `command_inbox.external_key`).
+// The composite `UNIQUE(command_id, chunk_index)` and `PRIMARY KEY(job_id,
+// scheduled_for)` are expressed as unique indexes because SQLite cannot add
+// a table-level constraint to an existing table via `ALTER TABLE`.
+// ---------------------------------------------------------------------------
 
-/// Applies every migration in `migrations` with a version greater than the
-/// current `schema_version`, each inside its own transaction. Idempotent:
-/// already-applied migrations are skipped. Returns the number of migrations
-/// applied in this run.
-///
-/// The storage executor performs work synchronously (Microsoft.Data.Sqlite has
-/// no true async I/O), so the migrations are applied by blocking on the
-/// completed tasks and the function returns an already-completed task.
-let migrate (exec: StorageExecutor) (migrations: Migration list) : Task<int> =
-    exec.WriteAsync(fun conn ->
-        use cmd = conn.CreateCommand()
+[<Migration(1L)>]
+type CreateUsers() =
+    inherit Migration()
 
-        cmd.CommandText <-
-            "CREATE TABLE IF NOT EXISTS schema_version(version INTEGER NOT NULL, applied_at INTEGER NOT NULL);"
+    override this.Up() =
+        this.Create
+            .Table("users")
+            .WithColumn("user_id")
+            .AsInt64()
+            .PrimaryKey()
+            .WithColumn("username")
+            .AsString()
+            .Nullable()
+            .WithColumn("role")
+            .AsString()
+            .NotNullable()
+            .WithColumn("workspace_path")
+            .AsString()
+            .NotNullable()
+            .WithColumn("timezone")
+            .AsString()
+            .Nullable()
+            .WithColumn("created_at")
+            .AsInt64()
+            .NotNullable()
+            .WithColumn("updated_at")
+            .AsInt64()
+            .NotNullable()
+        |> ignore
 
-        cmd.ExecuteNonQuery() |> ignore
-        ())
-    |> fun t -> t.GetAwaiter().GetResult()
+    override this.Down() = this.Delete.Table("users") |> ignore
 
-    let currentVersion =
-        exec.ReadAsync(fun conn ->
-            use cmd = conn.CreateCommand()
-            cmd.CommandText <- "SELECT COALESCE(MAX(version), 0) FROM schema_version;"
+[<Migration(2L)>]
+type CreateCommandInbox() =
+    inherit Migration()
 
-            match cmd.ExecuteScalar() with
-            | :? int64 as v -> int v
-            | :? int as v -> v
-            | _ -> 0)
-        |> fun t -> t.GetAwaiter().GetResult()
+    override this.Up() =
+        this.Create
+            .Table("command_inbox")
+            .WithColumn("id")
+            .AsInt64()
+            .PrimaryKey()
+            .Identity()
+            .WithColumn("origin")
+            .AsString()
+            .NotNullable()
+            .WithColumn("external_key")
+            .AsString()
+            .Nullable()
+            .Unique()
+            .WithColumn("user_id")
+            .AsInt64()
+            .NotNullable()
+            .WithColumn("chat_id")
+            .AsInt64()
+            .NotNullable()
+            .WithColumn("payload")
+            .AsString()
+            .NotNullable()
+            .WithColumn("priority")
+            .AsInt32()
+            .NotNullable()
+            .WithDefaultValue(0)
+            .WithColumn("status")
+            .AsString()
+            .NotNullable()
+            .WithDefaultValue("pending")
+            .WithColumn("lease_until")
+            .AsInt64()
+            .Nullable()
+            .WithColumn("heartbeat_at")
+            .AsInt64()
+            .Nullable()
+            .WithColumn("attempts")
+            .AsInt32()
+            .NotNullable()
+            .WithDefaultValue(0)
+            .WithColumn("max_attempts")
+            .AsInt32()
+            .NotNullable()
+            .WithDefaultValue(5)
+            .WithColumn("created_at")
+            .AsInt64()
+            .NotNullable()
+            .WithColumn("updated_at")
+            .AsInt64()
+            .NotNullable()
+        |> ignore
 
-    let pending =
-        migrations
-        |> List.filter (fun m -> m.Version > currentVersion)
-        |> List.sortBy (fun m -> m.Version)
+    override this.Down() =
+        this.Delete.Table("command_inbox") |> ignore
 
-    let mutable applied = 0
+[<Migration(3L)>]
+type CreateMessageOutbox() =
+    inherit Migration()
 
-    for m in pending do
-        exec.WriteAsync(fun conn ->
-            use tx = conn.BeginTransaction()
-            use cmd = conn.CreateCommand()
-            cmd.Transaction <- tx
-            cmd.CommandText <- m.Sql
-            cmd.ExecuteNonQuery() |> ignore
-            use cmd2 = conn.CreateCommand()
-            cmd2.Transaction <- tx
-            cmd2.CommandText <- "INSERT INTO schema_version(version, applied_at) VALUES ($version, $now);"
+    override this.Up() =
+        this.Create
+            .Table("message_outbox")
+            .WithColumn("id")
+            .AsInt64()
+            .PrimaryKey()
+            .Identity()
+            .WithColumn("command_id")
+            .AsInt64()
+            .NotNullable()
+            .WithColumn("chunk_index")
+            .AsInt32()
+            .NotNullable()
+            .WithColumn("chat_id")
+            .AsInt64()
+            .NotNullable()
+            .WithColumn("random_id")
+            .AsInt64()
+            .NotNullable()
+            .Unique()
+            .WithColumn("payload")
+            .AsString()
+            .NotNullable()
+            .WithColumn("status")
+            .AsString()
+            .NotNullable()
+            .WithDefaultValue("pending")
+            .WithColumn("remote_message_id")
+            .AsInt64()
+            .Nullable()
+            .WithColumn("attempts")
+            .AsInt32()
+            .NotNullable()
+            .WithDefaultValue(0)
+            .WithColumn("max_attempts")
+            .AsInt32()
+            .NotNullable()
+            .WithDefaultValue(5)
+            .WithColumn("created_at")
+            .AsInt64()
+            .NotNullable()
+            .WithColumn("updated_at")
+            .AsInt64()
+            .NotNullable()
+        |> ignore
 
-            cmd2.Parameters.AddWithValue("$version", m.Version) |> ignore
+        // Table-level `UNIQUE(command_id, chunk_index)` — SQLite cannot add a
+        // UNIQUE table constraint to an existing table, so express it as a
+        // unique index, which enforces the same uniqueness.
+        this.Create
+            .Index("ux_message_outbox_command_chunk")
+            .OnTable("message_outbox")
+            .OnColumn("command_id")
+            .Ascending()
+            .OnColumn("chunk_index")
+            .Ascending()
+            .WithOptions()
+            .Unique()
+        |> ignore
 
-            cmd2.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToUnixTimeSeconds())
-            |> ignore
+    override this.Down() =
+        this.Delete.Table("message_outbox") |> ignore
 
-            cmd2.ExecuteNonQuery() |> ignore
-            tx.Commit()
-            ())
-        |> fun t -> t.GetAwaiter().GetResult()
+[<Migration(4L)>]
+type CreateScheduleJobs() =
+    inherit Migration()
 
-        applied <- applied + 1
+    override this.Up() =
+        this.Create
+            .Table("schedule_jobs")
+            .WithColumn("id")
+            .AsInt64()
+            .PrimaryKey()
+            .Identity()
+            .WithColumn("user_id")
+            .AsInt64()
+            .NotNullable()
+            .WithColumn("cron_expr")
+            .AsString()
+            .NotNullable()
+            .WithColumn("timezone")
+            .AsString()
+            .NotNullable()
+            .WithColumn("prompt")
+            .AsString()
+            .NotNullable()
+            .WithColumn("enabled")
+            .AsInt32()
+            .NotNullable()
+            .WithDefaultValue(1)
+            .WithColumn("catchup_policy")
+            .AsString()
+            .NotNullable()
+            .WithDefaultValue("skip")
+            .WithColumn("next_run")
+            .AsInt64()
+            .Nullable()
+            .WithColumn("created_at")
+            .AsInt64()
+            .NotNullable()
+            .WithColumn("updated_at")
+            .AsInt64()
+            .NotNullable()
+        |> ignore
 
-    Task.FromResult applied
+    override this.Down() =
+        this.Delete.Table("schedule_jobs") |> ignore
 
-/// The full v2 schema, split into versioned steps so an older database can be
-/// upgraded by replaying the migrations above its current `schema_version`.
-let migrations: Migration list =
-    [ { Version = 1
-        Name = "users"
-        Sql =
-          "CREATE TABLE users (user_id INTEGER PRIMARY KEY, username TEXT, role TEXT NOT NULL, workspace_path TEXT NOT NULL, timezone TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);" }
-      { Version = 2
-        Name = "command_inbox"
-        Sql =
-          "CREATE TABLE command_inbox (id INTEGER PRIMARY KEY AUTOINCREMENT, origin TEXT NOT NULL, external_key TEXT UNIQUE, user_id INTEGER NOT NULL, chat_id INTEGER NOT NULL, payload TEXT NOT NULL, priority INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'pending', lease_until INTEGER NULL, heartbeat_at INTEGER NULL, attempts INTEGER NOT NULL DEFAULT 0, max_attempts INTEGER NOT NULL DEFAULT 5, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);" }
-      { Version = 3
-        Name = "message_outbox"
-        Sql =
-          "CREATE TABLE message_outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, command_id INTEGER NOT NULL, chunk_index INTEGER NOT NULL, chat_id INTEGER NOT NULL, random_id INTEGER NOT NULL UNIQUE, payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', remote_message_id INTEGER NULL, attempts INTEGER NOT NULL DEFAULT 0, max_attempts INTEGER NOT NULL DEFAULT 5, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, UNIQUE(command_id, chunk_index));" }
-      { Version = 4
-        Name = "schedule_jobs"
-        Sql =
-          "CREATE TABLE schedule_jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, cron_expr TEXT NOT NULL, timezone TEXT NOT NULL, prompt TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, catchup_policy TEXT NOT NULL DEFAULT 'skip', next_run INTEGER NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);" }
-      { Version = 5
-        Name = "schedule_runs"
-        Sql =
-          "CREATE TABLE schedule_runs (job_id INTEGER NOT NULL, scheduled_for INTEGER NOT NULL, status TEXT NOT NULL, command_id INTEGER NULL, PRIMARY KEY(job_id, scheduled_for));" }
-      { Version = 6
-        Name = "backup_log"
-        Sql =
-          "CREATE TABLE backup_log (id INTEGER PRIMARY KEY AUTOINCREMENT, started_at INTEGER NOT NULL, finished_at INTEGER NULL, path TEXT NULL, checksum TEXT NULL, status TEXT NOT NULL, error TEXT NULL);" } ]
+[<Migration(5L)>]
+type CreateScheduleRuns() =
+    inherit Migration()
+
+    override this.Up() =
+        this.Create
+            .Table("schedule_runs")
+            .WithColumn("job_id")
+            .AsInt64()
+            .NotNullable()
+            .WithColumn("scheduled_for")
+            .AsInt64()
+            .NotNullable()
+            .WithColumn("status")
+            .AsString()
+            .NotNullable()
+            .WithColumn("command_id")
+            .AsInt64()
+            .Nullable()
+        |> ignore
+
+        // Composite `PRIMARY KEY(job_id, scheduled_for)` — SQLite cannot add a
+        // PRIMARY KEY table constraint to an existing table, so express it as a
+        // unique index over the two NOT NULL columns (functionally a key).
+        this.Create
+            .Index("pk_schedule_runs")
+            .OnTable("schedule_runs")
+            .OnColumn("job_id")
+            .Ascending()
+            .OnColumn("scheduled_for")
+            .Ascending()
+            .WithOptions()
+            .Unique()
+        |> ignore
+
+    override this.Down() =
+        this.Delete.Table("schedule_runs") |> ignore
+
+[<Migration(6L)>]
+type CreateBackupLog() =
+    inherit Migration()
+
+    override this.Up() =
+        this.Create
+            .Table("backup_log")
+            .WithColumn("id")
+            .AsInt64()
+            .PrimaryKey()
+            .Identity()
+            .WithColumn("started_at")
+            .AsInt64()
+            .NotNullable()
+            .WithColumn("finished_at")
+            .AsInt64()
+            .Nullable()
+            .WithColumn("path")
+            .AsString()
+            .Nullable()
+            .WithColumn("checksum")
+            .AsString()
+            .Nullable()
+            .WithColumn("status")
+            .AsString()
+            .NotNullable()
+            .WithColumn("error")
+            .AsString()
+            .Nullable()
+        |> ignore
+
+    override this.Down() =
+        this.Delete.Table("backup_log") |> ignore
+
+// ---------------------------------------------------------------------------
+// Runner
+// ---------------------------------------------------------------------------
+
+/// Builds the connection string used by the FluentMigrator runner. The runner
+/// opens its own connections, so it must apply the same `foreign_keys` and
+/// `DefaultTimeout` settings the storage executor applies on every connection
+/// (see `StorageInternals`); otherwise FK semantics would differ between the
+/// executor and the migration runner.
+let private runnerConnectionString (options: StorageOptions) : string =
+    let builder = SqliteConnectionStringBuilder()
+    builder.DataSource <- options.DatabasePath
+    builder.Mode <- SqliteOpenMode.ReadWriteCreate
+    builder.ForeignKeys <- true
+    builder.DefaultTimeout <- max 1 (int options.BusyTimeout.TotalSeconds)
+    builder.ConnectionString
+
+let private withRunner (options: StorageOptions) (f: IMigrationRunner -> unit) : unit =
+    let services =
+        ServiceCollection()
+            .AddFluentMigratorCore()
+            .ConfigureRunner(fun rb ->
+                rb
+                    .AddSQLite()
+                    .WithGlobalConnectionString(runnerConnectionString options)
+                    .ScanIn(typeof<CreateUsers>.Assembly)
+                    .For.Migrations()
+                |> ignore)
+            .AddLogging(fun lb -> lb.AddFluentMigratorConsole() |> ignore)
+
+    use provider = services.BuildServiceProvider()
+    let runner = provider.GetRequiredService<IMigrationRunner>()
+    f runner
+
+/// Applies every pending FluentMigrator migration to the database. Idempotent:
+/// migrations already applied (tracked in `VersionInfo`) are skipped.
+let run (options: StorageOptions) : unit =
+    withRunner options (fun runner -> runner.MigrateUp())
+
+/// Migrates up to `version` (inclusive): applies all pending migrations with a
+/// version <= `version`.
+let migrateUp (options: StorageOptions) (version: int64) : unit =
+    withRunner options (fun runner -> runner.MigrateUp(version))
+
+/// Migrates down to `version` (exclusive): rolls back every applied migration
+/// with a version > `version`, executing each migration's `Down()` in reverse
+/// order. `MigrateDown 0L` rolls back the entire schema.
+let migrateDown (options: StorageOptions) (version: int64) : unit =
+    withRunner options (fun runner -> runner.MigrateDown(version))
