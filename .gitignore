@@ -8,4 +8,4 @@ spikes/**/models/
 *.user
 spikes/**/onnx_model/
 data/
-/phos.json
+/appsettings.json

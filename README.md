@@ -15,35 +15,35 @@ dotnet build
 
 ## Запуск
 
-1. Создайте файл конфигурации `phos.json`:
+1. Скопируйте пример конфигурации в `appsettings.json` (в корне репозитория, игнорируется git):
 
-```json
-{
-  "databasePath": "data/phos.db",
-  "busyTimeoutSeconds": 2,
-  "readPoolSize": 4,
-  "checkpointEvery": 10,
-  "sessionPath": "data/wtelegram-bot.session",
-  "users": [{ "id": 123456789, "role": "owner" }],
-  "allowedChats": []
-}
+```bash
+cp appsettings.example.json appsettings.json
 ```
 
-2. Задайте переменные окружения с данными Telegram-приложения:
+Заполните `Whitelist.Users[0].Id` вашим Telegram user id (роль `owner`) и добавьте группы/каналы в `AllowedChats`.
+
+2. Задайте секреты через переменные окружения (никогда не храните их в файле):
 
 | Переменная | Откуда |
 |---|---|
-| `PHOS_TELEGRAM_API_ID` | `api_id` из [my.telegram.org](https://my.telegram.org) |
-| `PHOS_TELEGRAM_API_HASH` | `api_hash` из [my.telegram.org](https://my.telegram.org) |
-| `PHOS_TELEGRAM_BOT_TOKEN` | токен бота от [@BotFather](https://t.me/BotFather) |
+| `PHOS_TELEGRAM__APIID` | `api_id` из [my.telegram.org](https://my.telegram.org) |
+| `PHOS_TELEGRAM__APIHASH` | `api_hash` из [my.telegram.org](https://my.telegram.org) |
+| `PHOS_TELEGRAM__BOTTOKEN` | токен бота от [@BotFather](https://t.me/BotFather) |
+
+Обратите внимание на двойное подчёркивание `__` — это разделитель секций `IConfiguration`: `PHOS_TELEGRAM__APIID` соответствует `Telegram:ApiId`.
 
 3. Запустите хост:
 
 ```bash
-dotnet run --project src/Phos.App -- phos.json
+dotnet run --project src/Phos.App
 ```
 
-Путь к конфигу также можно задать через `PHOS_CONFIG`; по умолчанию — `phos.json`.
+Конфигурация собирается из `appsettings.json`, переменных окружения с префиксом `PHOS_` и аргументов командной строки. Переопределить значение можно так:
+
+```bash
+dotnet run --project src/Phos.App -- --Storage:DatabasePath /tmp/phos.db
+```
 
 ## Что уже работает
 
