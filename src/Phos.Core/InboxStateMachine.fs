@@ -11,6 +11,7 @@ type Status =
     | Completed
     | Failed
     | DeadLetter
+    | NeedsReview
 
 /// The durable state of an inbox command.
 type Command =
@@ -31,6 +32,8 @@ type Event =
     | LeaseExpired of DateTimeOffset
     | Retry
     | DeadLetter
+    | HostDied
+    | ReviewedRetry
 
 /// Applies `event` to `command`, returning the new state or an error for an
 /// invalid transition.
@@ -68,6 +71,17 @@ let apply (command: Command) (event: Event) : Result<Command, string> =
                     LeaseUntil = None
                     HeartbeatAt = None }
     | Failed, Event.DeadLetter ->
+        Ok
+            { command with
+                Status = Status.DeadLetter }
+    | (Claimed | Running), HostDied -> Ok { command with Status = NeedsReview }
+    | NeedsReview, ReviewedRetry ->
+        Ok
+            { command with
+                Status = Pending
+                LeaseUntil = None
+                HeartbeatAt = None }
+    | NeedsReview, Event.DeadLetter ->
         Ok
             { command with
                 Status = Status.DeadLetter }

@@ -9,9 +9,7 @@ open FsCheck.Xunit
 open Phos.Core.DomainTypes
 open Phos.Core.Whitelist
 open Phos.Core.ToolPolicy
-open Phos.Core.PromptBudget
 open Phos.Core.Chunker
-open Phos.Core.Rrf
 open Phos.Core.SchedulePolicy
 open Phos.Core.InboxStateMachine
 open Phos.Core.OutboxStateMachine
@@ -25,9 +23,6 @@ module Out = Phos.Core.OutboxStateMachine
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Monotonic, deterministic token counter (1 token per UTF-16 code unit).
-let tokenCount (s: string) : int = s.Length
 
 /// Generator of arbitrary strings (includes backticks to exercise fences).
 let private stringGen: Gen<string> =
@@ -184,207 +179,101 @@ let ``whitelist group requires allowed chat and uses stored role or User fallbac
 // ---------------------------------------------------------------------------
 
 [<Fact>]
-let ``tool policy admin tool denied for non-admin`` () =
-    let policy =
-        { Default = Tp.Allow
-          Tools = Map.empty
-          AdminTools = Set.singleton "kill" }
-
-    resolve policy User "kill"
-    |> should
-        equal
-        { Allowed = false
-          NeedsConfirmation = false }
-
-[<Fact>]
-let ``tool policy admin tool allowed for owner and admin`` () =
-    let policy =
-        { Default = Tp.Allow
-          Tools = Map.empty
-          AdminTools = Set.singleton "kill" }
-
-    resolve policy Owner "kill"
-    |> should
-        equal
-        { Allowed = true
-          NeedsConfirmation = false }
-
-    resolve policy Admin "kill"
-    |> should
-        equal
-        { Allowed = true
-          NeedsConfirmation = false }
+let ``role ordering is Owner >= Admin >= User`` () =
+    roleAtLeast Owner Admin |> should be True
+    roleAtLeast Owner User |> should be True
+    roleAtLeast Admin User |> should be True
+    roleAtLeast Admin Owner |> should be False
+    roleAtLeast User Owner |> should be False
+    roleAtLeast User Admin |> should be False
+    roleAtLeast Owner Owner |> should be True
+    roleAtLeast Admin Admin |> should be True
+    roleAtLeast User User |> should be True
 
 [<Fact>]
-let ``tool policy prompt needs confirmation`` () =
+let ``tool policy known tool allowed when role at least min role`` () =
     let policy =
-        { Default = Tp.Allow
-          Tools = Map.ofList [ "danger", Tp.Prompt ]
-          AdminTools = Set.empty }
+        { DefaultMinRole = None
+          Tools = Map.ofList [ "tg_send_message", Admin ] }
 
-    resolve policy User "danger"
-    |> should
-        equal
-        { Allowed = true
-          NeedsConfirmation = true }
+    resolve policy Owner "tg_send_message"
+    |> should equal { Allowed = true; MinRole = Some Admin }
+
+    resolve policy Admin "tg_send_message"
+    |> should equal { Allowed = true; MinRole = Some Admin }
 
 [<Fact>]
-let ``tool policy deny blocks`` () =
+let ``tool policy known tool denied when role below min role`` () =
     let policy =
-        { Default = Tp.Allow
-          Tools = Map.ofList [ "rm", Tp.Deny ]
-          AdminTools = Set.empty }
+        { DefaultMinRole = None
+          Tools = Map.ofList [ "tg_send_message", Admin ] }
 
-    resolve policy Admin "rm"
-    |> should
-        equal
-        { Allowed = false
-          NeedsConfirmation = false }
+    resolve policy User "tg_send_message"
+    |> should equal { Allowed = false; MinRole = None }
 
 [<Fact>]
-let ``tool policy unknown tool uses default`` () =
+let ``tool policy unknown tool uses default min role`` () =
     let policy =
-        { Default = Tp.Deny
-          Tools = Map.empty
-          AdminTools = Set.empty }
+        { DefaultMinRole = Some User
+          Tools = Map.empty }
 
     resolve policy Owner "unknown"
-    |> should
-        equal
-        { Allowed = false
-          NeedsConfirmation = false }
+    |> should equal { Allowed = true; MinRole = Some User }
 
-[<Property>]
-let ``tool policy admin tools require owner or admin`` (role: UserRole) (toolName: string) =
+    resolve policy Admin "unknown"
+    |> should equal { Allowed = true; MinRole = Some User }
+
+    resolve policy User "unknown"
+    |> should equal { Allowed = true; MinRole = Some User }
+
+[<Fact>]
+let ``tool policy unknown tool denied when default min role exceeds role`` () =
     let policy =
-        { Default = Tp.Allow
-          Tools = Map.empty
-          AdminTools = Set.singleton toolName }
+        { DefaultMinRole = Some Admin
+          Tools = Map.empty }
 
-    let decision = resolve policy role toolName
+    resolve policy User "unknown"
+    |> should equal { Allowed = false; MinRole = None }
 
-    match role with
-    | Owner
-    | Admin -> decision.Allowed
-    | User -> not decision.Allowed
-
-[<Property>]
-let ``tool policy unknown tool resolves to default``
-    (role: UserRole)
-    (defaultPolicy: Tp.ToolPolicy)
-    (toolName: string)
-    =
+[<Fact>]
+let ``tool policy unknown tool with no default is denied`` () =
     let policy =
-        { Default = defaultPolicy
-          Tools = Map.empty
-          AdminTools = Set.empty }
+        { DefaultMinRole = None
+          Tools = Map.empty }
 
-    let decision = resolve policy role toolName
-
-    match defaultPolicy with
-    | Tp.Allow -> decision.Allowed
-    | Tp.Prompt -> decision.Allowed && decision.NeedsConfirmation
-    | Tp.Deny -> not decision.Allowed
-
-// ---------------------------------------------------------------------------
-// PromptBudget
-// ---------------------------------------------------------------------------
-
-[<Fact>]
-let ``truncate keeps prefix up to max tokens`` () =
-    truncate tokenCount 4 "abcdefghij" |> should equal "abcd"
-
-[<Fact>]
-let ``truncate returns empty for non-positive max tokens`` () =
-    truncate tokenCount 0 "abcdef" |> should equal ""
-
-[<Fact>]
-let ``truncate returns text unchanged when within budget`` () =
-    truncate tokenCount 100 "abcdef" |> should equal "abcdef"
-
-[<Fact>]
-let ``build is deterministic`` () =
-    let budget =
-        { TotalTokens = 8
-          PerLayer = Map.ofList [ (BasePolicy, 5); (Persona, 5) ]
-          TruncationOrder = [ BasePolicy; Persona ] }
-
-    let contents =
-        [ { Layer = BasePolicy; Text = "abcdef" }
-          { Layer = Persona; Text = "ghijkl" } ]
-
-    build tokenCount budget contents
-    |> should equal (build tokenCount budget contents)
-
-[<Fact>]
-let ``build respects total and per-layer limits`` () =
-    let budget =
-        { TotalTokens = 6
-          PerLayer = Map.ofList [ (BasePolicy, 5); (Persona, 5) ]
-          TruncationOrder = [ BasePolicy; Persona ] }
-
-    let contents =
-        [ { Layer = BasePolicy; Text = "abcdef" }
-          { Layer = Persona; Text = "ghijkl" } ]
-
-    let result = build tokenCount budget contents
-
-    result
-    |> List.sumBy (fun (_, t) -> tokenCount t)
-    |> should be (lessThanOrEqualTo 6)
-
-    result
-    |> List.forall (fun (layer, text) ->
-        match Map.tryFind layer budget.PerLayer with
-        | Some cap -> tokenCount text <= cap
-        | None -> true)
-    |> should be True
-
-[<Fact>]
-let ``build keeps content order and skips missing layers`` () =
-    let budget =
-        { TotalTokens = 100
-          PerLayer = Map.ofList [ (BasePolicy, 100); (Persona, 100) ]
-          TruncationOrder = [ BasePolicy; Persona ] }
-
-    let contents =
-        [ { Layer = BasePolicy; Text = "hello" }; { Layer = Persona; Text = "world" } ]
-
-    let result = build tokenCount budget contents
-    result |> List.map fst |> should equal [ BasePolicy; Persona ]
-    result |> List.map snd |> should equal [ "hello"; "world" ]
-
-let private layerGen: Gen<Layer> =
-    Gen.elements [ BasePolicy; Persona; Skills; CoreMemory; Recall; State; CurrentJob ]
-
-let private contentGen: Gen<LayerContent list> =
-    Gen.listOf (
-        Gen.zip layerGen stringGen
-        |> Gen.map (fun (layer, text) -> { Layer = layer; Text = text })
-    )
-    |> Gen.map (List.distinctBy (fun c -> c.Layer))
-
-let private budgetGen: Gen<Budget> =
-    Gen.zip (Gen.choose (0, 200)) (Gen.zip (Gen.listOf (Gen.zip layerGen (Gen.choose (0, 100)))) (Gen.listOf layerGen))
-    |> Gen.map (fun (total, (perLayer, order)) ->
-        { TotalTokens = total
-          PerLayer = Map.ofList perLayer
-          TruncationOrder = order })
+    resolve policy Owner "unknown"
+    |> should equal { Allowed = false; MinRole = None }
 
 [<Property>]
-let ``prompt budget build respects total and per-layer`` () =
-    Prop.forAll (Arb.fromGen (Gen.zip contentGen budgetGen)) (fun (contents, budget) ->
-        let result = build tokenCount budget contents
-        let total = result |> List.sumBy (fun (_, t) -> tokenCount t)
+let ``tool policy known tool allowed iff role at least min role`` (role: UserRole) (minRole: UserRole) =
+    let policy =
+        { DefaultMinRole = None
+          Tools = Map.ofList [ "tool", minRole ] }
 
-        let perLayerOk =
-            result
-            |> List.forall (fun (layer, text) ->
-                match Map.tryFind layer budget.PerLayer with
-                | Some cap -> tokenCount text <= cap
-                | None -> true)
+    let decision = resolve policy role "tool"
 
-        total <= budget.TotalTokens && perLayerOk)
+    decision.Allowed = roleAtLeast role minRole
+    && (decision.Allowed = (decision.MinRole = Some minRole))
+
+[<Property>]
+let ``tool policy unknown tool resolves by default min role`` (role: UserRole) (minRole: UserRole option) =
+    let policy =
+        { DefaultMinRole = minRole
+          Tools = Map.empty }
+
+    let decision = resolve policy role "unknown"
+
+    match minRole with
+    | Some m ->
+        decision.Allowed = roleAtLeast role m
+        && (decision.Allowed = (decision.MinRole = Some m))
+    | None -> not decision.Allowed && decision.MinRole = None
+
+[<Property>]
+let ``roleAtLeast is a total preorder`` (a: UserRole) (b: UserRole) =
+    roleAtLeast a a
+    && (roleAtLeast a b || roleAtLeast b a)
+    && ((roleAtLeast a b && roleAtLeast b a) = (a = b))
 
 // ---------------------------------------------------------------------------
 // Chunker
@@ -480,56 +369,6 @@ let ``chunk fences are never cut`` () =
         && (not c.FenceOpened || c.Text.StartsWith("```"))
         && (not c.FenceClosed || c.Text.EndsWith("```")))
     |> should be True
-
-// ---------------------------------------------------------------------------
-// Rrf
-// ---------------------------------------------------------------------------
-
-[<Fact>]
-let ``rrf scores by reciprocal rank`` () =
-    let scores = score 1.0 [ Seq.ofList [ "a"; "b" ]; Seq.ofList [ "b"; "c" ] ]
-    scores.["a"] |> should equal (1.0 / 2.0)
-    scores.["b"] |> should equal (1.0 / 3.0 + 1.0 / 2.0)
-    scores.["c"] |> should equal (1.0 / 3.0)
-
-[<Property>]
-let ``rrf adding a list never decreases any score`` (k: float) (lists: string list list) (extra: string list) =
-    let k =
-        if Double.IsNaN k || Double.IsInfinity k then
-            1.0
-        else
-            abs k + 1.0
-
-    let toSeqSeq (xs: string list list) : seq<seq<string>> = xs |> List.map Seq.ofList |> List.toSeq
-    let baseScores = score k (toSeqSeq lists)
-    let newScores = score k (toSeqSeq (lists @ [ extra ]))
-
-    let allKeys =
-        Set.union
-            (baseScores |> Map.toList |> List.map fst |> Set.ofList)
-            (newScores |> Map.toList |> List.map fst |> Set.ofList)
-
-    allKeys
-    |> Set.forall (fun key ->
-        let b = Map.tryFind key baseScores |> Option.defaultValue 0.0
-        let n = Map.tryFind key newScores |> Option.defaultValue 0.0
-        n >= b)
-
-[<Property>]
-let ``rrf earlier rank contributes at least as much as later`` (k: float) (items: string list) =
-    let k =
-        if Double.IsNaN k || Double.IsInfinity k then
-            1.0
-        else
-            abs k + 1.0
-    // Distinct items preserve the rank->contribution ordering (duplicates would sum).
-    let distinct = items |> List.distinct
-    let scores = score k [ Seq.ofList distinct ]
-
-    distinct
-    |> List.mapi (fun i x -> x, i)
-    |> List.pairwise
-    |> List.forall (fun ((x, _), (y, _)) -> Map.find x scores >= Map.find y scores)
 
 // ---------------------------------------------------------------------------
 // SchedulePolicy
@@ -725,6 +564,85 @@ let ``inbox shouldDeadLetter flags exhausted failed commands`` () =
     In.shouldDeadLetter (mkInboxCommand In.Failed 2 5) |> should be False
     In.shouldDeadLetter (mkInboxCommand In.Running 5 5) |> should be False
 
+[<Fact>]
+let ``inbox Claimed --HostDied--> NeedsReview`` () =
+    let cmd = mkInboxCommand In.Claimed 1 5
+
+    match In.apply cmd In.HostDied with
+    | Ok next -> next.Status |> should equal In.NeedsReview
+    | Error msg -> failwith msg
+
+[<Fact>]
+let ``inbox Running --HostDied--> NeedsReview`` () =
+    let cmd = mkInboxCommand In.Running 1 5
+
+    match In.apply cmd In.HostDied with
+    | Ok next -> next.Status |> should equal In.NeedsReview
+    | Error msg -> failwith msg
+
+[<Fact>]
+let ``inbox NeedsReview --ReviewedRetry--> Pending preserves attempts`` () =
+    let cmd = mkInboxCommand In.NeedsReview 3 5
+
+    match In.apply cmd In.ReviewedRetry with
+    | Ok next ->
+        next.Status |> should equal In.Pending
+        next.Attempts |> should equal 3
+    | Error msg -> failwith msg
+
+[<Fact>]
+let ``inbox NeedsReview --DeadLetter--> DeadLetter`` () =
+    let cmd = mkInboxCommand In.NeedsReview 5 5
+
+    match In.apply cmd In.Event.DeadLetter with
+    | Ok next -> next.Status |> should equal In.Status.DeadLetter
+    | Error msg -> failwith msg
+
+[<Fact>]
+let ``inbox NeedsReview has no automatic transition except review or dead letter`` () =
+    let cmd = mkInboxCommand In.NeedsReview 3 5
+
+    (In.apply
+        cmd
+        (In.Claim(
+            DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero),
+            DateTimeOffset(2026, 1, 1, 0, 5, 0, TimeSpan.Zero)
+        ))
+     |> Result.isError)
+    |> should be True
+
+    (In.apply cmd In.Start |> Result.isError) |> should be True
+    (In.apply cmd In.Complete |> Result.isError) |> should be True
+    (In.apply cmd In.Fail |> Result.isError) |> should be True
+
+    (In.apply cmd (In.LeaseExpired(DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero)))
+     |> Result.isError)
+    |> should be True
+
+    (In.apply cmd In.Retry |> Result.isError) |> should be True
+    (In.apply cmd In.HostDied |> Result.isError) |> should be True
+
+[<Property>]
+let ``inbox HostDied from Claimed or Running yields NeedsReview`` (status: In.Status) =
+    (status = In.Claimed || status = In.Running)
+    ==> (let cmd = mkInboxCommand status 1 5
+
+         match In.apply cmd In.HostDied with
+         | Ok next -> next.Status = In.NeedsReview
+         | Error _ -> false)
+
+[<Property>]
+let ``inbox NeedsReview only transitions via ReviewedRetry or DeadLetter`` (ev: In.Event) =
+    let cmd = mkInboxCommand In.NeedsReview 3 5
+
+    match ev with
+    | In.Event.ReviewedRetry -> In.apply cmd ev = Ok { cmd with Status = In.Pending }
+    | In.Event.DeadLetter ->
+        In.apply cmd ev = Ok
+            { cmd with
+                Status = In.Status.DeadLetter }
+    | _ -> In.apply cmd ev |> Result.isError
+
 [<Property>]
 let ``inbox apply never throws and yields a known status or error``
     (attempts: int)
@@ -743,7 +661,8 @@ let ``inbox apply never throws and yields a known status or error``
               In.Running
               In.Completed
               In.Failed
-              In.Status.DeadLetter ]
+              In.Status.DeadLetter
+              In.NeedsReview ]
     | Error _ -> true
 
 // ---------------------------------------------------------------------------

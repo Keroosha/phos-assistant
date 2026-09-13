@@ -5,7 +5,7 @@ Parses Cobertura XML produced by coverlet and enforces the project policy:
 
   - total line coverage >= 90%
   - total branch coverage >= 85%
-  - per-project branch coverage >= 90% for Core / Pipeline / Scheduler
+  - per-project branch coverage >= 90% for Core / Storage / Scheduler
 
 Only source files under `src/` are counted; test projects are ignored.
 If no `src/` lines are measured yet (Phase 0 state), the gate reports a
@@ -24,7 +24,7 @@ import xml.etree.ElementTree as ET
 LINE_TOTAL = 0.90
 BRANCH_TOTAL = 0.85
 BRANCH_PER_PROJECT = 0.90
-BRANCH_REQUIRED_PROJECTS = ("Core", "Pipeline", "Scheduler")
+BRANCH_REQUIRED_PROJECTS = ("Core", "Storage", "Scheduler")
 
 
 class Project:
