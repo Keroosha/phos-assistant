@@ -18,7 +18,16 @@ open FsToolkit.ErrorHandling
 type TelegramTransport(config: TelegramConfig) =
     let peers = PeerCache()
 
+    // SessionStore (a FileStream) opens the session file at Client construction,
+    // so the session directory must already exist.
+    do Transport.ensureSessionDir config.SessionPath
+
     let client: WTelegram.Client =
+        // File-based session via `session_pathname` (SessionStore). The 3-arg
+        // ctor (byte[]/Action<byte[]>) would wrap an ActionStore with a null
+        // save callback → NRE on Session.Save() → session never persisted →
+        // re-auth on every start → 420 FLOOD_WAIT.
+        //
         // `configProvider` returns `string | null`; a null result means "not
         // configured" to WTelegramClient. phone/code/2FA keys are never answered,
         // so null must cross the interop boundary untouched.
@@ -26,11 +35,7 @@ type TelegramTransport(config: TelegramConfig) =
             Func<string, string>(fun key ->
                 match Transport.configProvider config key with
                 | null -> Unchecked.defaultof<string>
-                | s -> s),
-            // No in-memory session key: the session file is located via the
-            // `session_pathname` config key, and no save callback is needed.
-            Unchecked.defaultof<byte[]>,
-            Unchecked.defaultof<Action<byte[]>>
+                | s -> s)
         )
 
     let loginCore () : Task<BotInfo> =

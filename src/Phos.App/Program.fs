@@ -121,11 +121,27 @@ let main (argv: string[]) : int =
             builder.Services.AddHostedService<TelegramStartup>() |> ignore
             builder.Services.AddHostedService<OutboxDeliveryService>() |> ignore
 
+            // Never let an unhandled exception take the process down silently:
+            // log it and keep running (or record it) so transient failures are
+            // recoverable rather than fatal.
+            AppDomain.CurrentDomain.UnhandledException.Add(fun args ->
+                let detail =
+                    if obj.ReferenceEquals(args.ExceptionObject, null) then
+                        "unknown"
+                    else
+                        string args.ExceptionObject
+
+                eprintfn "phos: unhandled exception: %s" detail)
+
+            TaskScheduler.UnobservedTaskException.Add(fun args ->
+                eprintfn "phos: unobserved task exception: %s" args.Exception.Message
+                args.SetObserved())
+
             use host = builder.Build()
 
             try
                 host.Run()
                 0
             with ex ->
-                eprintfn "phos: %s" ex.Message
+                eprintfn "phos: %s" (ex.ToString())
                 1

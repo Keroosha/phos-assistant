@@ -138,19 +138,35 @@ module Transport =
         | _ -> 0L
 
     /// Maps a WTelegramClient transport exception to a typed `SendError`.
-    /// Recognizes `FLOOD_WAIT_<n>` / `SLOWMODE_WAIT_<n>` (underscore optional);
-    /// everything else becomes `Other`.
+    /// A 420 `RpcException` carries the real wait seconds in `X` (the message is
+    /// masked to e.g. "FLOOD_WAIT_X"), so it is preferred. Otherwise recognizes
+    /// `FLOOD_WAIT_<n>` / `SLOWMODE_WAIT_<n>` (underscore optional) from the
+    /// message text; everything else becomes `Other`.
     let mapRpcError (ex: exn) : SendError =
-        let m = Regex.Match(ex.Message, "(FLOOD_WAIT|SLOWMODE_WAIT)_?(\d+)")
+        match ex with
+        | :? TL.RpcException as rpc when rpc.Code = 420 && rpc.X > 0 ->
+            if rpc.Message.StartsWith "SLOWMODE" then
+                SlowModeWait rpc.X
+            else
+                FloodWait rpc.X
+        | _ ->
+            let m = Regex.Match(ex.Message, "(FLOOD_WAIT|SLOWMODE_WAIT)_?(\d+)")
 
-        if m.Success then
-            let seconds = int m.Groups.[2].Value
+            if m.Success then
+                let seconds = int m.Groups.[2].Value
 
-            match m.Groups.[1].Value with
-            | "FLOOD_WAIT" -> FloodWait seconds
-            | _ -> SlowModeWait seconds
-        else
-            Other ex.Message
+                match m.Groups.[1].Value with
+                | "FLOOD_WAIT" -> FloodWait seconds
+                | _ -> SlowModeWait seconds
+            else
+                Other ex.Message
+
+    /// Delay before retrying a failed bot login: exact FLOOD_WAIT seconds when the
+    /// RpcException carries them (X), otherwise a fixed 30s backoff.
+    let loginRetryDelay (ex: exn) : TimeSpan =
+        match ex with
+        | :? TL.RpcException as rpc when rpc.Code = 420 && rpc.X > 0 -> TimeSpan.FromSeconds(float rpc.X)
+        | _ -> TimeSpan.FromSeconds 30.0
 
     /// Builds the bot identity from a logged-in `TL.User`.
     let extractBotInfo (userId: int64) (botUser: TL.User) : BotInfo =

@@ -956,6 +956,25 @@ let ``mapRpcError recognizes flood and slowmode waits and falls back to Other`` 
     Transport.mapRpcError (Exception "boom") |> should equal (Other "boom")
 
 [<Fact>]
+let ``mapRpcError uses RpcException X for flood and slowmode waits`` () =
+    Transport.mapRpcError (TL.RpcException(420, "FLOOD_WAIT_X", 1518))
+    |> should equal (FloodWait 1518)
+
+    Transport.mapRpcError (TL.RpcException(420, "SLOWMODE_WAIT_X", 7))
+    |> should equal (SlowModeWait 7)
+
+[<Fact>]
+let ``login retry delay uses flood wait seconds from RpcException`` () =
+    Transport.loginRetryDelay (TL.RpcException(420, "FLOOD_WAIT_X", 1518))
+    |> should equal (TimeSpan.FromSeconds 1518.0)
+
+    Transport.loginRetryDelay (TL.RpcException(500, "INTERNAL", -1))
+    |> should equal (TimeSpan.FromSeconds 30.0)
+
+    Transport.loginRetryDelay (Exception "boom")
+    |> should equal (TimeSpan.FromSeconds 30.0)
+
+[<Fact>]
 let ``buildSendRequest sets peer, message, random id and entities`` () =
     let peer = TL.InputPeerUser(1L, 2L) :> TL.InputPeer
 

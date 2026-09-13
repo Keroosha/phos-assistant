@@ -54,12 +54,20 @@ type OutboxDelivery(outbox: IMessageOutbox, transport: ITelegramTransport, logge
                     return true
         }
 
-    /// Runs the delivery loop until `ct` is cancelled.
+    /// Runs the delivery loop until `ct` is cancelled. Each iteration is
+    /// guarded so a transient/unexpected error never kills the background
+    /// service; it is logged and the loop resumes after a short backoff.
     member this.RunAsync(ct: CancellationToken) : Task<unit> =
         task {
             while not ct.IsCancellationRequested do
-                let! processed = this.DeliverOnceAsync ct
+                try
+                    let! processed = this.DeliverOnceAsync ct
 
-                if not processed then
-                    do! Task.Delay(TimeSpan.FromMilliseconds 100.0, ct)
+                    if not processed then
+                        do! Task.Delay(TimeSpan.FromMilliseconds 100.0, ct)
+                with
+                | :? OperationCanceledException as oce -> raise oce
+                | ex ->
+                    logger.LogError(ex, "outbox delivery iteration failed")
+                    do! Task.Delay(TimeSpan.FromSeconds 5.0, ct)
         }
