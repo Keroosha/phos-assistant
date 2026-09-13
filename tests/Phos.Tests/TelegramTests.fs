@@ -121,6 +121,20 @@ type FakeTransport() =
         member _.EditMessage _ _ _ _ = Task.FromResult(())
         member _.DownloadVoice _ = task { return voiceBytes }
 
+/// Fake voice processor returning a configurable result, so the update handler
+/// voice path can be tested without a real STT service.
+type FakeVoiceProcessor() =
+    let mutable result = Ok "текст"
+
+    member _.Result
+        with set (v: Result<string, string>) = result <- v
+
+    interface IVoiceProcessor with
+        member _.ProcessAsync(_: VoiceRef) = task { return result }
+
+/// Default fake voice processor for the handler tests that are not about voice.
+let private noopVoice = FakeVoiceProcessor()
+
 /// Capturing ILogger that records (level, eventId, message) for each log call.
 type CapturingLogger() =
     let entries = ResizeArray<LogLevel * EventId * string>()
@@ -200,7 +214,8 @@ let ``allowlisted start is accepted and upserts the user`` () =
                 let whitelist =
                     Phos.Core.Whitelist.create (Map.ofList [ (UserId 1L, User) ]) Set.empty
 
-                let handler = UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue)
+                let handler =
+                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, noopVoice)
 
                 let update = mkUpdate 100L testChat testUser (Some "/start") None
                 let! result = handler.HandleAsync update
@@ -246,7 +261,8 @@ let ``start is denied before admission for a non-whitelisted user`` () =
                 let whitelist =
                     Phos.Core.Whitelist.create (Map.ofList [ (UserId 1L, User) ]) Set.empty
 
-                let handler = UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue)
+                let handler =
+                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, noopVoice)
 
                 let stranger =
                     { Id = UserId 999L
@@ -291,7 +307,8 @@ let ``non-whitelisted text is denied and admit is not called`` () =
                 let whitelist =
                     Phos.Core.Whitelist.create (Map.ofList [ (UserId 1L, User) ]) Set.empty
 
-                let handler = UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue)
+                let handler =
+                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, noopVoice)
 
                 let stranger =
                     { Id = UserId 999L
@@ -333,7 +350,8 @@ let ``ping is accepted and pong is delivered with the same random id`` () =
                 let whitelist =
                     Phos.Core.Whitelist.create (Map.ofList [ (UserId 1L, User) ]) Set.empty
 
-                let handler = UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue)
+                let handler =
+                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, noopVoice)
 
                 let update = mkUpdate 200L testChat testUser (Some "/ping") None
                 let! result = handler.HandleAsync update
@@ -385,7 +403,8 @@ let ``duplicate update id is rejected and admitted once`` () =
                 let whitelist =
                     Phos.Core.Whitelist.create (Map.ofList [ (UserId 1L, User) ]) Set.empty
 
-                let handler = UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue)
+                let handler =
+                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, noopVoice)
 
                 let update = mkUpdate 300L testChat testUser (Some "hello") None
                 let! first = handler.HandleAsync update
@@ -423,7 +442,11 @@ let ``voice update is admitted with a voice marker and voice bytes download`` ()
                 let whitelist =
                     Phos.Core.Whitelist.create (Map.ofList [ (UserId 1L, User) ]) Set.empty
 
-                let handler = UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue)
+                let voiceProc = FakeVoiceProcessor()
+                voiceProc.Result <- Ok "распознанный текст"
+
+                let handler =
+                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, voiceProc)
 
                 let voiceRef =
                     { ChatId = testChat.Id
@@ -435,12 +458,66 @@ let ``voice update is admitted with a voice marker and voice bytes download`` ()
                 let! result = handler.HandleAsync update
                 result |> should equal Accepted
                 admitCalls.Count |> should equal 1
-                admitCalls.[0].Payload |> should equal "voice:500"
+                admitCalls.[0].Payload |> should equal "распознанный текст"
 
                 let transport = FakeTransport()
                 transport.VoiceBytes <- [| 9uy; 8uy; 7uy |]
                 let! bytes = (transport :> ITelegramTransport).DownloadVoice voiceRef
                 bytes |> should equal [| 9uy; 8uy; 7uy |]
+            finally
+                dispose exec
+        }
+    finally
+        deleteDir dir
+
+[<Fact>]
+let ``voice error replies a warning and does not admit`` () =
+    let dir = makeTempDir ()
+    let dbPath = Path.Combine(dir, "phos.db")
+
+    try
+        task {
+            let exec = createExecutor dbPath
+
+            try
+                let inbox, _, users = mkRepos exec
+                let dedupe = UpdateDedupe(1000)
+                let admitCalls = ResizeArray<CommandEnvelope>()
+                let outbox = ResizeArray<OutboxEnvelope>()
+
+                let enqueue (env: OutboxEnvelope) =
+                    task {
+                        outbox.Add env
+                        return ()
+                    }
+
+                let admit (env: CommandEnvelope) =
+                    task {
+                        admitCalls.Add env
+                        return Admitted 1L
+                    }
+
+                let whitelist =
+                    Phos.Core.Whitelist.create (Map.ofList [ (UserId 1L, User) ]) Set.empty
+
+                let voiceProc = FakeVoiceProcessor()
+                voiceProc.Result <- Error "голосовое слишком большое"
+
+                let handler =
+                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, voiceProc)
+
+                let voiceRef =
+                    { ChatId = testChat.Id
+                      MessageId = 503L
+                      FileReference = [| 1uy; 2uy |]
+                      AccessHash = 123L }
+
+                let update = mkUpdate 405L testChat testUser None (Some voiceRef)
+                let! result = handler.HandleAsync update
+                result |> should equal Accepted
+                admitCalls.Count |> should equal 0
+                outbox.Count |> should equal 1
+                outbox.[0].Payload |> should equal "⚠️ голосовое слишком большое"
             finally
                 dispose exec
         }
@@ -465,7 +542,8 @@ let ``admit failure yields AdmitFailed`` () =
                 let whitelist =
                     Phos.Core.Whitelist.create (Map.ofList [ (UserId 1L, User) ]) Set.empty
 
-                let handler = UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue)
+                let handler =
+                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, noopVoice)
 
                 let update = mkUpdate 500L testChat testUser (Some "hello") None
                 let! result = handler.HandleAsync update
@@ -1401,7 +1479,8 @@ let ``group chat with an allowed chat id is processed`` () =
                 let whitelist =
                     Phos.Core.Whitelist.create (Map.ofList [ (UserId 1L, User) ]) (Set.ofList [ ChatId 10L ])
 
-                let handler = UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue)
+                let handler =
+                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, noopVoice)
 
                 let groupChat = { Id = ChatId 10L; Kind = Group }
                 let update = mkUpdate 900L groupChat testUser (Some "hello") None
@@ -1438,7 +1517,11 @@ let ``voice update with text still admits the voice marker`` () =
                 let whitelist =
                     Phos.Core.Whitelist.create (Map.ofList [ (UserId 1L, User) ]) Set.empty
 
-                let handler = UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue)
+                let voiceProc = FakeVoiceProcessor()
+                voiceProc.Result <- Ok "голосовой текст"
+
+                let handler =
+                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, voiceProc)
 
                 let voiceRef =
                     { ChatId = testChat.Id
@@ -1450,7 +1533,7 @@ let ``voice update with text still admits the voice marker`` () =
                 let! result = handler.HandleAsync update
                 result |> should equal Accepted
                 admitCalls.Count |> should equal 1
-                admitCalls.[0].Payload |> should equal "voice:501"
+                admitCalls.[0].Payload |> should equal "голосовой текст"
             finally
                 dispose exec
         }
@@ -1481,7 +1564,8 @@ let ``empty update admits an empty command payload`` () =
                 let whitelist =
                     Phos.Core.Whitelist.create (Map.ofList [ (UserId 1L, User) ]) Set.empty
 
-                let handler = UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue)
+                let handler =
+                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, noopVoice)
 
                 let update = mkUpdate 902L testChat testUser None None
                 let! result = handler.HandleAsync update
@@ -1518,7 +1602,8 @@ let ``unknown slash command is admitted as a command`` () =
                 let whitelist =
                     Phos.Core.Whitelist.create (Map.ofList [ (UserId 1L, User) ]) Set.empty
 
-                let handler = UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue)
+                let handler =
+                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, noopVoice)
 
                 let update = mkUpdate 903L testChat testUser (Some "/help") None
                 let! result = handler.HandleAsync update
@@ -1555,7 +1640,11 @@ let ``voice update in an allowed group chat is admitted`` () =
                 let whitelist =
                     Phos.Core.Whitelist.create (Map.ofList [ (UserId 1L, User) ]) (Set.ofList [ ChatId 20L ])
 
-                let handler = UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue)
+                let voiceProc = FakeVoiceProcessor()
+                voiceProc.Result <- Ok "текст из группы"
+
+                let handler =
+                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, voiceProc)
 
                 let groupChat = { Id = ChatId 20L; Kind = Group }
 
@@ -1569,7 +1658,7 @@ let ``voice update in an allowed group chat is admitted`` () =
                 let! result = handler.HandleAsync update
                 result |> should equal Accepted
                 admitCalls.Count |> should equal 1
-                admitCalls.[0].Payload |> should equal "voice:502"
+                admitCalls.[0].Payload |> should equal "текст из группы"
             finally
                 dispose exec
         }
@@ -1600,7 +1689,8 @@ let ``group chat not in whitelist is denied with ChatNotAllowed`` () =
                 let whitelist =
                     Phos.Core.Whitelist.create (Map.ofList [ (UserId 1L, User) ]) Set.empty
 
-                let handler = UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue)
+                let handler =
+                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, noopVoice)
 
                 let groupChat = { Id = ChatId 30L; Kind = Group }
                 let update = mkUpdate 905L groupChat testUser (Some "hello") None
@@ -1639,7 +1729,8 @@ let ``start in a channel with an allowed chat id upserts the user`` () =
                 let whitelist =
                     Phos.Core.Whitelist.create (Map.ofList [ (UserId 1L, User) ]) (Set.ofList [ ChatId 40L ])
 
-                let handler = UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue)
+                let handler =
+                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, noopVoice)
 
                 let channel = { Id = ChatId 40L; Kind = Channel }
                 let update = mkUpdate 906L channel testUser (Some "/start") None
@@ -1680,7 +1771,8 @@ let ``ping with trailing text still replies pong`` () =
                 let whitelist =
                     Phos.Core.Whitelist.create (Map.ofList [ (UserId 1L, User) ]) Set.empty
 
-                let handler = UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue)
+                let handler =
+                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, noopVoice)
 
                 let update = mkUpdate 907L testChat testUser (Some "/ping please") None
                 let! result = handler.HandleAsync update
@@ -1716,7 +1808,8 @@ let ``ping in an allowed group chat is accepted`` () =
                 let whitelist =
                     Phos.Core.Whitelist.create (Map.ofList [ (UserId 1L, User) ]) (Set.ofList [ ChatId 50L ])
 
-                let handler = UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue)
+                let handler =
+                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, noopVoice)
 
                 let groupChat = { Id = ChatId 50L; Kind = Group }
                 let update = mkUpdate 908L groupChat testUser (Some "/ping") None
@@ -1753,7 +1846,8 @@ let ``empty text string is admitted as an empty command`` () =
                 let whitelist =
                     Phos.Core.Whitelist.create (Map.ofList [ (UserId 1L, User) ]) Set.empty
 
-                let handler = UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue)
+                let handler =
+                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, noopVoice)
 
                 let update = mkUpdate 909L testChat testUser (Some "") None
                 let! result = handler.HandleAsync update
@@ -1784,7 +1878,8 @@ let ``start with a user that has no username still upserts`` () =
                 let whitelist =
                     Phos.Core.Whitelist.create (Map.ofList [ (UserId 1L, User) ]) Set.empty
 
-                let handler = UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue)
+                let handler =
+                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, noopVoice)
 
                 let noUsername =
                     { Id = UserId 1L
@@ -1828,7 +1923,8 @@ let ``ping with a voice still replies pong`` () =
                 let whitelist =
                     Phos.Core.Whitelist.create (Map.ofList [ (UserId 1L, User) ]) Set.empty
 
-                let handler = UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue)
+                let handler =
+                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, noopVoice)
 
                 let voiceRef =
                     { ChatId = testChat.Id
@@ -1872,7 +1968,8 @@ let ``admit failure returns AdmitFailed and enqueues nothing`` () =
                 let whitelist =
                     Phos.Core.Whitelist.create (Map.ofList [ (UserId 1L, User) ]) Set.empty
 
-                let handler = UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue)
+                let handler =
+                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, noopVoice)
 
                 let update = mkUpdate 920L testChat testUser (Some "hello") None
                 let! result = handler.HandleAsync update
@@ -1909,7 +2006,8 @@ let ``update without text or voice is admitted with an empty payload`` () =
                 let whitelist =
                     Phos.Core.Whitelist.create (Map.ofList [ (UserId 1L, User) ]) Set.empty
 
-                let handler = UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue)
+                let handler =
+                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, noopVoice)
 
                 let update = mkUpdate 921L testChat testUser None None
                 let! result = handler.HandleAsync update

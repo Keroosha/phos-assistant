@@ -11,6 +11,7 @@
     <Compile Include="UpdateModel.fs" />
     <Compile Include="UpdateDedupe.fs" />
     <Compile Include="EntitySend.fs" />
+    <Compile Include="VoiceProcessor.fs" />
     <Compile Include="UpdateHandler.fs" />
     <Compile Include="PhosLog.fs" />
     <Compile Include="OutboxDelivery.fs" />
@@ -26,6 +27,7 @@
   <ItemGroup>
     <ProjectReference Include="../../src/Phos.Core/Phos.Core.fsproj" />
     <ProjectReference Include="../../src/Phos.Storage/Phos.Storage.fsproj" />
+    <ProjectReference Include="../../src/Phos.Speech/Phos.Speech.fsproj" />
   </ItemGroup>
 
 </Project>

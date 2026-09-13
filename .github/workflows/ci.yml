@@ -12,5 +12,7 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           global-json-file: global.json
+      - name: Provision STT models
+        run: bash scripts/provision-stt.sh
       - name: Run gates
         run: bash scripts/ci.sh

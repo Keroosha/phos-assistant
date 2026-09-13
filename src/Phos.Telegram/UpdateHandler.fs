@@ -41,7 +41,8 @@ type UpdateHandler
         users: IUserRepository,
         dedupe: UpdateDedupe,
         admit: CommandEnvelope -> Task<AdmitOutcome>,
-        enqueueOutbox: OutboxEnvelope -> Task<unit>
+        enqueueOutbox: OutboxEnvelope -> Task<unit>,
+        voice: IVoiceProcessor
     ) =
 
     let greetingText = "Привет! Я phos, твой ассистент в Telegram."
@@ -92,22 +93,40 @@ type UpdateHandler
                         do! enqueueReply update.UpdateId update.Chat "pong"
                         return Accepted
                     | _ ->
-                        let payload =
-                            match update.Voice with
-                            | Some voice -> sprintf "voice:%d" voice.MessageId
-                            | None -> update.Text |> Option.defaultValue ""
+                        match update.Voice with
+                        | Some v ->
+                            let! result = voice.ProcessAsync v
 
-                        let envelope =
-                            { Origin = Telegram
-                              ExternalKey = Some(sprintf "tg:%d" update.UpdateId)
-                              UserId = update.From.Id
-                              ChatId = update.Chat.Id
-                              Payload = payload
-                              Priority = 0 }
+                            match result with
+                            | Ok text ->
+                                let envelope =
+                                    { Origin = Telegram
+                                      ExternalKey = Some(sprintf "tg:%d" update.UpdateId)
+                                      UserId = update.From.Id
+                                      ChatId = update.Chat.Id
+                                      Payload = text
+                                      Priority = 0 }
 
-                        let! outcome = admit envelope
+                                let! outcome = admit envelope
 
-                        match outcome with
-                        | Admitted _ -> return Accepted
-                        | Failed -> return AdmitFailed
+                                match outcome with
+                                | Admitted _ -> return Accepted
+                                | Failed -> return AdmitFailed
+                            | Error msg ->
+                                do! enqueueReply update.UpdateId update.Chat ("⚠️ " + msg)
+                                return Accepted
+                        | None ->
+                            let envelope =
+                                { Origin = Telegram
+                                  ExternalKey = Some(sprintf "tg:%d" update.UpdateId)
+                                  UserId = update.From.Id
+                                  ChatId = update.Chat.Id
+                                  Payload = update.Text |> Option.defaultValue ""
+                                  Priority = 0 }
+
+                            let! outcome = admit envelope
+
+                            match outcome with
+                            | Admitted _ -> return Accepted
+                            | Failed -> return AdmitFailed
         }

@@ -23,6 +23,8 @@
     <PackageVersion Include="Microsoft.Extensions.Configuration.Binder" Version="10.0.12" />
     <!-- Telegram: MTProto bot transport -->
     <PackageVersion Include="WTelegramClient" Version="4.4.8" />
+    <!-- Speech: sherpa-onnx managed wrapper (transitively pulls the linux-x64 native runtime) -->
+    <PackageVersion Include="org.k2fsa.sherpa.onnx" Version="1.13.8" />
     <!-- Test stack -->
     <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.10.0" />
     <PackageVersion Include="xunit" Version="2.9.3" />

@@ -33,13 +33,32 @@ type WhitelistSettings =
     { Users: ConfigUser array
       AllowedChats: int64 array }
 
+/// Speech-to-text settings, bound from the `Stt` config section. `WhisperDir`
+/// is optional; an empty string disables the Whisper fallback engine.
+[<CLIMutable>]
+type SttSettings =
+    { Enabled: bool
+      ModelPath: string
+      TokensPath: string
+      VadModelPath: string
+      WhisperDir: string
+      NumThreads: int
+      MaxBytes: int64
+      MaxDurationSeconds: int
+      FfmpegPath: string
+      FfmpegTimeoutSeconds: int
+      ProbeTimeoutSeconds: int
+      MaxConcurrentStt: int
+      ModelSha256: string }
+
 /// App-wide configuration bound from `IConfiguration` (appsettings.json +
 /// `PHOS_` environment variables + command line).
 [<CLIMutable>]
 type AppConfig =
     { Telegram: TelegramSettings
       Storage: StorageSettings
-      Whitelist: WhitelistSettings }
+      Whitelist: WhitelistSettings
+      Stt: SttSettings }
 
 /// Binds and validates the app configuration.
 module Config =
@@ -90,6 +109,29 @@ module Config =
                     (not (String.IsNullOrWhiteSpace cfg.Telegram.BotToken))
 
             do! validateRoles cfg.Whitelist.Users
+
+            if cfg.Stt.Enabled then
+                do!
+                    Result.requireTrue
+                        "Stt:ModelPath must not be empty"
+                        (not (String.IsNullOrWhiteSpace cfg.Stt.ModelPath))
+
+                do!
+                    Result.requireTrue
+                        "Stt:TokensPath must not be empty"
+                        (not (String.IsNullOrWhiteSpace cfg.Stt.TokensPath))
+
+                do!
+                    Result.requireTrue
+                        "Stt:VadModelPath must not be empty"
+                        (not (String.IsNullOrWhiteSpace cfg.Stt.VadModelPath))
+
+                do! Result.requireTrue "Stt:NumThreads must be >= 1" (cfg.Stt.NumThreads >= 1)
+                do! Result.requireTrue "Stt:MaxBytes must be > 0" (cfg.Stt.MaxBytes > 0L)
+                do! Result.requireTrue "Stt:MaxDurationSeconds must be > 0" (cfg.Stt.MaxDurationSeconds > 0)
+                do! Result.requireTrue "Stt:MaxConcurrentStt must be >= 1" (cfg.Stt.MaxConcurrentStt >= 1)
+                do! Result.requireTrue "Stt:FfmpegTimeoutSeconds must be > 0" (cfg.Stt.FfmpegTimeoutSeconds > 0)
+
             return cfg
         }
 
@@ -98,7 +140,7 @@ module Config =
     /// vars) yields an `Error` describing the missing file.
     let bind (configuration: IConfiguration) : Result<AppConfig, string> =
         let sections =
-            [ "Telegram"; "Storage"; "Whitelist" ]
+            [ "Telegram"; "Storage"; "Whitelist"; "Stt" ]
             |> List.forall (fun name -> configuration.GetSection(name).Exists())
 
         if not sections then
@@ -137,3 +179,23 @@ module Config =
           BusyTimeout = TimeSpan.FromSeconds(float cfg.Storage.BusyTimeoutSeconds)
           ReadPoolSize = cfg.Storage.ReadPoolSize
           CheckpointEvery = cfg.Storage.CheckpointEvery }
+
+    /// Builds STT options from the config. An empty `WhisperDir` disables the
+    /// Whisper fallback engine.
+    let toSttOptions (cfg: AppConfig) : Phos.Speech.SttOptions =
+        { ModelPath = cfg.Stt.ModelPath
+          TokensPath = cfg.Stt.TokensPath
+          VadModelPath = cfg.Stt.VadModelPath
+          WhisperDir =
+            if String.IsNullOrWhiteSpace cfg.Stt.WhisperDir then
+                None
+            else
+                Some cfg.Stt.WhisperDir
+          NumThreads = cfg.Stt.NumThreads
+          MaxBytes = cfg.Stt.MaxBytes
+          MaxDurationSeconds = cfg.Stt.MaxDurationSeconds
+          FfmpegPath = cfg.Stt.FfmpegPath
+          FfmpegTimeoutSeconds = cfg.Stt.FfmpegTimeoutSeconds
+          ProbeTimeoutSeconds = cfg.Stt.ProbeTimeoutSeconds
+          MaxConcurrentStt = cfg.Stt.MaxConcurrentStt
+          ModelSha256 = cfg.Stt.ModelSha256 }

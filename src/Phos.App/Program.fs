@@ -9,6 +9,7 @@ open Microsoft.Extensions.Hosting
 open Microsoft.Extensions.Logging
 open Phos.Core.Whitelist
 open Phos.Storage
+open Phos.Speech
 open Phos.Telegram
 open Phos.App
 
@@ -78,6 +79,21 @@ let main (argv: string[]) : int =
                 sp.GetRequiredService<TelegramTransport>() :> ITelegramTransport)
             |> ignore
 
+            let sttOptions = Config.toSttOptions cfg
+
+            builder.Services.AddSingleton<ISttService>(fun sp ->
+                new SttService(sttOptions, sp.GetRequiredService<ILogger<SttService>>()) :> ISttService)
+            |> ignore
+
+            builder.Services.AddSingleton<IVoiceProcessor>(fun sp ->
+                VoiceProcessor(
+                    sp.GetRequiredService<ITelegramTransport>(),
+                    sp.GetRequiredService<ISttService>(),
+                    sp.GetRequiredService<ILogger<VoiceProcessor>>()
+                )
+                :> IVoiceProcessor)
+            |> ignore
+
             builder.Services.AddSingleton<UpdateHandler>(fun sp ->
                 let inbox = sp.GetRequiredService<ICommandInbox>()
                 let users = sp.GetRequiredService<IUserRepository>()
@@ -107,7 +123,15 @@ let main (argv: string[]) : int =
                         return ()
                     }
 
-                UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueueOutbox))
+                UpdateHandler(
+                    whitelist,
+                    inbox,
+                    users,
+                    dedupe,
+                    admit,
+                    enqueueOutbox,
+                    sp.GetRequiredService<IVoiceProcessor>()
+                ))
             |> ignore
 
             builder.Services.AddSingleton<OutboxDelivery>(fun sp ->
@@ -120,6 +144,14 @@ let main (argv: string[]) : int =
 
             builder.Services.AddHostedService<TelegramStartup>() |> ignore
             builder.Services.AddHostedService<OutboxDeliveryService>() |> ignore
+
+            builder.Services.AddHostedService<SttSelfTest>(fun sp ->
+                SttSelfTest(
+                    cfg.Stt,
+                    sp.GetRequiredService<ISttService>(),
+                    sp.GetRequiredService<ILogger<SttSelfTest>>()
+                ))
+            |> ignore
 
             // Never let an unhandled exception take the process down silently:
             // log it and keep running (or record it) so transient failures are

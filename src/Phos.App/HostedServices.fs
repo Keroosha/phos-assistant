@@ -5,6 +5,7 @@ open System.Threading
 open System.Threading.Tasks
 open Microsoft.Extensions.Hosting
 open Microsoft.Extensions.Logging
+open Phos.Speech
 open Phos.Telegram
 
 /// Hosted service that wires the Telegram update handler and performs the bot
@@ -67,3 +68,20 @@ type OutboxDeliveryService(delivery: OutboxDelivery) =
     inherit BackgroundService()
 
     override _.ExecuteAsync(stoppingToken: CancellationToken) : Task = delivery.RunAsync stoppingToken :> Task
+
+/// Hosted service that validates the STT model files (existence + checksum pin)
+/// shortly after startup. A failure is logged but does NOT crash the host — the
+/// resilience rule — so a transient provisioning gap never takes the process
+/// down; subsequent per-call transcriptions surface a `ModelError`.
+type SttSelfTest(settings: SttSettings, stt: ISttService, logger: ILogger<SttSelfTest>) =
+    interface IHostedService with
+        member _.StartAsync(_: CancellationToken) : Task =
+            task {
+                if settings.Enabled then
+                    match stt.Validate() with
+                    | Ok() -> logger.LogInformation("STT models validated")
+                    | Error msg -> logger.LogError("STT validation failed: {Message}", msg)
+            }
+            :> Task
+
+        member _.StopAsync(_: CancellationToken) : Task = Task.CompletedTask
