@@ -73,15 +73,57 @@
 
 ---
 
-## Phase 2 (v2) — контур (НЕ реализуется сейчас)
+## Phase 2 (v2) — Encrypted storage и durable queue (`src/Phos.Storage`)
 
-- `src/Phos.Storage`: миграции (users c `workspace_path`, command_inbox, message_outbox, schedule_jobs, schedule_runs, backup_log), storage executor (single-writer + read pool, WAL, busy_timeout, checkpoint), leases, репозитории inbox/outbox.
-- **Нет** `mcp_servers`/`mcp_tokens`/TokenCrypto — креды MCP в `agent.db` OMP.
-- Acceptance «keys отсутствуют в DB/логах» = секреты phos (bot token, API-key провайдера) не попадают в DB/логи.
+Пакеты: `Microsoft.Data.Sqlite` 10.0.12 (pin в `Directory.Packages.props`). Проект `src/Phos.Storage/Phos.Storage.fsproj` (FSharp.Core + Microsoft.Data.Sqlite), ProjectReference на `Phos.Core`. Добавить в `Phos.sln`. Ссылается на: `Phos.Core.DomainTypes`, `Phos.Core.InboxStateMachine.Status`, `Phos.Core.OutboxStateMachine.Status`, `Phos.Core.UserRole`.
 
-## Phase 3 (v2) — контур (НЕ реализуется сейчас)
+Файлы (порядок в fsproj):
 
-- `src/Phos.Telegram`: bot login (WTelegramClient), UpdateManager, peer cache, voice download, entity-safe send/edit/live draft, FLOOD_WAIT, random-id outbox delivery; whitelist до queue admission.
+1. `Schema.fs` — `type Migration = { Version: int; Name: string; Sql: string }`; `val migrate: StorageExecutor -> Migration list -> Task<int>` (идемпотентно, каждая миграция в транзакции, `schema_version`). DDL (v2-схема, timestamps INTEGER unix seconds UTC):
+   - `schema_version(version INTEGER NOT NULL, applied_at INTEGER NOT NULL)`
+   - `users(user_id INTEGER PRIMARY KEY, username TEXT, role TEXT NOT NULL, workspace_path TEXT NOT NULL, timezone TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`
+   - `command_inbox(id INTEGER PRIMARY KEY AUTOINCREMENT, origin TEXT NOT NULL, external_key TEXT UNIQUE, user_id INTEGER NOT NULL, chat_id INTEGER NOT NULL, payload TEXT NOT NULL, priority INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'pending', lease_until INTEGER NULL, heartbeat_at INTEGER NULL, attempts INTEGER NOT NULL DEFAULT 0, max_attempts INTEGER NOT NULL DEFAULT 5, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`
+   - `message_outbox(id INTEGER PRIMARY KEY AUTOINCREMENT, command_id INTEGER NOT NULL, chunk_index INTEGER NOT NULL, chat_id INTEGER NOT NULL, random_id INTEGER NOT NULL UNIQUE, payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', remote_message_id INTEGER NULL, attempts INTEGER NOT NULL DEFAULT 0, max_attempts INTEGER NOT NULL DEFAULT 5, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, UNIQUE(command_id, chunk_index))`
+   - `schedule_jobs(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, cron_expr TEXT NOT NULL, timezone TEXT NOT NULL, prompt TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, catchup_policy TEXT NOT NULL DEFAULT 'skip', next_run INTEGER NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`
+   - `schedule_runs(job_id INTEGER NOT NULL, scheduled_for INTEGER NOT NULL, status TEXT NOT NULL, command_id INTEGER NULL, PRIMARY KEY(job_id, scheduled_for))`
+   - `backup_log(id INTEGER PRIMARY KEY AUTOINCREMENT, started_at INTEGER NOT NULL, finished_at INTEGER NULL, path TEXT NULL, checksum TEXT NULL, status TEXT NOT NULL, error TEXT NULL)`
+   - Статусы inbox: 'pending'/'claimed'/'running'/'completed'/'failed'/'dead_letter'/'needs_review' (маппинг на Core Status). Outbox: 'pending'/'sending'/'sent'/'failed'.
+
+2. `StorageExecutor.fs`:
+   - `type StorageOptions = { DatabasePath: string; BusyTimeout: TimeSpan; ReadPoolSize: int; CheckpointEvery: int }`
+   - `type StorageExecutor` — единственный writer: `WriteAsync: (SqliteConnection -> 'T) -> Task<'T>` (сериализовано SemaphoreSlim(1)); `ReadAsync: (SqliteConnection -> 'T) -> Task<'T>` (bounded pool); соединения между потоками не разделяются; `PRAGMA journal_mode=WAL`, `busy_timeout`, `foreign_keys=ON`; checkpoint `wal_checkpoint(TRUNCATE)` после каждых `CheckpointEvery` writes + `CheckpointNow()`; `IAsyncDisposable`; фабрика `StorageExecutor.Create` / `openExecutor`.
+
+3. `Users.fs` — `IUserRepository` + SQLite:
+   - `type UserRecord = { Id: UserId; Username: string option; Role: UserRole; WorkspacePath: string; Timezone: string option }`
+   - `Upsert: UserRecord -> Task<unit>`, `GetByTelegramId: UserId -> Task<UserRecord option>`, `List: unit -> Task<UserRecord list>`.
+
+4. `CommandInbox.fs` — `ICommandInbox` + SQLite (как в v1-контракте, плюс needs_review):
+   - `type CommandEnvelope = { Origin: Origin; ExternalKey: string option; UserId: UserId; ChatId: ChatId; Payload: string; Priority: int }`
+   - `type Lease = { Until: DateTimeOffset; HeartbeatAt: DateTimeOffset }`
+   - `type Command = { Id: int64; Envelope: CommandEnvelope; Status: InboxStateMachine.Status; Attempts: int; MaxAttempts: int; LeaseUntil: DateTimeOffset option; HeartbeatAt: DateTimeOffset option }`
+   - `Insert` (UNIQUE external_key → вернуть существующий id), `ClaimNextForChat: ChatId -> Lease -> Task<Command option>` (атомарно, один победитель), `ClaimById`, `MarkStarted`, `MarkCompleted`, `MarkFailed` (attempts+1 → failed/dead_letter по max_attempts), `Retry` (failed → pending), `MarkNeedsReview` (claimed/running → needs_review), `ReviewRetry` (needs_review → pending), `Heartbeat`, `ExpireLeases: DateTimeOffset -> Task<int>`, `CountPending`, `CountDeadLetter`.
+
+5. `MessageOutbox.fs` — `IMessageOutbox` + SQLite (как v1: Insert UNIQUE random_id/command+chunk, BeginSend, MarkSent(id, remoteMessageId), MarkFailed, Retry (random_id неизменен, без дублей), NextPending, GetByRandomId, CountPending).
+
+6. `Repositories.fs` — фабрики/DI (по вкусу).
+
+**НЕТ** `mcp_servers`/`mcp_tokens`/TokenCrypto/IMasterKeyProvider — креды MCP в `agent.db` OMP (v2).
+
+Тесты (`tests/Phos.Tests/StorageTests.fs`), temp-file SQLite с WAL:
+- миграции: fresh → latest; повторный запуск идемпотентен; upgrade replay;
+- concurrency: N параллельных Insert/Claim через WriteAsync — все закоммичены, без потерь; busy_timeout ограничивает ожидание (~2s, не вешает);
+- crash boundaries: транзакция без commit (dispose) → rollback; committed данные переживают закрытие/переоткрытие (WAL replay);
+- leases: два конкурентных claim → ровно один; expiry → pending; attempts ≥ max → dead_letter; `MarkNeedsReview` + `ReviewRetry` (needs_review → pending);
+- restart replay: pending после reopen остаётся claimable;
+- outbox: retry сохраняет random_id; duplicate random_id → одна запись; MarkSent хранит remote_message_id;
+- users: Upsert/GetByTelegramId/List с workspace_path;
+- **keys absent**: сырые байты DB-файла не содержат sentinel-секретов (например, `StorageOptions`/connection string с паролем-сентinel); вывод (stdout/stderr, если storage логирует) не содержит payload/секреты.
+
+Acceptance: durable command переживает process kill (committed → закрыть без clean shutdown → переоткрыть → claimable); ключи отсутствуют в DB/логах; `bash scripts/ci.sh` EXIT 0 с гейтом (Storage branch ≥ 90% — Storage теперь в required-проектах v2).
+
+## Phase 3 (v2) — Telegram transport (контур, реализуется после Phase 2)
+
+- `src/Phos.Telegram`: bot login (WTelegramClient 4.4.8), UpdateManager, peer cache/access hashes, voice download, entity-safe send/edit/live draft, FLOOD_WAIT, random-id outbox delivery; whitelist до queue admission.
 - Acceptance: allowlisted `/start` → `/ping`; duplicate update один раз; voice bytes скачаны; phone/code/2FA не запрашиваются.
 
 ---

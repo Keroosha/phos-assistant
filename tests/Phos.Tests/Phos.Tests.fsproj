@@ -8,6 +8,7 @@
   <ItemGroup>
     <Compile Include="Tests.fs" />
     <Compile Include="CoreTests.fs" />
+    <Compile Include="StorageTests.fs" />
   </ItemGroup>
 
   <ItemGroup>
@@ -28,6 +29,7 @@
 
   <ItemGroup>
     <ProjectReference Include="../../src/Phos.Core/Phos.Core.fsproj" />
+    <ProjectReference Include="../../src/Phos.Storage/Phos.Storage.fsproj" />
   </ItemGroup>
 
 </Project>

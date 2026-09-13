@@ -137,7 +137,9 @@ def main() -> int:
         failures.append(f"total branch coverage {branch_rate:.1%} < {BRANCH_TOTAL:.0%}")
 
     for name, proj in sorted(projects.items()):
-        if any(proj.name.startswith(p) for p in BRANCH_REQUIRED_PROJECTS):
+        # Match project directory names like "Phos.Core" against required
+        # short names ("Core", "Storage", "Scheduler") by dotted segment.
+        if any(p in name.split(".") for p in BRANCH_REQUIRED_PROJECTS):
             rate = proj.branches_covered / proj.branches if proj.branches else 1.0
             print(f"  {proj.name}: branch {rate:.1%} ({proj.branches_covered:.0f}/{proj.branches})")
             if proj.branches > 0 and rate < BRANCH_PER_PROJECT:
