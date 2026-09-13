@@ -59,6 +59,7 @@
 | Admission/queue | SQLite `command_inbox`/`message_outbox` (упрощённый) | Microsoft.Data.Sqlite 10.x | [OK] |
 | Расписание | Cronos + собственный durable registry | Cronos 0.13.0, MIT | [OK] |
 | Бэкапы | `VACUUM INTO` + age + снапшот OMP-данных | SQLite + age | [OK] |
+| Ошибки | Result/AsyncResult/TaskResult CE, типизированные ошибки | FsToolkit.ErrorHandling 5.2.0, MIT | [OK] |
 
 `WTelegramBot` не используется — это Bot-API-shaped слой поверх WTelegramClient; ходим по MTProto напрямую.
 
@@ -269,6 +270,7 @@ SQLite поддерживает concurrency, но только одного writ
 - Nightly Stryker.NET по Core/Storage/Scheduler: сначала report, затем break threshold 70%.
 - Каждый механизм: failing test → implementation → green. Каждый баг: воспроизводящий regression test до fix.
 - Реальные Telegram/MCP/STT tests имеют integration category и идут nightly/manual; fast CI использует fake transport/server, но проверяет observable contract, не wiring. OMP-интеграционные тесты — против локального `omp --mode rpc` (fake LLM через локальный endpoint) в CI, помечены integration.
+- Error handling: FsToolkit.ErrorHandling 5.2.0 (result/taskResult CEs, типизированные ошибки); исключения остаются только на границе I/O и для инвариантов.
 
 ### 2.9. Async-first pipeline: упрощённый дизайн
 

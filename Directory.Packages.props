@@ -4,6 +4,8 @@
   </PropertyGroup>
   <ItemGroup>
     <PackageVersion Include="FSharp.Core" Version="10.0.103" />
+    <!-- Error handling: Result/AsyncResult/TaskResult CEs + typed errors (5.x includes TaskResult; separate TaskResult package is 4.x-only) -->
+    <PackageVersion Include="FsToolkit.ErrorHandling" Version="5.2.0" />
     <!-- Schedule: pure computation cron expression parsing -->
     <PackageVersion Include="Cronos" Version="0.13.0" />
     <!-- Storage: durable queue / SQLite persistence -->

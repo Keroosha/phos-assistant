@@ -2,6 +2,7 @@ module Phos.Core.InboxStateMachine
 
 open System
 open Phos.Core.DomainTypes
+open FsToolkit.ErrorHandling
 
 /// Lifecycle status of an inbox command.
 type Status =
@@ -35,9 +36,14 @@ type Event =
     | HostDied
     | ReviewedRetry
 
+/// Error returned by `apply` for an invalid transition or an exhausted retry.
+type Error =
+    | InvalidTransition of Status * Event
+    | MaxAttemptsReached
+
 /// Applies `event` to `command`, returning the new state or an error for an
 /// invalid transition.
-let apply (command: Command) (event: Event) : Result<Command, string> =
+let apply (command: Command) (event: Event) : Result<Command, Error> =
     match command.Status, event with
     | Pending, Claim(now, leaseUntil) ->
         Ok
@@ -62,14 +68,15 @@ let apply (command: Command) (event: Event) : Result<Command, string> =
                 LeaseUntil = None
                 HeartbeatAt = None }
     | Failed, Retry ->
-        if command.Attempts >= command.MaxAttempts then
-            Error "cannot retry: max attempts reached"
-        else
-            Ok
+        result {
+            do! Result.requireTrue MaxAttemptsReached (command.Attempts < command.MaxAttempts)
+
+            return
                 { command with
                     Status = Pending
                     LeaseUntil = None
                     HeartbeatAt = None }
+        }
     | Failed, Event.DeadLetter ->
         Ok
             { command with
@@ -85,7 +92,7 @@ let apply (command: Command) (event: Event) : Result<Command, string> =
         Ok
             { command with
                 Status = Status.DeadLetter }
-    | _ -> Error(sprintf "invalid transition: %A -> %A" command.Status event)
+    | _ -> Error(InvalidTransition(command.Status, event))
 
 /// A command can be claimed only while it is `Pending`.
 let canClaim (command: Command) : bool = command.Status = Pending

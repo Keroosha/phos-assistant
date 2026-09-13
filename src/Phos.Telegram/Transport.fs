@@ -2,9 +2,11 @@ namespace Phos.Telegram
 
 open System
 open System.IO
+open System.Text.RegularExpressions
 open System.Threading.Tasks
 open Phos.Core.DomainTypes
 open Phos.Core.Chunker
+open FsToolkit.ErrorHandling
 
 /// Telegram bot identity after login.
 type BotInfo =
@@ -26,6 +28,12 @@ type SendTarget =
 
 /// Result of sending a message.
 type SendResult = { RemoteMessageId: int64 }
+
+/// Expected Telegram-side send failures, typed so callers never parse exception text.
+type SendError =
+    | FloodWait of int
+    | SlowModeWait of int
+    | Other of string
 
 /// Reference to a Telegram voice message to download.
 type VoiceRef =
@@ -129,6 +137,21 @@ module Transport =
         | :? TL.UpdateShortMessage as s -> int64 s.id
         | _ -> 0L
 
+    /// Maps a WTelegramClient transport exception to a typed `SendError`.
+    /// Recognizes `FLOOD_WAIT_<n>` / `SLOWMODE_WAIT_<n>` (underscore optional);
+    /// everything else becomes `Other`.
+    let mapRpcError (ex: exn) : SendError =
+        let m = Regex.Match(ex.Message, "(FLOOD_WAIT|SLOWMODE_WAIT)_?(\d+)")
+
+        if m.Success then
+            let seconds = int m.Groups.[2].Value
+
+            match m.Groups.[1].Value with
+            | "FLOOD_WAIT" -> FloodWait seconds
+            | _ -> SlowModeWait seconds
+        else
+            Other ex.Message
+
     /// Builds the bot identity from a logged-in `TL.User`.
     let extractBotInfo (userId: int64) (botUser: TL.User) : BotInfo =
         { BotId = userId
@@ -175,6 +198,6 @@ module Transport =
 /// The Telegram transport boundary, fakeable in tests.
 type ITelegramTransport =
     abstract Login: unit -> Task<BotInfo>
-    abstract SendMessage: SendTarget -> Task<SendResult>
+    abstract SendMessage: SendTarget -> TaskResult<SendResult, SendError>
     abstract EditMessage: ChatId -> int64 -> string -> TelegramEntity list -> Task<unit>
     abstract DownloadVoice: VoiceRef -> Task<byte[]>

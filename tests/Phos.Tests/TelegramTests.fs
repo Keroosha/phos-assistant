@@ -79,7 +79,7 @@ type FakeTransport() =
     let mutable failCount = 0
     let mutable floodCount = 0
     let mutable slowmodeCount = 0
-    let mutable floodMessage = "FLOOD_WAIT_0"
+    let mutable floodSeconds = 0
 
     member _.SendCalls = List.ofSeq sendCalls
 
@@ -93,8 +93,8 @@ type FakeTransport() =
 
     member _.FloodNext(n: int) = floodCount <- n
 
-    member _.FloodMessage
-        with set (v: string) = floodMessage <- v
+    member _.FloodSeconds
+        with set (v: int) = floodSeconds <- v
 
     member _.SlowmodeNext(n: int) = slowmodeCount <- n
 
@@ -106,16 +106,16 @@ type FakeTransport() =
             task {
                 if failCount > 0 then
                     failCount <- failCount - 1
-                    return! Task.FromException<SendResult>(Exception("boom"))
+                    return Error(Other "boom")
                 elif floodCount > 0 then
                     floodCount <- floodCount - 1
-                    return! Task.FromException<SendResult>(Exception(floodMessage))
+                    return Error(FloodWait floodSeconds)
                 elif slowmodeCount > 0 then
                     slowmodeCount <- slowmodeCount - 1
-                    return! Task.FromException<SendResult>(Exception("SLOWMODE_WAIT_0"))
+                    return Error(SlowModeWait 0)
                 else
                     sendCalls.Add target
-                    return { RemoteMessageId = remoteId }
+                    return Ok { RemoteMessageId = remoteId }
             }
 
         member _.EditMessage _ _ _ _ = Task.FromResult(())
@@ -558,7 +558,7 @@ let ``flood wait logs a warning event 2 with the wait seconds`` () =
                 let e = entry.Value
 
                 let transport = FakeTransport()
-                transport.FloodMessage <- "FLOOD_WAIT_1"
+                transport.FloodSeconds <- 1
                 transport.FloodNext 1
                 let logger = CapturingLogger()
                 let delivery = OutboxDelivery(outbox, transport, logger)
@@ -602,37 +602,6 @@ let ``slowmode wait also retries later with the same random id`` () =
 
                 let! sent = outbox.GetByRandomId 889L
                 sent |> Option.isSome |> should be True
-                sent.Value.Status |> should equal Out.Sent
-            finally
-                dispose exec
-        }
-    finally
-        deleteDir dir
-
-[<Fact>]
-let ``flood wait without underscore is retried with the same random id`` () =
-    let dir = makeTempDir ()
-    let dbPath = Path.Combine(dir, "phos.db")
-
-    try
-        task {
-            let exec = createExecutor dbPath
-
-            try
-                let _, outbox, _ = mkRepos exec
-                let! _ = outbox.Insert 1L 0 testChat.Id 890L "hello"
-
-                let transport = FakeTransport()
-                transport.FloodMessage <- "FLOOD_WAIT5"
-                transport.FloodNext 1
-                let delivery = OutboxDelivery(outbox, transport, NullLogger.Instance)
-                let! _ = delivery.DeliverOnceAsync(CancellationToken.None)
-                let! _ = delivery.DeliverOnceAsync(CancellationToken.None)
-
-                transport.SendCalls |> should haveLength 1
-                transport.SendCalls.[0].RandomId |> should equal 890L
-
-                let! sent = outbox.GetByRandomId 890L
                 sent.Value.Status |> should equal Out.Sent
             finally
                 dispose exec
@@ -924,6 +893,16 @@ let ``extractRemoteMessageId reads id from sent message updates`` () =
 
     let other = TL.Updates()
     Transport.extractRemoteMessageId other |> should equal 0L
+
+[<Fact>]
+let ``mapRpcError recognizes flood and slowmode waits and falls back to Other`` () =
+    Transport.mapRpcError (Exception "FLOOD_WAIT_1") |> should equal (FloodWait 1)
+    Transport.mapRpcError (Exception "FLOOD_WAIT5") |> should equal (FloodWait 5)
+
+    Transport.mapRpcError (Exception "SLOWMODE_WAIT_0")
+    |> should equal (SlowModeWait 0)
+
+    Transport.mapRpcError (Exception "boom") |> should equal (Other "boom")
 
 [<Fact>]
 let ``buildSendRequest sets peer, message, random id and entities`` () =

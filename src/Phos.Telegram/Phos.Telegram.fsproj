@@ -18,6 +18,7 @@
 
   <ItemGroup>
     <PackageReference Include="FSharp.Core" />
+    <PackageReference Include="FsToolkit.ErrorHandling" />
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
     <PackageReference Include="WTelegramClient" />
   </ItemGroup>

@@ -4,6 +4,7 @@ open System
 open System.IO
 open System.Threading.Tasks
 open Phos.Core.DomainTypes
+open FsToolkit.ErrorHandling
 
 /// WTelegramClient-backed transport. Wraps the client, wires the config
 /// callback, secures the session directory, and resolves peers via `PeerCache`.
@@ -40,12 +41,16 @@ type TelegramTransport(config: TelegramConfig) =
             return Transport.extractBotInfo client.UserId botUser
         }
 
-    let sendMessageCore (target: SendTarget) : Task<SendResult> =
-        task {
+    let sendMessageCore (target: SendTarget) : TaskResult<SendResult, SendError> =
+        taskResult {
             let peer = Transport.resolvePeer peers target.ChatId
             let req = Transport.buildSendRequest peer target
-            let! result = client.Invoke(req)
-            return { RemoteMessageId = Transport.extractRemoteMessageId result }
+
+            try
+                let! result = client.Invoke(req)
+                return { RemoteMessageId = Transport.extractRemoteMessageId result }
+            with ex ->
+                return! Error(Transport.mapRpcError ex)
         }
 
     let editMessageCore (chat: ChatId) (messageId: int64) (text: string) (entities: TelegramEntity list) : Task<unit> =

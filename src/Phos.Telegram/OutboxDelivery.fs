@@ -1,7 +1,6 @@
 namespace Phos.Telegram
 
 open System
-open System.Text.RegularExpressions
 open System.Threading
 open System.Threading.Tasks
 open Microsoft.Extensions.Logging
@@ -15,11 +14,6 @@ open Phos.Storage
 /// marked failed with attempts+1. Before sending, `GetByRandomId` guards against
 /// re-sending a `random_id` that is already sent/sending.
 type OutboxDelivery(outbox: IMessageOutbox, transport: ITelegramTransport, logger: ILogger) =
-    let tryFloodWaitSeconds (ex: exn) : int option =
-        let m = Regex.Match(ex.Message, "(?:FLOOD_WAIT|SLOWMODE_WAIT)_?(\d+)")
-
-        if m.Success then Some(int m.Groups.[1].Value) else None
-
     /// Delivers at most one pending outbox entry. Returns `true` if an entry was
     /// processed (sent, marked failed, or scheduled for a flood-wait retry).
     member _.DeliverOnceAsync(ct: CancellationToken) : Task<bool> =
@@ -40,26 +34,24 @@ type OutboxDelivery(outbox: IMessageOutbox, transport: ITelegramTransport, logge
                       Text = entry.Payload
                       Entities = [] }
 
-                try
-                    let! result = transport.SendMessage target
+                match! transport.SendMessage target with
+                | Ok result ->
                     do! outbox.MarkSent entry.Id result.RemoteMessageId
                     PhosLog.sentOutbox.Invoke(logger, entry.Id, entry.RandomId, null)
                     return true
-                with ex ->
-                    match tryFloodWaitSeconds ex with
-                    | Some seconds ->
-                        // Move out of 'sending' back to a retryable state;
-                        // the random_id is never changed, so a retry does
-                        // not create a second message.
-                        do! outbox.MarkFailed entry.Id
-                        do! outbox.Retry entry.Id
-                        PhosLog.floodWait.Invoke(logger, seconds, entry.Id, entry.RandomId, null)
-                        do! Task.Delay(TimeSpan.FromSeconds(float seconds), ct)
-                        return true
-                    | None ->
-                        do! outbox.MarkFailed entry.Id
-                        PhosLog.deliveryFailed.Invoke(logger, entry.Id, ex.Message, ex)
-                        return true
+                | Error(FloodWait seconds | SlowModeWait seconds) ->
+                    // Move out of 'sending' back to a retryable state;
+                    // the random_id is never changed, so a retry does
+                    // not create a second message.
+                    do! outbox.MarkFailed entry.Id
+                    do! outbox.Retry entry.Id
+                    PhosLog.floodWait.Invoke(logger, seconds, entry.Id, entry.RandomId, null)
+                    do! Task.Delay(TimeSpan.FromSeconds(float seconds), ct)
+                    return true
+                | Error(Other msg) ->
+                    do! outbox.MarkFailed entry.Id
+                    PhosLog.deliveryFailed.Invoke(logger, entry.Id, msg, null)
+                    return true
         }
 
     /// Runs the delivery loop until `ct` is cancelled.

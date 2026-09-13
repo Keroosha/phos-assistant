@@ -471,7 +471,7 @@ let ``inbox Pending --Claim--> Claimed increments attempts and sets lease`` () =
         next.Status |> should equal In.Claimed
         next.Attempts |> should equal 1
         next.LeaseUntil |> should equal (Some lease)
-    | Error msg -> failwith msg
+    | Error e -> failwith (sprintf "expected Ok, got %A" e)
 
 [<Fact>]
 let ``inbox Claimed --Start--> Running`` () =
@@ -479,7 +479,7 @@ let ``inbox Claimed --Start--> Running`` () =
 
     match In.apply cmd In.Start with
     | Ok next -> next.Status |> should equal In.Running
-    | Error msg -> failwith msg
+    | Error e -> failwith (sprintf "expected Ok, got %A" e)
 
 [<Fact>]
 let ``inbox Running --Complete--> Completed`` () =
@@ -487,7 +487,7 @@ let ``inbox Running --Complete--> Completed`` () =
 
     match In.apply cmd In.Complete with
     | Ok next -> next.Status |> should equal In.Completed
-    | Error msg -> failwith msg
+    | Error e -> failwith (sprintf "expected Ok, got %A" e)
 
 [<Fact>]
 let ``inbox Running --Fail--> Failed when attempts below max`` () =
@@ -495,7 +495,7 @@ let ``inbox Running --Fail--> Failed when attempts below max`` () =
 
     match In.apply cmd In.Fail with
     | Ok next -> next.Status |> should equal In.Failed
-    | Error msg -> failwith msg
+    | Error e -> failwith (sprintf "expected Ok, got %A" e)
 
 [<Fact>]
 let ``inbox Running --Fail--> DeadLetter when attempts at max`` () =
@@ -503,7 +503,7 @@ let ``inbox Running --Fail--> DeadLetter when attempts at max`` () =
 
     match In.apply cmd In.Fail with
     | Ok next -> next.Status |> should equal In.DeadLetter
-    | Error msg -> failwith msg
+    | Error e -> failwith (sprintf "expected Ok, got %A" e)
 
 [<Fact>]
 let ``inbox LeaseExpired resets to Pending`` () =
@@ -513,7 +513,7 @@ let ``inbox LeaseExpired resets to Pending`` () =
     | Ok next ->
         next.Status |> should equal In.Pending
         next.LeaseUntil |> should equal None
-    | Error msg -> failwith msg
+    | Error e -> failwith (sprintf "expected Ok, got %A" e)
 
 [<Fact>]
 let ``inbox Failed --Retry--> Pending`` () =
@@ -521,7 +521,7 @@ let ``inbox Failed --Retry--> Pending`` () =
 
     match In.apply cmd In.Retry with
     | Ok next -> next.Status |> should equal In.Pending
-    | Error msg -> failwith msg
+    | Error e -> failwith (sprintf "expected Ok, got %A" e)
 
 [<Fact>]
 let ``inbox Failed --DeadLetter--> DeadLetter`` () =
@@ -529,7 +529,7 @@ let ``inbox Failed --DeadLetter--> DeadLetter`` () =
 
     match In.apply cmd In.Event.DeadLetter with
     | Ok next -> next.Status |> should equal In.Status.DeadLetter
-    | Error msg -> failwith msg
+    | Error e -> failwith (sprintf "expected Ok, got %A" e)
 
 [<Fact>]
 let ``inbox invalid transitions return Error`` () =
@@ -570,7 +570,7 @@ let ``inbox Claimed --HostDied--> NeedsReview`` () =
 
     match In.apply cmd In.HostDied with
     | Ok next -> next.Status |> should equal In.NeedsReview
-    | Error msg -> failwith msg
+    | Error e -> failwith (sprintf "expected Ok, got %A" e)
 
 [<Fact>]
 let ``inbox Running --HostDied--> NeedsReview`` () =
@@ -578,7 +578,7 @@ let ``inbox Running --HostDied--> NeedsReview`` () =
 
     match In.apply cmd In.HostDied with
     | Ok next -> next.Status |> should equal In.NeedsReview
-    | Error msg -> failwith msg
+    | Error e -> failwith (sprintf "expected Ok, got %A" e)
 
 [<Fact>]
 let ``inbox NeedsReview --ReviewedRetry--> Pending preserves attempts`` () =
@@ -588,7 +588,7 @@ let ``inbox NeedsReview --ReviewedRetry--> Pending preserves attempts`` () =
     | Ok next ->
         next.Status |> should equal In.Pending
         next.Attempts |> should equal 3
-    | Error msg -> failwith msg
+    | Error e -> failwith (sprintf "expected Ok, got %A" e)
 
 [<Fact>]
 let ``inbox NeedsReview --DeadLetter--> DeadLetter`` () =
@@ -596,7 +596,7 @@ let ``inbox NeedsReview --DeadLetter--> DeadLetter`` () =
 
     match In.apply cmd In.Event.DeadLetter with
     | Ok next -> next.Status |> should equal In.Status.DeadLetter
-    | Error msg -> failwith msg
+    | Error e -> failwith (sprintf "expected Ok, got %A" e)
 
 [<Fact>]
 let ``inbox NeedsReview has no automatic transition except review or dead letter`` () =
@@ -675,7 +675,7 @@ let ``outbox Pending --BeginSend--> Sending`` () =
 
     match Out.apply entry Out.BeginSend with
     | Ok next -> next.Status |> should equal Out.Sending
-    | Error msg -> failwith msg
+    | Error e -> failwith (sprintf "expected Ok, got %A" e)
 
 [<Fact>]
 let ``outbox Sending --Sent--> Sent stores remote id`` () =
@@ -685,7 +685,7 @@ let ``outbox Sending --Sent--> Sent stores remote id`` () =
     | Ok next ->
         next.Status |> should equal Out.Status.Sent
         next.RemoteMessageId |> should equal (Some 99L)
-    | Error msg -> failwith msg
+    | Error e -> failwith (sprintf "expected Ok, got %A" e)
 
 [<Fact>]
 let ``outbox Sending --Fail--> Failed increments attempts`` () =
@@ -695,7 +695,7 @@ let ``outbox Sending --Fail--> Failed increments attempts`` () =
     | Ok next ->
         next.Status |> should equal Out.Failed
         next.Attempts |> should equal 2
-    | Error msg -> failwith msg
+    | Error e -> failwith (sprintf "expected Ok, got %A" e)
 
 [<Fact>]
 let ``outbox retry keeps RandomId`` () =
@@ -703,7 +703,7 @@ let ``outbox retry keeps RandomId`` () =
 
     match Out.apply entry Out.BeginSend with
     | Ok next -> next.RandomId |> should equal 42L
-    | Error msg -> failwith msg
+    | Error e -> failwith (sprintf "expected Ok, got %A" e)
 
 [<Fact>]
 let ``outbox retry is rejected when max attempts reached`` () =

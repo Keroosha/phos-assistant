@@ -1,5 +1,7 @@
 module Phos.Core.OutboxStateMachine
 
+open FsToolkit.ErrorHandling
+
 /// Lifecycle status of an outbox entry.
 type Status =
     | Pending
@@ -30,9 +32,14 @@ type Event =
 let canRetry (entry: Entry) : bool =
     entry.Status = Failed && entry.Attempts < entry.MaxAttempts
 
+/// Error returned by `apply` for an invalid transition or an exhausted retry.
+type Error =
+    | InvalidTransition of Status * Event
+    | MaxAttemptsReached
+
 /// Applies `event` to `entry`, returning the new state or an error for an
 /// invalid transition.
-let apply (entry: Entry) (event: Event) : Result<Entry, string> =
+let apply (entry: Entry) (event: Event) : Result<Entry, Error> =
     match entry.Status, event with
     | Pending, BeginSend -> Ok { entry with Status = Sending }
     | Sending, Event.Sent remoteId ->
@@ -46,11 +53,11 @@ let apply (entry: Entry) (event: Event) : Result<Entry, string> =
                 Status = Failed
                 Attempts = entry.Attempts + 1 }
     | Failed, BeginSend ->
-        if canRetry entry then
-            Ok { entry with Status = Sending }
-        else
-            Error "cannot retry: max attempts reached"
-    | _ -> Error(sprintf "invalid transition: %A -> %A" entry.Status event)
+        result {
+            do! Result.requireTrue MaxAttemptsReached (entry.Attempts < entry.MaxAttempts)
+            return { entry with Status = Sending }
+        }
+    | _ -> Error(InvalidTransition(entry.Status, event))
 
 /// An entry can be sent if it is `Pending` or `Failed` and still retryable.
 let canSend (entry: Entry) : bool =
