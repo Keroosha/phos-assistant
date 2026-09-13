@@ -8,6 +8,12 @@
     <PackageVersion Include="Cronos" Version="0.13.0" />
     <!-- Storage: durable queue / SQLite persistence -->
     <PackageVersion Include="Microsoft.Data.Sqlite" Version="10.0.12" />
+    <!-- Storage: schema migrations via FluentMigrator runner (SQLite provider uses Microsoft.Data.Sqlite) -->
+    <PackageVersion Include="FluentMigrator" Version="8.0.1" />
+    <PackageVersion Include="FluentMigrator.Runner" Version="8.0.1" />
+    <PackageVersion Include="FluentMigrator.Runner.SQLite" Version="8.0.1" />
+    <!-- Logging: ILogger + LoggerMessage.Define (F# has no partial methods, so the [LoggerMessage] source generator is C#-only) -->
+    <PackageVersion Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.12" />
     <!-- Telegram: MTProto bot transport -->
     <PackageVersion Include="WTelegramClient" Version="4.4.8" />
     <!-- Test stack -->
