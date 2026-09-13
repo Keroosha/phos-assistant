@@ -42,15 +42,10 @@ let private defaultOptions (dbPath: string) : StorageOptions =
 
 let private createExecutor (dbPath: string) : StorageExecutor =
     let exec = StorageExecutor.Create(defaultOptions dbPath)
-
-    Schema.migrate exec Schema.migrations
-    |> fun t -> t.GetAwaiter().GetResult() |> ignore
-
+    Schema.run (defaultOptions dbPath)
     exec
 
-let private dispose (exec: StorageExecutor) =
-    (exec :> IAsyncDisposable).DisposeAsync().AsTask()
-    |> fun t -> t.GetAwaiter().GetResult()
+let private dispose (exec: StorageExecutor) = exec.Dispose()
 
 let private mkRepos (exec: StorageExecutor) =
     (CommandInbox(exec) :> ICommandInbox, MessageOutbox(exec) :> IMessageOutbox, UserRepository(exec) :> IUserRepository)

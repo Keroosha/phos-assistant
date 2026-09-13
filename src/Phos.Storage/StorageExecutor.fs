@@ -114,17 +114,15 @@ type StorageExecutor private (options: StorageOptions) =
         finally
             writeLock.Release() |> ignore
 
-    interface IAsyncDisposable with
-        // `DisposeAsync` is the mandated IAsyncDisposable member returning ValueTask;
-        // the asynchronousFunctionNames rule only accepts Task/Async, so suppress it.
-        // fsharplint:disable-next-line FL0095
-        member _.DisposeAsync() : ValueTask =
-            if not disposed then
-                disposed <- true
-                writeLock.Dispose()
-                readLock.Dispose()
+    /// Releases the semaphores. Idempotent; safe to call more than once.
+    member this.Dispose() =
+        if not disposed then
+            disposed <- true
+            writeLock.Dispose()
+            readLock.Dispose()
 
-            ValueTask.CompletedTask
+    interface IDisposable with
+        member this.Dispose() = this.Dispose()
 
     /// Opens (creating if necessary) the database and establishes WAL mode.
     static member Create(options: StorageOptions) : StorageExecutor =

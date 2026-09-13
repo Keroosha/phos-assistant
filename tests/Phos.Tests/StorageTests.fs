@@ -40,15 +40,10 @@ let private defaultOptions (dbPath: string) : StorageOptions =
 
 let private createExecutor (dbPath: string) : StorageExecutor =
     let exec = StorageExecutor.Create(defaultOptions dbPath)
-
-    Schema.migrate exec Schema.migrations
-    |> fun t -> t.GetAwaiter().GetResult() |> ignore
-
+    Schema.run (defaultOptions dbPath)
     exec
 
-let private dispose (exec: StorageExecutor) =
-    (exec :> IAsyncDisposable).DisposeAsync().AsTask()
-    |> fun t -> t.GetAwaiter().GetResult()
+let private dispose (exec: StorageExecutor) = exec.Dispose()
 
 /// Creates a migrated executor, runs `body`, then disposes it.
 let private withExecutor (dbPath: string) (body: StorageExecutor -> Task<unit>) : Task<unit> =
@@ -99,10 +94,10 @@ let ``migrations apply fresh schema and are idempotent`` () =
                 tableExists exec "schedule_jobs" |> should be True
                 tableExists exec "schedule_runs" |> should be True
                 tableExists exec "backup_log" |> should be True
-                tableExists exec "schema_version" |> should be True
+                tableExists exec "VersionInfo" |> should be True
 
-                let! applied = Schema.migrate exec Schema.migrations
-                applied |> should equal 0
+                // Re-running is a no-op: FluentMigrator skips applied migrations.
+                Schema.run (defaultOptions dbPath)
             })
     finally
         deleteDir dir
@@ -120,14 +115,12 @@ let ``migrations replay in order for upgrade`` () =
 
             try
                 // Only apply migration 1 (users), then verify later tables are absent.
-                let! applied1 = Schema.migrate exec (Schema.migrations |> List.take 1)
-                applied1 |> should equal 1
+                Schema.migrateUp (defaultOptions dbPath) 1L
                 tableExists exec "users" |> should be True
                 tableExists exec "command_inbox" |> should be False
 
-                // Replay the full list: 2..6 should be applied.
-                let! applied2 = Schema.migrate exec Schema.migrations
-                applied2 |> should equal 5
+                // Replay the rest: 2..6 should be applied.
+                Schema.run (defaultOptions dbPath)
                 tableExists exec "command_inbox" |> should be True
                 tableExists exec "message_outbox" |> should be True
                 tableExists exec "schedule_jobs" |> should be True
@@ -149,14 +142,54 @@ let ``migrate handles empty and partial upgrade sets`` () =
             let exec = StorageExecutor.Create(defaultOptions dbPath)
 
             try
-                let! a0 = Schema.migrate exec []
-                a0 |> should equal 0
-                let! a1 = Schema.migrate exec (Schema.migrations |> List.take 2)
-                a1 |> should equal 2
-                let! a2 = Schema.migrate exec (Schema.migrations |> List.take 2)
-                a2 |> should equal 0
-                let! a3 = Schema.migrate exec Schema.migrations
-                a3 |> should equal 4
+                // Partial upgrade: apply up to version 2.
+                Schema.migrateUp (defaultOptions dbPath) 2L
+                tableExists exec "users" |> should be True
+                tableExists exec "command_inbox" |> should be True
+                tableExists exec "message_outbox" |> should be False
+
+                // Re-applying the same version is a no-op.
+                Schema.migrateUp (defaultOptions dbPath) 2L
+                tableExists exec "message_outbox" |> should be False
+
+                // Apply the rest.
+                Schema.run (defaultOptions dbPath)
+                tableExists exec "message_outbox" |> should be True
+                tableExists exec "schedule_jobs" |> should be True
+                tableExists exec "schedule_runs" |> should be True
+                tableExists exec "backup_log" |> should be True
+            finally
+                dispose exec
+        }
+    finally
+        deleteDir dir
+
+[<Fact>]
+let ``migrate down rolls back the schema executing every Down`` () =
+    let dir = makeTempDir ()
+    let dbPath = Path.Combine(dir, "phos.db")
+
+    try
+        task {
+            let exec = StorageExecutor.Create(defaultOptions dbPath)
+
+            try
+                Schema.run (defaultOptions dbPath)
+                tableExists exec "users" |> should be True
+                tableExists exec "command_inbox" |> should be True
+                tableExists exec "message_outbox" |> should be True
+                tableExists exec "schedule_jobs" |> should be True
+                tableExists exec "schedule_runs" |> should be True
+                tableExists exec "backup_log" |> should be True
+
+                // Roll back everything: each migration's Down() executes in reverse.
+                Schema.migrateDown (defaultOptions dbPath) 0L
+                tableExists exec "users" |> should be False
+                tableExists exec "command_inbox" |> should be False
+                tableExists exec "message_outbox" |> should be False
+                tableExists exec "schedule_jobs" |> should be False
+                tableExists exec "schedule_runs" |> should be False
+                tableExists exec "backup_log" |> should be False
             finally
                 dispose exec
         }
@@ -205,8 +238,7 @@ let ``executor checkpoints after every write when interval is one`` () =
             let exec = StorageExecutor.Create options
 
             try
-                Schema.migrate exec Schema.migrations
-                |> fun t -> t.GetAwaiter().GetResult() |> ignore
+                Schema.run (defaultOptions dbPath)
 
                 let inbox = Repositories.commandInbox exec
                 let! _ = inbox.Insert(mkEnvelope "cp1-1")
@@ -235,8 +267,7 @@ let ``executor handles zero checkpoint interval and sub-second timeout`` () =
             let exec = StorageExecutor.Create options
 
             try
-                Schema.migrate exec Schema.migrations
-                |> fun t -> t.GetAwaiter().GetResult() |> ignore
+                Schema.run (defaultOptions dbPath)
 
                 let inbox = Repositories.commandInbox exec
                 let! _ = inbox.Insert(mkEnvelope "zero-1")
