@@ -368,7 +368,7 @@ let ``mixed concurrent operations are serialized correctly`` () =
                           task {
                               let! _ = inbox.Insert(mkEnvelope (sprintf "mix-%d" i))
                               do! exec.CheckpointNow()
-                              let! _ = outbox.Insert (int64 i) 0 (ChatId 1L) (int64 i) "m"
+                              let! _ = outbox.Insert (int64 i) 0 (ChatId 1L) (int64 i) "m" []
                               ()
                           } ]
 
@@ -709,7 +709,7 @@ let ``outbox retry keeps random id and sent stores remote id`` () =
         withExecutor dbPath (fun exec ->
             task {
                 let outbox = Repositories.messageOutbox exec
-                let! id = outbox.Insert 1L 0 (ChatId 1L) 42L "hello"
+                let! id = outbox.Insert 1L 0 (ChatId 1L) 42L "hello" []
                 let! next = outbox.NextPending()
                 next |> should not' (be None)
                 let eid = next.Value.Id
@@ -745,11 +745,44 @@ let ``outbox duplicate random id collapses to one row`` () =
         withExecutor dbPath (fun exec ->
             task {
                 let outbox = Repositories.messageOutbox exec
-                let! id1 = outbox.Insert 1L 0 (ChatId 1L) 42L "hello"
-                let! id2 = outbox.Insert 1L 1 (ChatId 1L) 42L "hello"
+                let! id1 = outbox.Insert 1L 0 (ChatId 1L) 42L "hello" []
+                let! id2 = outbox.Insert 1L 1 (ChatId 1L) 42L "hello" []
                 id2 |> should equal id1
                 let! count = outbox.CountPending()
                 count |> should equal 1
+            })
+    finally
+        deleteDir dir
+
+[<Fact>]
+let ``outbox entities roundtrip through insert and read`` () =
+    let dir = makeTempDir ()
+    let dbPath = Path.Combine(dir, "phos.db")
+
+    try
+        withExecutor dbPath (fun exec ->
+            task {
+                let outbox = Repositories.messageOutbox exec
+
+                let entities: Phos.Core.Chunker.Entity list =
+                    [ { Offset = 0
+                        Length = 8
+                        Kind = Phos.Core.Chunker.Bold }
+                      { Offset = 10
+                        Length = 6
+                        Kind = Phos.Core.Chunker.Italic } ]
+
+                let! id = outbox.Insert 1L 0 (ChatId 1L) 42L "**bold** *italic*" entities
+
+                id |> should not' (equal 0L)
+
+                let! byRandom = outbox.GetByRandomId 42L
+                byRandom |> should not' (be None)
+                byRandom.Value.Entities |> should equal entities
+
+                let! next = outbox.NextPending()
+                next |> should not' (be None)
+                next.Value.Entities |> should equal entities
             })
     finally
         deleteDir dir

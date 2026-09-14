@@ -161,6 +161,7 @@ let main (argv: string[]) : int =
                                 env.ChatId
                                 env.RandomId
                                 env.Payload
+                                env.Entities
 
                         return ()
                     }
@@ -218,6 +219,7 @@ let main (argv: string[]) : int =
                                 env.ChatId
                                 env.RandomId
                                 env.Payload
+                                env.Entities
 
                         return ()
                     }

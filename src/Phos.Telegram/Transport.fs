@@ -127,6 +127,36 @@ module Transport =
 
         req
 
+    /// Builds a `messages.sendReaction` request.
+    ///
+    /// `reaction` is an optional field gated by `flags.0` in the TL schema: with
+    /// `flags` left at zero the field is never serialized and Telegram silently
+    /// ignores the whole request, so `has_reaction` is always set.
+    let buildReactionRequest
+        (peer: TL.InputPeer)
+        (messageId: int64)
+        (emoji: string)
+        : TL.Methods.Messages_SendReaction =
+        let req = TL.Methods.Messages_SendReaction()
+        req.peer <- peer
+        req.msg_id <- int messageId
+
+        let reaction = TL.ReactionEmoji()
+        reaction.emoticon <- emoji
+        req.reaction <- [| reaction :> TL.Reaction |]
+        req.flags <- TL.Methods.Messages_SendReaction.Flags.has_reaction
+        req
+
+    /// Builds a `messages.setTyping` request with a typing action.
+    ///
+    /// `action` is a mandatory field (not gated by a flags bit), so no flags
+    /// need to be set; `top_msg_id` is left unset.
+    let buildTypingRequest (peer: TL.InputPeer) : TL.Methods.Messages_SetTyping =
+        let req = TL.Methods.Messages_SetTyping()
+        req.peer <- peer
+        req.action <- TL.SendMessageTypingAction() :> TL.SendMessageAction
+        req
+
     /// Extracts the remote message id from the `messages.sendMessage` response.
     ///
     /// A bot send returns an `UpdatesBase`; for a text send the id lives on the
@@ -218,3 +248,4 @@ type ITelegramTransport =
     abstract EditMessage: ChatId -> int64 -> string -> TelegramEntity list -> Task<unit>
     abstract DownloadVoice: VoiceRef -> Task<byte[]>
     abstract SetReaction: ChatId -> int64 -> string -> Task<unit>
+    abstract SetTyping: ChatId -> Task<unit>

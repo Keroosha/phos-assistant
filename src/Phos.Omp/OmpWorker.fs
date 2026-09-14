@@ -61,7 +61,7 @@ type OmpWorker
             let chunks = EntitySend.chunkForSend text []
 
             for i, chunk in List.indexed chunks do
-                let! _ = outbox.Insert cmd.Id i cmd.Envelope.ChatId (Random.Shared.NextInt64()) chunk.Text
+                let! _ = outbox.Insert cmd.Id i cmd.Envelope.ChatId (Random.Shared.NextInt64()) chunk.Text []
                 ()
         }
 
@@ -91,20 +91,36 @@ type OmpWorker
             | None -> ()
         }
 
-    /// Keeps the lease alive while the command runs. Stops when the command is
-    /// no longer running or the user's OMP process died (so the lease expires
-    /// and the command is reclaimed — no loss, no duplicate execution).
-    let startHeartbeat (cmdId: int64) (userId: UserId) : unit =
+    /// Keeps the lease alive and the "bot is typing" bubble fresh while the
+    /// command runs. Telegram expires the typing bubble after ~5s, so it is
+    /// re-sent every 4s. Stops when the command is no longer running or the
+    /// user's OMP process died (so the lease expires and the command is
+    /// reclaimed — no loss, no duplicate execution).
+    let startHeartbeat (cmdId: int64) (userId: UserId) (chatId: ChatId) : unit =
         let cts = new CancellationTokenSource()
         heartbeats.[cmdId] <- cts
+
+        let setTyping () : Task<unit> =
+            task {
+                try
+                    do! transport.SetTyping chatId
+                with ex ->
+                    logger.LogWarning(ex, "set typing failed for command {Id}", cmdId)
+            }
 
         let loop: Task =
             task {
                 try
+                    // Send one typing immediately so the user sees feedback as
+                    // soon as the command is accepted.
+                    do! setTyping ()
+
                     let mutable running = true
+                    let mutable tick = 0
 
                     while running && not cts.IsCancellationRequested do
-                        do! Task.Delay(20000, cts.Token)
+                        do! Task.Delay(4000, cts.Token)
+                        tick <- tick + 1
 
                         if not (sessions.IsRuntimeAlive userId) then
                             running <- false
@@ -113,7 +129,12 @@ type OmpWorker
 
                             match cmd with
                             | Some c when c.Status = Inbox.Status.Running ->
-                                do! inbox.Heartbeat cmdId (now ()) (now().AddSeconds 60.0)
+                                do! setTyping ()
+
+                                // Heartbeat every 5th tick (20s) to keep the
+                                // lease alive.
+                                if tick % 5 = 0 then
+                                    do! inbox.Heartbeat cmdId (now ()) (now().AddSeconds 60.0)
                             | _ -> running <- false
                 with :? OperationCanceledException ->
                     ()
@@ -137,7 +158,7 @@ type OmpWorker
                 | Ok() ->
                     do! acknowledge cmd
                     do! inbox.MarkStarted cmd.Id
-                    startHeartbeat cmd.Id user
+                    startHeartbeat cmd.Id user cmd.Envelope.ChatId
                 | Error msg when msg = "queue full" ->
                     // Durable no-loss: the command stays `claimed`; its lease
                     // expires and `ExpireLeases` returns it to `pending`, so the

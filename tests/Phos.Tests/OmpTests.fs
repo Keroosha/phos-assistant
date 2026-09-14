@@ -18,6 +18,7 @@ open Xunit
 open FsUnit.Xunit
 open Microsoft.Extensions.Logging.Abstractions
 open Phos.Core.DomainTypes
+open Phos.Core.Chunker
 open Phos.Storage
 open Phos.Telegram
 open Phos.Omp
@@ -120,9 +121,11 @@ let private mkCommand (id: int64) (chatId: int64) (payload: string) : Command =
 type FakeTransport(?voiceBytes: byte[]) =
     let mutable sendCount = 0
     let mutable editCount = 0
+    let mutable typingCount = 0
     let reactions = ResizeArray<int64 * string>()
     member _.SendCount = sendCount
     member _.EditCount = editCount
+    member _.TypingCount = typingCount
     member _.Reactions = reactions
 
     interface ITelegramTransport with
@@ -146,6 +149,10 @@ type FakeTransport(?voiceBytes: byte[]) =
 
         member _.SetReaction (_: ChatId) (messageId: int64) (emoji: string) =
             reactions.Add(messageId, emoji)
+            Task.FromResult(())
+
+        member _.SetTyping(_: ChatId) =
+            typingCount <- typingCount + 1
             Task.FromResult(())
 
 type FakeVoiceProcessor(result: Result<string, string>) =
@@ -754,6 +761,8 @@ let ``terminal agent_end chunks accumulated text`` () =
     let st2, envelopes = EventFormatter.onEvent ctx st frame
     envelopes.Length |> should be (greaterThan 1)
     envelopes |> List.forall (fun e -> e.Payload.Length <= 4096) |> should be True
+    // Markdown-free text produces no entities on the chunks.
+    envelopes |> List.forall (fun e -> e.Entities |> List.isEmpty) |> should be True
     let joined = envelopes |> List.map (fun e -> e.Payload) |> String.concat ""
     joined |> should equal text
     st2.Accumulated |> should equal ""
@@ -1707,7 +1716,14 @@ type FakeOutbox() =
     member _.Entries = entries
 
     interface IMessageOutbox with
-        member _.Insert (commandId: int64) (chunkIndex: int) (chatId: ChatId) (randomId: int64) (payload: string) =
+        member _.Insert
+            (commandId: int64)
+            (chunkIndex: int)
+            (chatId: ChatId)
+            (randomId: int64)
+            (payload: string)
+            (entities: Entity list)
+            =
             task {
                 let e =
                     { Id = int64 entries.Count
@@ -1716,6 +1732,7 @@ type FakeOutbox() =
                       ChatId = chatId
                       RandomId = randomId
                       Payload = payload
+                      Entities = entities
                       Status = Outbox.Status.Pending
                       Attempts = 0
                       MaxAttempts = 5
@@ -1812,6 +1829,9 @@ let ``worker acknowledges accepted command with eyes reaction`` () =
         let mid, emoji = transport.Reactions.[0]
         mid |> should equal messageId
         emoji |> should equal "👀"
+        // The typing bubble is sent immediately on accept (and re-sent on the
+        // 4s loop while the command is Running).
+        transport.TypingCount |> should be (greaterThanOrEqualTo 1)
     }
 
 [<Fact>]
@@ -2327,7 +2347,9 @@ let ``uri resolver returns error on download failure`` () =
                 member _.DownloadVoice(_: VoiceRef) =
                     task { return failwith "download exploded" }
 
-                member _.SetReaction (_: ChatId) (_: int64) (_: string) = Task.FromResult(()) }
+                member _.SetReaction (_: ChatId) (_: int64) (_: string) = Task.FromResult(())
+
+                member _.SetTyping(_: ChatId) = Task.FromResult(()) }
 
         let resolver = HostUriResolver(transport, NullLogger<HostUriResolver>.Instance)
         let frame = JsonObject()
@@ -2572,7 +2594,9 @@ let ``executor maps flood wait to an error`` () =
                 member _.EditMessage (_: ChatId) (_: int64) (_: string) (_: TelegramEntity list) = Task.FromResult(())
                 member _.DownloadVoice(_: VoiceRef) = task { return [||] }
 
-                member _.SetReaction (_: ChatId) (_: int64) (_: string) = Task.FromResult(()) }
+                member _.SetReaction (_: ChatId) (_: int64) (_: string) = Task.FromResult(())
+
+                member _.SetTyping(_: ChatId) = Task.FromResult(()) }
 
         let executor =
             HostToolExecutor(transport, FakeVoiceProcessor(Ok "hi"), NullLogger<HostToolExecutor>.Instance)
@@ -2608,7 +2632,9 @@ let ``executor maps slowmode wait to an error`` () =
                 member _.EditMessage (_: ChatId) (_: int64) (_: string) (_: TelegramEntity list) = Task.FromResult(())
                 member _.DownloadVoice(_: VoiceRef) = task { return [||] }
 
-                member _.SetReaction (_: ChatId) (_: int64) (_: string) = Task.FromResult(()) }
+                member _.SetReaction (_: ChatId) (_: int64) (_: string) = Task.FromResult(())
+
+                member _.SetTyping(_: ChatId) = Task.FromResult(()) }
 
         let executor =
             HostToolExecutor(transport, FakeVoiceProcessor(Ok "hi"), NullLogger<HostToolExecutor>.Instance)

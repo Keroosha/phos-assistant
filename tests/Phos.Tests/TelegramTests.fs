@@ -122,6 +122,7 @@ type FakeTransport() =
         member _.DownloadVoice _ = task { return voiceBytes }
 
         member _.SetReaction _ _ _ = Task.FromResult(())
+        member _.SetTyping(_: ChatId) = Task.FromResult(())
 
 /// Fake voice processor returning a configurable result, so the update handler
 /// voice path can be tested without a real STT service.
@@ -344,7 +345,8 @@ let ``ping is accepted and pong is delivered with the same random id`` () =
 
                 let enqueue (env: OutboxEnvelope) =
                     task {
-                        let! _ = outbox.Insert env.CommandId env.ChunkIndex env.ChatId env.RandomId env.Payload
+                        let! _ =
+                            outbox.Insert env.CommandId env.ChunkIndex env.ChatId env.RandomId env.Payload env.Entities
 
                         return ()
                     }
@@ -571,7 +573,7 @@ let ``outbox retry after failure keeps the same random id`` () =
 
             try
                 let _, outbox, _ = mkRepos exec
-                let! _ = outbox.Insert 1L 0 testChat.Id 777L "hello"
+                let! _ = outbox.Insert 1L 0 testChat.Id 777L "hello" []
 
                 let transport = FakeTransport()
                 transport.FailNext 1
@@ -602,7 +604,7 @@ let ``flood wait retries later with the same random id`` () =
 
             try
                 let _, outbox, _ = mkRepos exec
-                let! _ = outbox.Insert 1L 0 testChat.Id 888L "hello"
+                let! _ = outbox.Insert 1L 0 testChat.Id 888L "hello" []
 
                 let transport = FakeTransport()
                 transport.FloodNext 1
@@ -633,7 +635,7 @@ let ``flood wait logs a warning event 2 with the wait seconds`` () =
 
             try
                 let _, outbox, _ = mkRepos exec
-                let! _ = outbox.Insert 1L 0 testChat.Id 888L "hello"
+                let! _ = outbox.Insert 1L 0 testChat.Id 888L "hello" []
                 let! entry = outbox.NextPending()
                 let e = entry.Value
 
@@ -669,7 +671,7 @@ let ``slowmode wait also retries later with the same random id`` () =
 
             try
                 let _, outbox, _ = mkRepos exec
-                let! _ = outbox.Insert 1L 0 testChat.Id 889L "hello"
+                let! _ = outbox.Insert 1L 0 testChat.Id 889L "hello" []
 
                 let transport = FakeTransport()
                 transport.SlowmodeNext 1
@@ -721,7 +723,7 @@ let ``run async delivers a pending entry until cancelled`` () =
 
             try
                 let _, outbox, _ = mkRepos exec
-                let! _ = outbox.Insert 1L 0 testChat.Id 999L "hello"
+                let! _ = outbox.Insert 1L 0 testChat.Id 999L "hello" []
 
                 let transport = FakeTransport()
                 let delivery = OutboxDelivery(outbox, transport, NullLogger.Instance)
@@ -1102,6 +1104,30 @@ let ``buildEditRequest sets peer, id, message and entities`` () =
 
     let req2 = Transport.buildEditRequest peer 56L "more" []
     req2.message |> should equal "more"
+
+[<Fact>]
+let ``buildReactionRequest sets peer, msg id, reaction and has_reaction flag`` () =
+    let peer = TL.InputPeerUser(1L, 2L) :> TL.InputPeer
+    let req = Transport.buildReactionRequest peer 55L "👀"
+
+    req.peer |> should not' (be null)
+    req.msg_id |> should equal 55
+    req.reaction |> should haveLength 1
+
+    match req.reaction.[0] with
+    | :? TL.ReactionEmoji as e -> e.emoticon |> should equal "👀"
+    | _ -> failwith "expected a ReactionEmoji reaction"
+
+    let hasReaction = TL.Methods.Messages_SendReaction.Flags.has_reaction
+    (req.flags &&& hasReaction = hasReaction) |> should be True
+
+[<Fact>]
+let ``buildTypingRequest sets peer and a typing action`` () =
+    let peer = TL.InputPeerUser(1L, 2L) :> TL.InputPeer
+    let req = Transport.buildTypingRequest peer
+
+    req.peer |> should not' (be null)
+    req.action |> should be ofExactType<TL.SendMessageTypingAction>
 
 [<Fact>]
 let ``resolvePeer returns a cached peer or throws`` () =

@@ -1,10 +1,12 @@
 namespace Phos.Storage
 
 open System
+open System.Text.Json
 open System.Threading.Tasks
 open Microsoft.Data.Sqlite
 open Phos.Core
 open Phos.Core.DomainTypes
+open Phos.Core.Chunker
 open Phos.Core.OutboxStateMachine
 
 /// A message entry in the transactional outbox.
@@ -15,6 +17,7 @@ type OutboxEntry =
       ChatId: ChatId
       RandomId: int64
       Payload: string
+      Entities: Entity list
       Status: OutboxStateMachine.Status
       Attempts: int
       MaxAttempts: int
@@ -25,7 +28,13 @@ type OutboxEntry =
 /// Repository for the `message_outbox` table.
 type IMessageOutbox =
     abstract Insert:
-        commandId: int64 -> chunkIndex: int -> chatId: ChatId -> randomId: int64 -> payload: string -> Task<int64>
+        commandId: int64 ->
+        chunkIndex: int ->
+        chatId: ChatId ->
+        randomId: int64 ->
+        payload: string ->
+        entities: Entity list ->
+            Task<int64>
 
     abstract NextPending: unit -> Task<OutboxEntry option>
     abstract BeginSend: id: int64 -> Task<unit>
@@ -50,8 +59,51 @@ type MessageOutbox(exec: StorageExecutor) =
         | "failed" -> Status.Failed
         | _ -> failwithf "unknown outbox status: %s" s
 
+    /// Encodes entities to the outbox's JSON text column. An empty list is
+    /// stored as an empty string (round-trips back to `[]`).
+    let encodeEntities (entities: Entity list) : string =
+        if List.isEmpty entities then
+            ""
+        else
+            let items =
+                entities
+                |> List.map (fun e ->
+                    {| offset = e.Offset
+                       length = e.Length
+                       kind = e.Kind.ToString() |})
+
+            JsonSerializer.Serialize(items)
+
+    /// Decodes the JSON text column back into entities. Missing/NULL/empty
+    /// values become `[]`; any parse failure is treated as `[]` so a corrupt
+    /// row never blocks delivery.
+    let decodeEntities (s: string) : Entity list =
+        if String.IsNullOrWhiteSpace s then
+            []
+        else
+            try
+                use doc = JsonDocument.Parse(s)
+
+                [ for el in doc.RootElement.EnumerateArray() ->
+                      let kind =
+                          match el.GetProperty("kind").GetString() with
+                          | "Bold" -> EntityKind.Bold
+                          | "Italic" -> EntityKind.Italic
+                          | "Code" -> EntityKind.Code
+                          | "Pre" -> EntityKind.Pre
+                          | "TextUrl" -> EntityKind.TextUrl
+                          | "Mention" -> EntityKind.Mention
+                          | "Hashtag" -> EntityKind.Hashtag
+                          | _ -> EntityKind.Unknown
+
+                      { Offset = el.GetProperty("offset").GetInt32()
+                        Length = el.GetProperty("length").GetInt32()
+                        Kind = kind } ]
+            with _ ->
+                []
+
     let selectColumns =
-        "id, command_id, chunk_index, chat_id, random_id, payload, status, attempts, max_attempts, remote_message_id, created_at, updated_at"
+        "id, command_id, chunk_index, chat_id, random_id, payload, entities, status, attempts, max_attempts, remote_message_id, created_at, updated_at"
 
     let readEntry (reader: SqliteDataReader) : OutboxEntry =
         let id = reader.GetInt64 0
@@ -60,12 +112,21 @@ type MessageOutbox(exec: StorageExecutor) =
         let cid = ChatId(reader.GetInt64 3)
         let randomId = reader.GetInt64 4
         let payload = reader.GetString 5
-        let status = statusOfString (reader.GetString 6)
-        let attempts = reader.GetInt32 7
-        let maxAttempts = reader.GetInt32 8
-        let remoteMessageId = if reader.IsDBNull 9 then None else Some(reader.GetInt64 9)
-        let createdAt = fromUnix (reader.GetInt64 10)
-        let updatedAt = fromUnix (reader.GetInt64 11)
+
+        let entities = decodeEntities (if reader.IsDBNull 6 then "" else reader.GetString 6)
+
+        let status = statusOfString (reader.GetString 7)
+        let attempts = reader.GetInt32 8
+        let maxAttempts = reader.GetInt32 9
+
+        let remoteMessageId =
+            if reader.IsDBNull 10 then
+                None
+            else
+                Some(reader.GetInt64 10)
+
+        let createdAt = fromUnix (reader.GetInt64 11)
+        let updatedAt = fromUnix (reader.GetInt64 12)
 
         { Id = id
           CommandId = commandId
@@ -73,6 +134,7 @@ type MessageOutbox(exec: StorageExecutor) =
           ChatId = cid
           RandomId = randomId
           Payload = payload
+          Entities = entities
           Status = status
           Attempts = attempts
           MaxAttempts = maxAttempts
@@ -81,14 +143,21 @@ type MessageOutbox(exec: StorageExecutor) =
           UpdatedAt = updatedAt }
 
     interface IMessageOutbox with
-        member _.Insert (commandId: int64) (chunkIndex: int) (chat: ChatId) (randomId: int64) (payload: string) =
+        member _.Insert
+            (commandId: int64)
+            (chunkIndex: int)
+            (chat: ChatId)
+            (randomId: int64)
+            (payload: string)
+            (entities: Entity list)
+            =
             exec.WriteAsync(fun conn ->
                 use cmd = conn.CreateCommand()
 
                 cmd.CommandText <-
                     """
-                    INSERT INTO message_outbox(command_id, chunk_index, chat_id, random_id, payload, status, created_at, updated_at)
-                    VALUES ($commandId, $chunkIndex, $chatId, $randomId, $payload, 'pending', $now, $now)
+                    INSERT INTO message_outbox(command_id, chunk_index, chat_id, random_id, payload, entities, status, created_at, updated_at)
+                    VALUES ($commandId, $chunkIndex, $chatId, $randomId, $payload, $entities, 'pending', $now, $now)
                     ON CONFLICT DO NOTHING
                     RETURNING id;
                 """
@@ -98,6 +167,7 @@ type MessageOutbox(exec: StorageExecutor) =
                 cmd.Parameters.AddWithValue("$chatId", chatId chat) |> ignore
                 cmd.Parameters.AddWithValue("$randomId", randomId) |> ignore
                 cmd.Parameters.AddWithValue("$payload", payload) |> ignore
+                cmd.Parameters.AddWithValue("$entities", encodeEntities entities) |> ignore
 
                 cmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToUnixTimeSeconds())
                 |> ignore

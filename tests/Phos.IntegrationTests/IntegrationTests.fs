@@ -17,6 +17,7 @@ open Xunit
 open FsUnit.Xunit
 open Microsoft.Extensions.Logging.Abstractions
 open Phos.Core.DomainTypes
+open Phos.Core.Chunker
 open Phos.Storage
 open Phos.Telegram
 open Phos.Omp
@@ -146,6 +147,8 @@ type FakeTransport(?voiceBytes: byte[]) =
 
         member _.SetReaction (_: ChatId) (_: int64) (_: string) = Task.FromResult(())
 
+        member _.SetTyping(_: ChatId) = Task.FromResult(())
+
 type FakeVoiceProcessor(result: Result<string, string>) =
     interface IVoiceProcessor with
         member _.ProcessAsync(_: VoiceRef) = task { return result }
@@ -155,7 +158,14 @@ type FakeOutbox() =
     member _.Entries = entries
 
     interface IMessageOutbox with
-        member _.Insert (commandId: int64) (chunkIndex: int) (chatId: ChatId) (randomId: int64) (payload: string) =
+        member _.Insert
+            (commandId: int64)
+            (chunkIndex: int)
+            (chatId: ChatId)
+            (randomId: int64)
+            (payload: string)
+            (entities: Entity list)
+            =
             task {
                 let e =
                     { Id = int64 entries.Count
@@ -164,6 +174,7 @@ type FakeOutbox() =
                       ChatId = chatId
                       RandomId = randomId
                       Payload = payload
+                      Entities = entities
                       Status = Phos.Core.OutboxStateMachine.Status.Pending
                       Attempts = 0
                       MaxAttempts = 5

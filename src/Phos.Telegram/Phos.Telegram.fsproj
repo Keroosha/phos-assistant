@@ -11,6 +11,7 @@
     <Compile Include="UpdateModel.fs" />
     <Compile Include="UpdateDedupe.fs" />
     <Compile Include="EntitySend.fs" />
+    <Compile Include="Markdown.fs" />
     <Compile Include="VoiceProcessor.fs" />
     <Compile Include="UpdateHandler.fs" />
     <Compile Include="PhosLog.fs" />

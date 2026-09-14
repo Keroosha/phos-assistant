@@ -299,6 +299,19 @@ type CreateBackupLog() =
     override this.Down() =
         this.Delete.Table("backup_log") |> ignore
 
+[<Migration(7L)>]
+type AddOutboxEntities() =
+    inherit Migration()
+
+    override this.Up() =
+        // Entities for outbound messages are stored as a JSON text column so the
+        // storage layer never depends on the Telegram entity type.
+        this.Alter.Table("message_outbox").AddColumn("entities").AsString().Nullable()
+        |> ignore
+
+    override this.Down() =
+        this.Delete.Column("entities").FromTable("message_outbox") |> ignore
+
 // ---------------------------------------------------------------------------
 // Runner
 // ---------------------------------------------------------------------------

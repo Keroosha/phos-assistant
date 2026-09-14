@@ -32,7 +32,7 @@ type OutboxDelivery(outbox: IMessageOutbox, transport: ITelegramTransport, logge
                     { ChatId = entry.ChatId
                       RandomId = entry.RandomId
                       Text = entry.Payload
-                      Entities = [] }
+                      Entities = entry.Entities |> List.map EntitySend.toTelegramEntity }
 
                 match! transport.SendMessage target with
                 | Ok result ->

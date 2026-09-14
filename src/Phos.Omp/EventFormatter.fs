@@ -3,6 +3,7 @@ namespace Phos.Omp
 open System
 open System.Text.Json.Nodes
 open Phos.Core.DomainTypes
+open Phos.Core.Chunker
 open Phos.Telegram
 
 /// Per-session stream state for the pure event formatter.
@@ -19,12 +20,13 @@ module EventFormatter =
 
     let initialState: StreamState = { Accumulated = "" }
 
-    let private envelope (ctx: FormatterContext) (index: int) (text: string) : OutboxEnvelope =
+    let private envelope (ctx: FormatterContext) (index: int) (text: string) (entities: Entity list) : OutboxEnvelope =
         { CommandId = ctx.CommandId
           ChunkIndex = index
           ChatId = ctx.ChatId
           RandomId = Random.Shared.NextInt64()
-          Payload = text }
+          Payload = text
+          Entities = entities }
 
     /// Consumes one event frame, returning the updated state and any outbox
     /// envelopes to deliver. `tool_execution_start` status messages are
@@ -57,9 +59,10 @@ module EventFormatter =
                 let text = st.Accumulated
 
                 if not (String.IsNullOrWhiteSpace text) then
-                    let chunks = EntitySend.chunkForSend text []
+                    let entities = Markdown.parse text
+                    let chunks = EntitySend.chunkForSend text entities
 
-                    envelopes <- chunks |> List.mapi (fun i c -> envelope ctx i c.Text)
+                    envelopes <- chunks |> List.mapi (fun i c -> envelope ctx i c.Text c.Entities)
 
                 st <- initialState
         | _ -> ()

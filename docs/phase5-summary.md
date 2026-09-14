@@ -44,9 +44,13 @@ Compile order:
 7. **HostUris.fs** — `HostUriResolver` for `tg://` scheme: read → download voice
    bytes → `host_uri_result` (audio as base64 text, `application/octet-stream`);
    write → `isError`. Scheme registered `writable:false`.
-8. **EventFormatter.fs** — PURE: `StreamState` accumulation; first `text_delta`
-   → single `"…"` typing status envelope; `agent_end` `isTerminal !== false` →
-   final text chunked via `Phos.Core.Chunker`; non-terminal → nothing.
+8. **EventFormatter.fs** — PURE: `StreamState` accumulation; `text_delta`
+   → silent accumulation (no status envelopes); `agent_end` `isTerminal !== false`
+   → markdown parsed (`Markdown.parse`: bold/italic/code/pre) and chunked with
+   entities via `Phos.Core.Chunker`; non-terminal → nothing. Delivery: typing
+   bubble re-sent every 4s while a command runs (OmpWorker), 👀 reaction on
+   accept (message id recovered from `tg:<updateId>`), entities stored in the
+   outbox `entities` column (migration 7) and mapped to Telegram entities.
 9. **SessionManager.fs** — per-user runtime (workspace, process/client, sessionId,
    queue with `MaxQueuePerUser` cap, Busy, LastActivity). `EnsureRuntime` (idempotent
    profile/workspace/spawn + `--resume` + get_state + SetHostTools + SetHostUriSchemes),
@@ -88,8 +92,10 @@ Compile order:
   host_uri read → base64, write → isError.
 - **SessionManager unit tests** (fake `IOmpRpcClient`): busy/queue/full; respawn
   with `--resume`; idle timeout; abort; terminal vs non-terminal agent_end → TurnEnded.
-- **EventFormatter unit tests**: text_delta accumulation; typing status once;
-  terminal → 4096 chunks; non-terminal/empty → nothing.
+- **EventFormatter unit tests**: text_delta accumulation (no status envelopes);
+  terminal → 4096 chunks with entity rebasing; non-terminal/empty → nothing.
+- **Markdown.parse tests**: bold/italic/code/fenced-pre offsets; unmatched markers
+  literal; `**` vs `*` disambiguation. **Outbox entities roundtrip** test.
 - **WorkspaceManager / ProfileManager tests**: Ensure + APPEND_SYSTEM.md; profile
   creation + source copy; missing source → Error; idempotency.
 - **CommandInbox `ListPendingChatIds` test** in StorageTests.fs.

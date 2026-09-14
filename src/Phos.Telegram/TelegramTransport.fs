@@ -89,13 +89,15 @@ type TelegramTransport(config: TelegramConfig) =
     let setReactionCore (chat: ChatId) (messageId: int64) (emoji: string) : Task<unit> =
         task {
             let peer = Transport.resolvePeer peers chat
-            let req = TL.Methods.Messages_SendReaction()
-            req.peer <- peer
-            req.msg_id <- int messageId
+            let req = Transport.buildReactionRequest peer messageId emoji
+            let! _ = client.Invoke(req)
+            return ()
+        }
 
-            let reaction = TL.ReactionEmoji()
-            reaction.emoticon <- emoji
-            req.reaction <- [| reaction :> TL.Reaction |]
+    let typingCore (chat: ChatId) : Task<unit> =
+        task {
+            let peer = Transport.resolvePeer peers chat
+            let req = Transport.buildTypingRequest peer
             let! _ = client.Invoke(req)
             return ()
         }
@@ -117,3 +119,5 @@ type TelegramTransport(config: TelegramConfig) =
         member _.DownloadVoice(voice) = downloadVoiceCore voice
 
         member _.SetReaction (chat) (messageId) (emoji) = setReactionCore chat messageId emoji
+
+        member _.SetTyping(chat) = typingCore chat

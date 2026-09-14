@@ -27,10 +27,12 @@ module EntitySend =
 
         Phos.Core.Chunker.chunk 4096 text coreEntities
 
+    /// Converts a single Core entity into a `TelegramEntity` ready for sending.
+    let toTelegramEntity (e: Entity) : TelegramEntity =
+        { Offset = e.Offset
+          Length = e.Length
+          Kind = e.Kind }
+
     /// Rebases a chunk's entities into `TelegramEntity` values ready for sending.
     let toTelegramEntities (chunk: Chunk) : TelegramEntity list =
-        chunk.Entities
-        |> List.map (fun e ->
-            { Offset = e.Offset
-              Length = e.Length
-              Kind = e.Kind })
+        chunk.Entities |> List.map toTelegramEntity
