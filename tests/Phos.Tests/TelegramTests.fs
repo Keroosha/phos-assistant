@@ -48,7 +48,7 @@ let private createExecutor (dbPath: string) : StorageExecutor =
 let private dispose (exec: StorageExecutor) = exec.Dispose()
 
 let private mkRepos (exec: StorageExecutor) =
-    (CommandInbox(exec) :> ICommandInbox, MessageOutbox(exec) :> IMessageOutbox, UserRepository(exec) :> IUserRepository)
+    (CommandInbox(exec) :> ICommandInbox, MessageOutbox(exec) :> IMessageOutbox)
 
 let private testChat: Chat = { Id = ChatId 1L; Kind = Private }
 
@@ -260,7 +260,7 @@ let ``login config provider only answers the four bot keys`` () =
 // ---------------------------------------------------------------------------
 
 [<Fact>]
-let ``allowlisted start is accepted and upserts the user`` () =
+let ``start text is admitted as command`` () =
     let dir = makeTempDir ()
     let dbPath = Path.Combine(dir, "phos.db")
 
@@ -269,7 +269,7 @@ let ``allowlisted start is accepted and upserts the user`` () =
             let exec = createExecutor dbPath
 
             try
-                let inbox, _, users = mkRepos exec
+                let inbox, _ = mkRepos exec
                 let dedupe = UpdateDedupe(1000)
                 let admitCalls = ResizeArray<CommandEnvelope>()
                 let outboxCalls = ResizeArray<OutboxEnvelope>()
@@ -286,20 +286,15 @@ let ``allowlisted start is accepted and upserts the user`` () =
                     Phos.Core.Whitelist.create (Map.ofList [ (UserId 1L, User) ]) Set.empty
 
                 let handler =
-                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, noopVoice, FakeTransport())
+                    UpdateHandler(whitelist, inbox, dedupe, admit, enqueue, noopVoice, FakeTransport())
 
                 let update = mkUpdate 100L testChat testUser (Some "/start") None
                 let! result = handler.HandleAsync update
                 result |> should equal Accepted
 
-                let! user = users.GetByTelegramId(UserId 1L)
-                user |> Option.isSome |> should be True
-                user.Value.WorkspacePath |> should startWith "/var/lib/phos/workspace/"
-                user.Value.Username |> should equal (Some "tester")
-
-                admitCalls.Count |> should equal 0
-                outboxCalls.Count |> should equal 1
-                outboxCalls.[0].Payload |> should not' (be Empty)
+                admitCalls.Count |> should equal 1
+                admitCalls.[0].Payload |> should equal "/start"
+                outboxCalls.Count |> should equal 0
             finally
                 dispose exec
         }
@@ -307,7 +302,7 @@ let ``allowlisted start is accepted and upserts the user`` () =
         deleteDir dir
 
 [<Fact>]
-let ``start is denied before admission for a non-whitelisted user`` () =
+let ``non-whitelisted user text is denied before admission`` () =
     let dir = makeTempDir ()
     let dbPath = Path.Combine(dir, "phos.db")
 
@@ -316,7 +311,7 @@ let ``start is denied before admission for a non-whitelisted user`` () =
             let exec = createExecutor dbPath
 
             try
-                let inbox, _, users = mkRepos exec
+                let inbox, _ = mkRepos exec
                 let dedupe = UpdateDedupe(1000)
                 let admitCalls = ResizeArray<CommandEnvelope>()
                 let outboxCalls = ResizeArray<OutboxEnvelope>()
@@ -333,19 +328,17 @@ let ``start is denied before admission for a non-whitelisted user`` () =
                     Phos.Core.Whitelist.create (Map.ofList [ (UserId 1L, User) ]) Set.empty
 
                 let handler =
-                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, noopVoice, FakeTransport())
+                    UpdateHandler(whitelist, inbox, dedupe, admit, enqueue, noopVoice, FakeTransport())
 
                 let stranger =
                     { Id = UserId 999L
                       Username = Some "stranger"
                       Role = User }
 
-                let update = mkUpdate 101L testChat stranger (Some "/start") None
+                let update = mkUpdate 101L testChat stranger (Some "hi") None
                 let! result = handler.HandleAsync update
                 result |> should equal (Denied NotWhitelisted)
 
-                let! user = users.GetByTelegramId(UserId 999L)
-                user |> Option.isNone |> should be True
                 admitCalls.Count |> should equal 0
                 outboxCalls.Count |> should equal 0
             finally
@@ -364,7 +357,7 @@ let ``non-whitelisted text is denied and admit is not called`` () =
             let exec = createExecutor dbPath
 
             try
-                let inbox, _, users = mkRepos exec
+                let inbox, _ = mkRepos exec
                 let dedupe = UpdateDedupe(1000)
                 let admitCalls = ResizeArray<CommandEnvelope>()
                 let enqueue (env: OutboxEnvelope) = task { () }
@@ -379,7 +372,7 @@ let ``non-whitelisted text is denied and admit is not called`` () =
                     Phos.Core.Whitelist.create (Map.ofList [ (UserId 1L, User) ]) Set.empty
 
                 let handler =
-                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, noopVoice, FakeTransport())
+                    UpdateHandler(whitelist, inbox, dedupe, admit, enqueue, noopVoice, FakeTransport())
 
                 let stranger =
                     { Id = UserId 999L
@@ -397,7 +390,7 @@ let ``non-whitelisted text is denied and admit is not called`` () =
         deleteDir dir
 
 [<Fact>]
-let ``ping is accepted and pong is delivered with the same random id`` () =
+let ``ping text is admitted as command`` () =
     let dir = makeTempDir ()
     let dbPath = Path.Combine(dir, "phos.db")
 
@@ -406,45 +399,32 @@ let ``ping is accepted and pong is delivered with the same random id`` () =
             let exec = createExecutor dbPath
 
             try
-                let inbox, outbox, users = mkRepos exec
+                let inbox, _ = mkRepos exec
                 let dedupe = UpdateDedupe(1000)
+                let admitCalls = ResizeArray<CommandEnvelope>()
+                let outboxCalls = ResizeArray<OutboxEnvelope>()
 
-                let admit _ = task { return Admitted 1L }
-
-                let enqueue (env: OutboxEnvelope) =
+                let admit (env: CommandEnvelope) =
                     task {
-                        let! _ =
-                            outbox.Insert env.CommandId env.ChunkIndex env.ChatId env.RandomId env.Payload env.Entities
-
-                        return ()
+                        admitCalls.Add env
+                        return Admitted 1L
                     }
+
+                let enqueue (env: OutboxEnvelope) = task { outboxCalls.Add env }
 
                 let whitelist =
                     Phos.Core.Whitelist.create (Map.ofList [ (UserId 1L, User) ]) Set.empty
 
                 let handler =
-                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, noopVoice, FakeTransport())
+                    UpdateHandler(whitelist, inbox, dedupe, admit, enqueue, noopVoice, FakeTransport())
 
                 let update = mkUpdate 200L testChat testUser (Some "/ping") None
                 let! result = handler.HandleAsync update
                 result |> should equal Accepted
 
-                let! entry = outbox.NextPending()
-                entry |> Option.isSome |> should be True
-                let e = entry.Value
-
-                let transport = FakeTransport()
-                let delivery = OutboxDelivery(outbox, transport, NullLogger.Instance)
-                let! processed = delivery.DeliverOnceAsync(CancellationToken.None)
-                processed |> should be True
-
-                transport.SendCalls |> should haveLength 1
-                transport.SendCalls.[0].RandomId |> should equal e.RandomId
-                transport.SendCalls.[0].Text |> should equal "pong"
-
-                let! sent = outbox.GetByRandomId e.RandomId
-                sent |> Option.isSome |> should be True
-                sent.Value.Status |> should equal Out.Sent
+                admitCalls.Count |> should equal 1
+                admitCalls.[0].Payload |> should equal "/ping"
+                outboxCalls.Count |> should equal 0
             finally
                 dispose exec
         }
@@ -461,7 +441,7 @@ let ``duplicate update id is rejected and admitted once`` () =
             let exec = createExecutor dbPath
 
             try
-                let inbox, _, users = mkRepos exec
+                let inbox, _ = mkRepos exec
                 let dedupe = UpdateDedupe(1000)
                 let admitCalls = ResizeArray<CommandEnvelope>()
                 let enqueue (env: OutboxEnvelope) = task { () }
@@ -476,7 +456,7 @@ let ``duplicate update id is rejected and admitted once`` () =
                     Phos.Core.Whitelist.create (Map.ofList [ (UserId 1L, User) ]) Set.empty
 
                 let handler =
-                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, noopVoice, FakeTransport())
+                    UpdateHandler(whitelist, inbox, dedupe, admit, enqueue, noopVoice, FakeTransport())
 
                 let update = mkUpdate 300L testChat testUser (Some "hello") None
                 let! first = handler.HandleAsync update
@@ -500,7 +480,7 @@ let ``voice update is admitted with a voice marker and voice bytes download`` ()
             let exec = createExecutor dbPath
 
             try
-                let inbox, _, users = mkRepos exec
+                let inbox, _ = mkRepos exec
                 let dedupe = UpdateDedupe(1000)
                 let admitCalls = ResizeArray<CommandEnvelope>()
                 let enqueue (env: OutboxEnvelope) = task { () }
@@ -518,7 +498,7 @@ let ``voice update is admitted with a voice marker and voice bytes download`` ()
                 voiceProc.Result <- Ok "распознанный текст"
 
                 let handler =
-                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, voiceProc, FakeTransport())
+                    UpdateHandler(whitelist, inbox, dedupe, admit, enqueue, voiceProc, FakeTransport())
 
                 let voiceRef =
                     { ChatId = testChat.Id
@@ -552,7 +532,7 @@ let ``voice error replies a warning and does not admit`` () =
             let exec = createExecutor dbPath
 
             try
-                let inbox, _, users = mkRepos exec
+                let inbox, _ = mkRepos exec
                 let dedupe = UpdateDedupe(1000)
                 let admitCalls = ResizeArray<CommandEnvelope>()
                 let outbox = ResizeArray<OutboxEnvelope>()
@@ -576,7 +556,7 @@ let ``voice error replies a warning and does not admit`` () =
                 voiceProc.Result <- Error "голосовое слишком большое"
 
                 let handler =
-                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, voiceProc, FakeTransport())
+                    UpdateHandler(whitelist, inbox, dedupe, admit, enqueue, voiceProc, FakeTransport())
 
                 let voiceRef =
                     { ChatId = testChat.Id
@@ -606,7 +586,7 @@ let ``admit failure yields AdmitFailed`` () =
             let exec = createExecutor dbPath
 
             try
-                let inbox, _, users = mkRepos exec
+                let inbox, _ = mkRepos exec
                 let dedupe = UpdateDedupe(1000)
                 let enqueue (env: OutboxEnvelope) = task { () }
                 let admit _ = task { return Failed }
@@ -615,7 +595,7 @@ let ``admit failure yields AdmitFailed`` () =
                     Phos.Core.Whitelist.create (Map.ofList [ (UserId 1L, User) ]) Set.empty
 
                 let handler =
-                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, noopVoice, FakeTransport())
+                    UpdateHandler(whitelist, inbox, dedupe, admit, enqueue, noopVoice, FakeTransport())
 
                 let update = mkUpdate 500L testChat testUser (Some "hello") None
                 let! result = handler.HandleAsync update
@@ -636,7 +616,7 @@ let ``sticker triggers reaction and does not admit`` () =
             let exec = createExecutor dbPath
 
             try
-                let inbox, _, users = mkRepos exec
+                let inbox, _ = mkRepos exec
                 let dedupe = UpdateDedupe(1000)
                 let admitCalls = ResizeArray<CommandEnvelope>()
                 let enqueue (env: OutboxEnvelope) = task { () }
@@ -653,7 +633,7 @@ let ``sticker triggers reaction and does not admit`` () =
                 let transport = FakeTransport()
 
                 let handler =
-                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, noopVoice, transport)
+                    UpdateHandler(whitelist, inbox, dedupe, admit, enqueue, noopVoice, transport)
 
                 let update = mkUpdateWith 600L testChat testUser None None None true None
                 let! result = handler.HandleAsync update
@@ -679,7 +659,7 @@ let ``photo admits command with base64 image and caption`` () =
             let exec = createExecutor dbPath
 
             try
-                let inbox, _, users = mkRepos exec
+                let inbox, _ = mkRepos exec
                 let dedupe = UpdateDedupe(1000)
                 let admitCalls = ResizeArray<CommandEnvelope>()
                 let enqueue (env: OutboxEnvelope) = task { () }
@@ -697,7 +677,7 @@ let ``photo admits command with base64 image and caption`` () =
                 let transport = FakeTransport(photoBytes = photoBytes)
 
                 let handler =
-                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, noopVoice, transport)
+                    UpdateHandler(whitelist, inbox, dedupe, admit, enqueue, noopVoice, transport)
 
                 let photoRef =
                     { ChatId = testChat.Id
@@ -728,7 +708,7 @@ let ``photo without caption admits empty payload with image`` () =
             let exec = createExecutor dbPath
 
             try
-                let inbox, _, users = mkRepos exec
+                let inbox, _ = mkRepos exec
                 let dedupe = UpdateDedupe(1000)
                 let admitCalls = ResizeArray<CommandEnvelope>()
                 let enqueue (env: OutboxEnvelope) = task { () }
@@ -746,7 +726,7 @@ let ``photo without caption admits empty payload with image`` () =
                 let transport = FakeTransport(photoBytes = photoBytes)
 
                 let handler =
-                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, noopVoice, transport)
+                    UpdateHandler(whitelist, inbox, dedupe, admit, enqueue, noopVoice, transport)
 
                 let photoRef =
                     { ChatId = testChat.Id
@@ -777,7 +757,7 @@ let ``photo download failure replies error and does not admit`` () =
             let exec = createExecutor dbPath
 
             try
-                let inbox, _, users = mkRepos exec
+                let inbox, _ = mkRepos exec
                 let dedupe = UpdateDedupe(1000)
                 let admitCalls = ResizeArray<CommandEnvelope>()
                 let outbox = ResizeArray<OutboxEnvelope>()
@@ -801,7 +781,7 @@ let ``photo download failure replies error and does not admit`` () =
                 transport.FailPhotoDownload <- true
 
                 let handler =
-                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, noopVoice, transport)
+                    UpdateHandler(whitelist, inbox, dedupe, admit, enqueue, noopVoice, transport)
 
                 let photoRef =
                     { ChatId = testChat.Id
@@ -836,7 +816,7 @@ let ``outbox retry after failure keeps the same random id`` () =
             let exec = createExecutor dbPath
 
             try
-                let _, outbox, _ = mkRepos exec
+                let _, outbox = mkRepos exec
                 let! _ = outbox.Insert 1L 0 testChat.Id 777L "hello" []
 
                 let transport = FakeTransport()
@@ -867,7 +847,7 @@ let ``flood wait retries later with the same random id`` () =
             let exec = createExecutor dbPath
 
             try
-                let _, outbox, _ = mkRepos exec
+                let _, outbox = mkRepos exec
                 let! _ = outbox.Insert 1L 0 testChat.Id 888L "hello" []
 
                 let transport = FakeTransport()
@@ -898,7 +878,7 @@ let ``flood wait logs a warning event 2 with the wait seconds`` () =
             let exec = createExecutor dbPath
 
             try
-                let _, outbox, _ = mkRepos exec
+                let _, outbox = mkRepos exec
                 let! _ = outbox.Insert 1L 0 testChat.Id 888L "hello" []
                 let! entry = outbox.NextPending()
                 let e = entry.Value
@@ -934,7 +914,7 @@ let ``slowmode wait also retries later with the same random id`` () =
             let exec = createExecutor dbPath
 
             try
-                let _, outbox, _ = mkRepos exec
+                let _, outbox = mkRepos exec
                 let! _ = outbox.Insert 1L 0 testChat.Id 889L "hello" []
 
                 let transport = FakeTransport()
@@ -965,7 +945,7 @@ let ``deliver once returns false when outbox is empty`` () =
             let exec = createExecutor dbPath
 
             try
-                let _, outbox, _ = mkRepos exec
+                let _, outbox = mkRepos exec
                 let transport = FakeTransport()
                 let delivery = OutboxDelivery(outbox, transport, NullLogger.Instance)
                 let! processed = delivery.DeliverOnceAsync(CancellationToken.None)
@@ -986,7 +966,7 @@ let ``run async delivers a pending entry until cancelled`` () =
             let exec = createExecutor dbPath
 
             try
-                let _, outbox, _ = mkRepos exec
+                let _, outbox = mkRepos exec
                 let! _ = outbox.Insert 1L 0 testChat.Id 999L "hello" []
 
                 let transport = FakeTransport()
@@ -1024,7 +1004,7 @@ let ``run async with no pending entries stops on cancellation`` () =
             let exec = createExecutor dbPath
 
             try
-                let _, outbox, _ = mkRepos exec
+                let _, outbox = mkRepos exec
                 let transport = FakeTransport()
                 let delivery = OutboxDelivery(outbox, transport, NullLogger.Instance)
 
@@ -1055,7 +1035,7 @@ let ``run async exits immediately when already cancelled`` () =
             let exec = createExecutor dbPath
 
             try
-                let _, outbox, _ = mkRepos exec
+                let _, outbox = mkRepos exec
                 let transport = FakeTransport()
                 let delivery = OutboxDelivery(outbox, transport, NullLogger.Instance)
 
@@ -1980,7 +1960,7 @@ let ``group chat with an allowed chat id is processed`` () =
             let exec = createExecutor dbPath
 
             try
-                let inbox, _, users = mkRepos exec
+                let inbox, _ = mkRepos exec
                 let dedupe = UpdateDedupe(1000)
                 let admitCalls = ResizeArray<CommandEnvelope>()
                 let enqueue (env: OutboxEnvelope) = task { () }
@@ -1995,7 +1975,7 @@ let ``group chat with an allowed chat id is processed`` () =
                     Phos.Core.Whitelist.create (Map.ofList [ (UserId 1L, User) ]) (Set.ofList [ ChatId 10L ])
 
                 let handler =
-                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, noopVoice, FakeTransport())
+                    UpdateHandler(whitelist, inbox, dedupe, admit, enqueue, noopVoice, FakeTransport())
 
                 let groupChat = { Id = ChatId 10L; Kind = Group }
                 let update = mkUpdate 900L groupChat testUser (Some "hello") None
@@ -2018,7 +1998,7 @@ let ``voice update with text still admits the voice marker`` () =
             let exec = createExecutor dbPath
 
             try
-                let inbox, _, users = mkRepos exec
+                let inbox, _ = mkRepos exec
                 let dedupe = UpdateDedupe(1000)
                 let admitCalls = ResizeArray<CommandEnvelope>()
                 let enqueue (env: OutboxEnvelope) = task { () }
@@ -2036,7 +2016,7 @@ let ``voice update with text still admits the voice marker`` () =
                 voiceProc.Result <- Ok "голосовой текст"
 
                 let handler =
-                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, voiceProc, FakeTransport())
+                    UpdateHandler(whitelist, inbox, dedupe, admit, enqueue, voiceProc, FakeTransport())
 
                 let voiceRef =
                     { ChatId = testChat.Id
@@ -2065,7 +2045,7 @@ let ``empty update admits an empty command payload`` () =
             let exec = createExecutor dbPath
 
             try
-                let inbox, _, users = mkRepos exec
+                let inbox, _ = mkRepos exec
                 let dedupe = UpdateDedupe(1000)
                 let admitCalls = ResizeArray<CommandEnvelope>()
                 let enqueue (env: OutboxEnvelope) = task { () }
@@ -2080,7 +2060,7 @@ let ``empty update admits an empty command payload`` () =
                     Phos.Core.Whitelist.create (Map.ofList [ (UserId 1L, User) ]) Set.empty
 
                 let handler =
-                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, noopVoice, FakeTransport())
+                    UpdateHandler(whitelist, inbox, dedupe, admit, enqueue, noopVoice, FakeTransport())
 
                 let update = mkUpdate 902L testChat testUser None None
                 let! result = handler.HandleAsync update
@@ -2103,7 +2083,7 @@ let ``unknown slash command is admitted as a command`` () =
             let exec = createExecutor dbPath
 
             try
-                let inbox, _, users = mkRepos exec
+                let inbox, _ = mkRepos exec
                 let dedupe = UpdateDedupe(1000)
                 let admitCalls = ResizeArray<CommandEnvelope>()
                 let enqueue (env: OutboxEnvelope) = task { () }
@@ -2118,7 +2098,7 @@ let ``unknown slash command is admitted as a command`` () =
                     Phos.Core.Whitelist.create (Map.ofList [ (UserId 1L, User) ]) Set.empty
 
                 let handler =
-                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, noopVoice, FakeTransport())
+                    UpdateHandler(whitelist, inbox, dedupe, admit, enqueue, noopVoice, FakeTransport())
 
                 let update = mkUpdate 903L testChat testUser (Some "/help") None
                 let! result = handler.HandleAsync update
@@ -2141,7 +2121,7 @@ let ``voice update in an allowed group chat is admitted`` () =
             let exec = createExecutor dbPath
 
             try
-                let inbox, _, users = mkRepos exec
+                let inbox, _ = mkRepos exec
                 let dedupe = UpdateDedupe(1000)
                 let admitCalls = ResizeArray<CommandEnvelope>()
                 let enqueue (env: OutboxEnvelope) = task { () }
@@ -2159,7 +2139,7 @@ let ``voice update in an allowed group chat is admitted`` () =
                 voiceProc.Result <- Ok "текст из группы"
 
                 let handler =
-                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, voiceProc, FakeTransport())
+                    UpdateHandler(whitelist, inbox, dedupe, admit, enqueue, voiceProc, FakeTransport())
 
                 let groupChat = { Id = ChatId 20L; Kind = Group }
 
@@ -2190,7 +2170,7 @@ let ``group chat not in whitelist is denied with ChatNotAllowed`` () =
             let exec = createExecutor dbPath
 
             try
-                let inbox, _, users = mkRepos exec
+                let inbox, _ = mkRepos exec
                 let dedupe = UpdateDedupe(1000)
                 let admitCalls = ResizeArray<CommandEnvelope>()
                 let enqueue (env: OutboxEnvelope) = task { () }
@@ -2205,7 +2185,7 @@ let ``group chat not in whitelist is denied with ChatNotAllowed`` () =
                     Phos.Core.Whitelist.create (Map.ofList [ (UserId 1L, User) ]) Set.empty
 
                 let handler =
-                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, noopVoice, FakeTransport())
+                    UpdateHandler(whitelist, inbox, dedupe, admit, enqueue, noopVoice, FakeTransport())
 
                 let groupChat = { Id = ChatId 30L; Kind = Group }
                 let update = mkUpdate 905L groupChat testUser (Some "hello") None
@@ -2219,7 +2199,7 @@ let ``group chat not in whitelist is denied with ChatNotAllowed`` () =
         deleteDir dir
 
 [<Fact>]
-let ``start in a channel with an allowed chat id upserts the user`` () =
+let ``start text in a channel with an allowed chat id is admitted`` () =
     let dir = makeTempDir ()
     let dbPath = Path.Combine(dir, "phos.db")
 
@@ -2228,7 +2208,7 @@ let ``start in a channel with an allowed chat id upserts the user`` () =
             let exec = createExecutor dbPath
 
             try
-                let inbox, _, users = mkRepos exec
+                let inbox, _ = mkRepos exec
                 let dedupe = UpdateDedupe(1000)
                 let admitCalls = ResizeArray<CommandEnvelope>()
                 let outboxCalls = ResizeArray<OutboxEnvelope>()
@@ -2245,17 +2225,16 @@ let ``start in a channel with an allowed chat id upserts the user`` () =
                     Phos.Core.Whitelist.create (Map.ofList [ (UserId 1L, User) ]) (Set.ofList [ ChatId 40L ])
 
                 let handler =
-                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, noopVoice, FakeTransport())
+                    UpdateHandler(whitelist, inbox, dedupe, admit, enqueue, noopVoice, FakeTransport())
 
                 let channel = { Id = ChatId 40L; Kind = Channel }
                 let update = mkUpdate 906L channel testUser (Some "/start") None
                 let! result = handler.HandleAsync update
                 result |> should equal Accepted
 
-                let! user = users.GetByTelegramId(UserId 1L)
-                user |> Option.isSome |> should be True
-                admitCalls.Count |> should equal 0
-                outboxCalls.Count |> should equal 1
+                admitCalls.Count |> should equal 1
+                admitCalls.[0].Payload |> should equal "/start"
+                outboxCalls.Count |> should equal 0
             finally
                 dispose exec
         }
@@ -2263,7 +2242,7 @@ let ``start in a channel with an allowed chat id upserts the user`` () =
         deleteDir dir
 
 [<Fact>]
-let ``ping with trailing text still replies pong`` () =
+let ``ping with trailing text is admitted as command`` () =
     let dir = makeTempDir ()
     let dbPath = Path.Combine(dir, "phos.db")
 
@@ -2272,7 +2251,7 @@ let ``ping with trailing text still replies pong`` () =
             let exec = createExecutor dbPath
 
             try
-                let inbox, _, users = mkRepos exec
+                let inbox, _ = mkRepos exec
                 let dedupe = UpdateDedupe(1000)
                 let admitCalls = ResizeArray<CommandEnvelope>()
                 let enqueue (env: OutboxEnvelope) = task { () }
@@ -2287,12 +2266,13 @@ let ``ping with trailing text still replies pong`` () =
                     Phos.Core.Whitelist.create (Map.ofList [ (UserId 1L, User) ]) Set.empty
 
                 let handler =
-                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, noopVoice, FakeTransport())
+                    UpdateHandler(whitelist, inbox, dedupe, admit, enqueue, noopVoice, FakeTransport())
 
                 let update = mkUpdate 907L testChat testUser (Some "/ping please") None
                 let! result = handler.HandleAsync update
                 result |> should equal Accepted
-                admitCalls.Count |> should equal 0
+                admitCalls.Count |> should equal 1
+                admitCalls.[0].Payload |> should equal "/ping please"
             finally
                 dispose exec
         }
@@ -2300,7 +2280,7 @@ let ``ping with trailing text still replies pong`` () =
         deleteDir dir
 
 [<Fact>]
-let ``ping in an allowed group chat is accepted`` () =
+let ``ping in an allowed group chat is admitted as command`` () =
     let dir = makeTempDir ()
     let dbPath = Path.Combine(dir, "phos.db")
 
@@ -2309,7 +2289,7 @@ let ``ping in an allowed group chat is accepted`` () =
             let exec = createExecutor dbPath
 
             try
-                let inbox, _, users = mkRepos exec
+                let inbox, _ = mkRepos exec
                 let dedupe = UpdateDedupe(1000)
                 let admitCalls = ResizeArray<CommandEnvelope>()
                 let enqueue (env: OutboxEnvelope) = task { () }
@@ -2324,13 +2304,14 @@ let ``ping in an allowed group chat is accepted`` () =
                     Phos.Core.Whitelist.create (Map.ofList [ (UserId 1L, User) ]) (Set.ofList [ ChatId 50L ])
 
                 let handler =
-                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, noopVoice, FakeTransport())
+                    UpdateHandler(whitelist, inbox, dedupe, admit, enqueue, noopVoice, FakeTransport())
 
                 let groupChat = { Id = ChatId 50L; Kind = Group }
                 let update = mkUpdate 908L groupChat testUser (Some "/ping") None
                 let! result = handler.HandleAsync update
                 result |> should equal Accepted
-                admitCalls.Count |> should equal 0
+                admitCalls.Count |> should equal 1
+                admitCalls.[0].Payload |> should equal "/ping"
             finally
                 dispose exec
         }
@@ -2347,7 +2328,7 @@ let ``empty text string is admitted as an empty command`` () =
             let exec = createExecutor dbPath
 
             try
-                let inbox, _, users = mkRepos exec
+                let inbox, _ = mkRepos exec
                 let dedupe = UpdateDedupe(1000)
                 let admitCalls = ResizeArray<CommandEnvelope>()
                 let enqueue (env: OutboxEnvelope) = task { () }
@@ -2362,7 +2343,7 @@ let ``empty text string is admitted as an empty command`` () =
                     Phos.Core.Whitelist.create (Map.ofList [ (UserId 1L, User) ]) Set.empty
 
                 let handler =
-                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, noopVoice, FakeTransport())
+                    UpdateHandler(whitelist, inbox, dedupe, admit, enqueue, noopVoice, FakeTransport())
 
                 let update = mkUpdate 909L testChat testUser (Some "") None
                 let! result = handler.HandleAsync update
@@ -2376,7 +2357,7 @@ let ``empty text string is admitted as an empty command`` () =
         deleteDir dir
 
 [<Fact>]
-let ``start with a user that has no username still upserts`` () =
+let ``start with a user that has no username is admitted as command`` () =
     let dir = makeTempDir ()
     let dbPath = Path.Combine(dir, "phos.db")
 
@@ -2385,46 +2366,7 @@ let ``start with a user that has no username still upserts`` () =
             let exec = createExecutor dbPath
 
             try
-                let inbox, _, users = mkRepos exec
-                let dedupe = UpdateDedupe(1000)
-                let enqueue (env: OutboxEnvelope) = task { () }
-                let admit _ = task { return Admitted 1L }
-
-                let whitelist =
-                    Phos.Core.Whitelist.create (Map.ofList [ (UserId 1L, User) ]) Set.empty
-
-                let handler =
-                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, noopVoice, FakeTransport())
-
-                let noUsername =
-                    { Id = UserId 1L
-                      Username = None
-                      Role = User }
-
-                let update = mkUpdate 910L testChat noUsername (Some "/start") None
-                let! result = handler.HandleAsync update
-                result |> should equal Accepted
-
-                let! user = users.GetByTelegramId(UserId 1L)
-                user |> Option.isSome |> should be True
-                user.Value.Username |> should equal None
-            finally
-                dispose exec
-        }
-    finally
-        deleteDir dir
-
-[<Fact>]
-let ``ping with a voice still replies pong`` () =
-    let dir = makeTempDir ()
-    let dbPath = Path.Combine(dir, "phos.db")
-
-    try
-        task {
-            let exec = createExecutor dbPath
-
-            try
-                let inbox, _, users = mkRepos exec
+                let inbox, _ = mkRepos exec
                 let dedupe = UpdateDedupe(1000)
                 let admitCalls = ResizeArray<CommandEnvelope>()
                 let enqueue (env: OutboxEnvelope) = task { () }
@@ -2439,7 +2381,53 @@ let ``ping with a voice still replies pong`` () =
                     Phos.Core.Whitelist.create (Map.ofList [ (UserId 1L, User) ]) Set.empty
 
                 let handler =
-                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, noopVoice, FakeTransport())
+                    UpdateHandler(whitelist, inbox, dedupe, admit, enqueue, noopVoice, FakeTransport())
+
+                let noUsername =
+                    { Id = UserId 1L
+                      Username = None
+                      Role = User }
+
+                let update = mkUpdate 910L testChat noUsername (Some "/start") None
+                let! result = handler.HandleAsync update
+                result |> should equal Accepted
+                admitCalls.Count |> should equal 1
+                admitCalls.[0].Payload |> should equal "/start"
+            finally
+                dispose exec
+        }
+    finally
+        deleteDir dir
+
+[<Fact>]
+let ``ping text with a voice processes the voice and admits`` () =
+    let dir = makeTempDir ()
+    let dbPath = Path.Combine(dir, "phos.db")
+
+    try
+        task {
+            let exec = createExecutor dbPath
+
+            try
+                let inbox, _ = mkRepos exec
+                let dedupe = UpdateDedupe(1000)
+                let admitCalls = ResizeArray<CommandEnvelope>()
+                let enqueue (env: OutboxEnvelope) = task { () }
+
+                let admit (env: CommandEnvelope) =
+                    task {
+                        admitCalls.Add env
+                        return Admitted 1L
+                    }
+
+                let whitelist =
+                    Phos.Core.Whitelist.create (Map.ofList [ (UserId 1L, User) ]) Set.empty
+
+                let voiceProc = FakeVoiceProcessor()
+                voiceProc.Result <- Ok "распознанный текст"
+
+                let handler =
+                    UpdateHandler(whitelist, inbox, dedupe, admit, enqueue, voiceProc, FakeTransport())
 
                 let voiceRef =
                     { ChatId = testChat.Id
@@ -2450,7 +2438,46 @@ let ``ping with a voice still replies pong`` () =
                 let update = mkUpdate 911L testChat testUser (Some "/ping") (Some voiceRef)
                 let! result = handler.HandleAsync update
                 result |> should equal Accepted
-                admitCalls.Count |> should equal 0
+                admitCalls.Count |> should equal 1
+                admitCalls.[0].Payload |> should equal "распознанный текст"
+            finally
+                dispose exec
+        }
+    finally
+        deleteDir dir
+
+[<Fact>]
+let ``stop text is admitted as command`` () =
+    let dir = makeTempDir ()
+    let dbPath = Path.Combine(dir, "phos.db")
+
+    try
+        task {
+            let exec = createExecutor dbPath
+
+            try
+                let inbox, _ = mkRepos exec
+                let dedupe = UpdateDedupe(1000)
+                let admitCalls = ResizeArray<CommandEnvelope>()
+                let enqueue (env: OutboxEnvelope) = task { () }
+
+                let admit (env: CommandEnvelope) =
+                    task {
+                        admitCalls.Add env
+                        return Admitted 1L
+                    }
+
+                let whitelist =
+                    Phos.Core.Whitelist.create (Map.ofList [ (UserId 1L, User) ]) Set.empty
+
+                let handler =
+                    UpdateHandler(whitelist, inbox, dedupe, admit, enqueue, noopVoice, FakeTransport())
+
+                let update = mkUpdate 940L testChat testUser (Some "/stop") None
+                let! result = handler.HandleAsync update
+                result |> should equal Accepted
+                admitCalls.Count |> should equal 1
+                admitCalls.[0].Payload |> should equal "/stop"
             finally
                 dispose exec
         }
@@ -2467,7 +2494,7 @@ let ``admit failure returns AdmitFailed and enqueues nothing`` () =
             let exec = createExecutor dbPath
 
             try
-                let inbox, _, users = mkRepos exec
+                let inbox, _ = mkRepos exec
                 let dedupe = UpdateDedupe(1000)
                 let admitCalls = ResizeArray<CommandEnvelope>()
                 let outboxCalls = ResizeArray<OutboxEnvelope>()
@@ -2484,7 +2511,7 @@ let ``admit failure returns AdmitFailed and enqueues nothing`` () =
                     Phos.Core.Whitelist.create (Map.ofList [ (UserId 1L, User) ]) Set.empty
 
                 let handler =
-                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, noopVoice, FakeTransport())
+                    UpdateHandler(whitelist, inbox, dedupe, admit, enqueue, noopVoice, FakeTransport())
 
                 let update = mkUpdate 920L testChat testUser (Some "hello") None
                 let! result = handler.HandleAsync update
@@ -2507,7 +2534,7 @@ let ``update without text or voice is admitted with an empty payload`` () =
             let exec = createExecutor dbPath
 
             try
-                let inbox, _, users = mkRepos exec
+                let inbox, _ = mkRepos exec
                 let dedupe = UpdateDedupe(1000)
                 let admitCalls = ResizeArray<CommandEnvelope>()
                 let enqueue (env: OutboxEnvelope) = task { () }
@@ -2522,7 +2549,7 @@ let ``update without text or voice is admitted with an empty payload`` () =
                     Phos.Core.Whitelist.create (Map.ofList [ (UserId 1L, User) ]) Set.empty
 
                 let handler =
-                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, noopVoice, FakeTransport())
+                    UpdateHandler(whitelist, inbox, dedupe, admit, enqueue, noopVoice, FakeTransport())
 
                 let update = mkUpdate 921L testChat testUser None None
                 let! result = handler.HandleAsync update
@@ -2545,7 +2572,7 @@ let ``handler prefixes reply context to text command`` () =
             let exec = createExecutor dbPath
 
             try
-                let inbox, _, users = mkRepos exec
+                let inbox, _ = mkRepos exec
                 let dedupe = UpdateDedupe(1000)
                 let admitCalls = ResizeArray<CommandEnvelope>()
                 let enqueue (env: OutboxEnvelope) = task { () }
@@ -2562,7 +2589,7 @@ let ``handler prefixes reply context to text command`` () =
                 let transport = FakeTransport(summaryResult = Some(MessageSummary.Text "старое"))
 
                 let handler =
-                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, noopVoice, transport)
+                    UpdateHandler(whitelist, inbox, dedupe, admit, enqueue, noopVoice, transport)
 
                 let update =
                     mkUpdateWith 930L testChat testUser (Some "привет") None None false (Some 5L)
@@ -2587,7 +2614,7 @@ let ``handler prefixes voice reply marker`` () =
             let exec = createExecutor dbPath
 
             try
-                let inbox, _, users = mkRepos exec
+                let inbox, _ = mkRepos exec
                 let dedupe = UpdateDedupe(1000)
                 let admitCalls = ResizeArray<CommandEnvelope>()
                 let enqueue (env: OutboxEnvelope) = task { () }
@@ -2607,7 +2634,7 @@ let ``handler prefixes voice reply marker`` () =
                 let transport = FakeTransport(summaryResult = Some MessageSummary.Voice)
 
                 let handler =
-                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, voiceProc, transport)
+                    UpdateHandler(whitelist, inbox, dedupe, admit, enqueue, voiceProc, transport)
 
                 let voiceRef =
                     { ChatId = testChat.Id
@@ -2640,7 +2667,7 @@ let ``handler prefixes photo reply marker`` () =
             let exec = createExecutor dbPath
 
             try
-                let inbox, _, users = mkRepos exec
+                let inbox, _ = mkRepos exec
                 let dedupe = UpdateDedupe(1000)
                 let admitCalls = ResizeArray<CommandEnvelope>()
                 let enqueue (env: OutboxEnvelope) = task { () }
@@ -2658,7 +2685,7 @@ let ``handler prefixes photo reply marker`` () =
                     FakeTransport(photoBytes = [| 1uy |], summaryResult = Some MessageSummary.Photo)
 
                 let handler =
-                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, noopVoice, transport)
+                    UpdateHandler(whitelist, inbox, dedupe, admit, enqueue, noopVoice, transport)
 
                 let photoRef =
                     { ChatId = testChat.Id
@@ -2688,7 +2715,7 @@ let ``handler admits without prefix when no reply`` () =
             let exec = createExecutor dbPath
 
             try
-                let inbox, _, users = mkRepos exec
+                let inbox, _ = mkRepos exec
                 let dedupe = UpdateDedupe(1000)
                 let admitCalls = ResizeArray<CommandEnvelope>()
                 let enqueue (env: OutboxEnvelope) = task { () }
@@ -2703,7 +2730,7 @@ let ``handler admits without prefix when no reply`` () =
                     Phos.Core.Whitelist.create (Map.ofList [ (UserId 1L, User) ]) Set.empty
 
                 let handler =
-                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, noopVoice, FakeTransport())
+                    UpdateHandler(whitelist, inbox, dedupe, admit, enqueue, noopVoice, FakeTransport())
 
                 let update =
                     mkUpdateWith 933L testChat testUser (Some "привет") None None false None
@@ -2728,7 +2755,7 @@ let ``handler proceeds when replied message missing`` () =
             let exec = createExecutor dbPath
 
             try
-                let inbox, _, users = mkRepos exec
+                let inbox, _ = mkRepos exec
                 let dedupe = UpdateDedupe(1000)
                 let admitCalls = ResizeArray<CommandEnvelope>()
                 let enqueue (env: OutboxEnvelope) = task { () }
@@ -2745,7 +2772,7 @@ let ``handler proceeds when replied message missing`` () =
                 // The replied message does not exist (GetMessageSummary returns
                 // None), so the admit proceeds without a prefix.
                 let handler =
-                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, noopVoice, FakeTransport())
+                    UpdateHandler(whitelist, inbox, dedupe, admit, enqueue, noopVoice, FakeTransport())
 
                 let update =
                     mkUpdateWith 934L testChat testUser (Some "привет") None None false (Some 9L)
@@ -2770,7 +2797,7 @@ let ``handler attaches replied photo image to text reply`` () =
             let exec = createExecutor dbPath
 
             try
-                let inbox, _, users = mkRepos exec
+                let inbox, _ = mkRepos exec
                 let dedupe = UpdateDedupe(1000)
                 let admitCalls = ResizeArray<CommandEnvelope>()
                 let enqueue (env: OutboxEnvelope) = task { () }
@@ -2788,7 +2815,7 @@ let ``handler attaches replied photo image to text reply`` () =
                     FakeTransport(summaryResult = Some MessageSummary.Photo, messagePhotoResult = Some [| 1uy; 2uy |])
 
                 let handler =
-                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, noopVoice, transport)
+                    UpdateHandler(whitelist, inbox, dedupe, admit, enqueue, noopVoice, transport)
 
                 let update =
                     mkUpdateWith 935L testChat testUser (Some "привет") None None false (Some 5L)
@@ -2814,7 +2841,7 @@ let ``handler attaches replied photo image with caption`` () =
             let exec = createExecutor dbPath
 
             try
-                let inbox, _, users = mkRepos exec
+                let inbox, _ = mkRepos exec
                 let dedupe = UpdateDedupe(1000)
                 let admitCalls = ResizeArray<CommandEnvelope>()
                 let enqueue (env: OutboxEnvelope) = task { () }
@@ -2835,7 +2862,7 @@ let ``handler attaches replied photo image with caption`` () =
                     )
 
                 let handler =
-                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, noopVoice, transport)
+                    UpdateHandler(whitelist, inbox, dedupe, admit, enqueue, noopVoice, transport)
 
                 let update =
                     mkUpdateWith 936L testChat testUser (Some "привет") None None false (Some 5L)
@@ -2861,7 +2888,7 @@ let ``handler no image for text reply`` () =
             let exec = createExecutor dbPath
 
             try
-                let inbox, _, users = mkRepos exec
+                let inbox, _ = mkRepos exec
                 let dedupe = UpdateDedupe(1000)
                 let admitCalls = ResizeArray<CommandEnvelope>()
                 let enqueue (env: OutboxEnvelope) = task { () }
@@ -2879,7 +2906,7 @@ let ``handler no image for text reply`` () =
                     FakeTransport(summaryResult = Some(MessageSummary.Text "старое"), messagePhotoResult = None)
 
                 let handler =
-                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, noopVoice, transport)
+                    UpdateHandler(whitelist, inbox, dedupe, admit, enqueue, noopVoice, transport)
 
                 let update =
                     mkUpdateWith 937L testChat testUser (Some "привет") None None false (Some 5L)
@@ -2905,7 +2932,7 @@ let ``handler degrades when replied photo download fails`` () =
             let exec = createExecutor dbPath
 
             try
-                let inbox, _, users = mkRepos exec
+                let inbox, _ = mkRepos exec
                 let dedupe = UpdateDedupe(1000)
                 let admitCalls = ResizeArray<CommandEnvelope>()
                 let enqueue (env: OutboxEnvelope) = task { () }
@@ -2923,7 +2950,7 @@ let ``handler degrades when replied photo download fails`` () =
                 transport.FailMessagePhoto <- true
 
                 let handler =
-                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, noopVoice, transport)
+                    UpdateHandler(whitelist, inbox, dedupe, admit, enqueue, noopVoice, transport)
 
                 let update =
                     mkUpdateWith 938L testChat testUser (Some "привет") None None false (Some 5L)

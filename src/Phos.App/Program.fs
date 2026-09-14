@@ -64,10 +64,6 @@ let main (argv: string[]) : int =
                 MessageOutbox(sp.GetRequiredService<StorageExecutor>()) :> IMessageOutbox)
             |> ignore
 
-            builder.Services.AddSingleton<IUserRepository>(fun sp ->
-                UserRepository(sp.GetRequiredService<StorageExecutor>()) :> IUserRepository)
-            |> ignore
-
             builder.Services.AddSingleton<UpdateDedupe>(UpdateDedupe 1000) |> ignore
 
             builder.Services.AddSingleton<TelegramTransport>(fun _ ->
@@ -194,7 +190,6 @@ let main (argv: string[]) : int =
 
             builder.Services.AddSingleton<UpdateHandler>(fun sp ->
                 let inbox = sp.GetRequiredService<ICommandInbox>()
-                let users = sp.GetRequiredService<IUserRepository>()
                 let logger = sp.GetRequiredService<ILogger<UpdateHandler>>()
                 let dedupe = sp.GetRequiredService<UpdateDedupe>()
                 let wake = sp.GetRequiredService<WakeChannel>()
@@ -227,7 +222,6 @@ let main (argv: string[]) : int =
                 UpdateHandler(
                     whitelist,
                     inbox,
-                    users,
                     dedupe,
                     admit,
                     enqueueOutbox,

@@ -27,29 +27,23 @@ type OutboxEnvelope =
       Payload: string
       Entities: Phos.Core.Chunker.Entity list }
 
-/// Processes a single incoming update: dedupe, whitelist, then classify.
+/// Processes a single incoming update: dedupe, whitelist, then admit.
 ///
 /// Order matters: dedupe first (a duplicate is never re-admitted), then the
 /// whitelist is checked BEFORE any admission so a denied user never reaches the
-/// inbox. `/start` upserts the user and replies a greeting via the outbox,
-/// `/ping` replies `pong`, and any other text/voice update becomes a
-/// `CommandEnvelope` admitted through the injected `admit` function. The handler
-/// never waits on an LLM/OMP turn.
+/// inbox. Any text or voice update becomes a `CommandEnvelope` admitted through
+/// the injected `admit` function; `/stop` is handled downstream (OmpWorker) by
+/// payload prefix. The handler never waits on an LLM/OMP turn.
 type UpdateHandler
     (
         whitelist: Whitelist,
         inbox: ICommandInbox,
-        users: IUserRepository,
         dedupe: UpdateDedupe,
         admit: CommandEnvelope -> Task<AdmitOutcome>,
         enqueueOutbox: OutboxEnvelope -> Task<unit>,
         voice: IVoiceProcessor,
         transport: ITelegramTransport
     ) =
-
-    let greetingText = "Привет! Я phos, твой ассистент в Telegram."
-
-    let workspacePath (UserId id) = sprintf "/var/lib/phos/workspace/%d" id
 
     /// Chunks a reply and enqueues each chunk to the outbox with a fresh,
     /// stable random_id.
@@ -132,7 +126,7 @@ type UpdateHandler
             else
                 match authorize whitelist update.From update.Chat with
                 | Deny reason -> return Denied reason
-                | Allow role ->
+                | Allow _ ->
                     if update.IsSticker then
                         // A sticker is feedback-only: react with 👀 and never
                         // admit a command. The reaction is best-effort — a
@@ -181,52 +175,13 @@ type UpdateHandler
                             do! enqueueReply update.UpdateId update.Chat "⚠️ не удалось скачать фото"
                             return Accepted
                     else
-                        match update.Text with
-                        | Some text when text.StartsWith "/start" ->
-                            let record =
-                                { Id = update.From.Id
-                                  Username = update.From.Username
-                                  Role = role
-                                  WorkspacePath = workspacePath update.From.Id
-                                  Timezone = None }
+                        match update.Voice with
+                        | Some v ->
+                            let! result = voice.ProcessAsync v
 
-                            do! users.Upsert record
-                            do! enqueueReply update.UpdateId update.Chat greetingText
-                            return Accepted
-                        | Some text when text.StartsWith "/ping" ->
-                            do! enqueueReply update.UpdateId update.Chat "pong"
-                            return Accepted
-                        | _ ->
-                            match update.Voice with
-                            | Some v ->
-                                let! result = voice.ProcessAsync v
-
-                                match result with
-                                | Ok text ->
-                                    let! payload, replyImage = replyPayload update text
-
-                                    let envelope =
-                                        { Origin = Telegram
-                                          ExternalKey = Some(sprintf "tg:%d" update.UpdateId)
-                                          UserId = update.From.Id
-                                          ChatId = update.Chat.Id
-                                          Payload = payload
-                                          Priority = 0
-                                          Images =
-                                            match replyImage with
-                                            | Some b -> [ Convert.ToBase64String b ]
-                                            | None -> [] }
-
-                                    let! outcome = admit envelope
-
-                                    match outcome with
-                                    | Admitted _ -> return Accepted
-                                    | Failed -> return AdmitFailed
-                                | Error msg ->
-                                    do! enqueueReply update.UpdateId update.Chat ("⚠️ " + msg)
-                                    return Accepted
-                            | None ->
-                                let! payload, replyImage = replyPayload update (update.Text |> Option.defaultValue "")
+                            match result with
+                            | Ok text ->
+                                let! payload, replyImage = replyPayload update text
 
                                 let envelope =
                                     { Origin = Telegram
@@ -245,4 +200,27 @@ type UpdateHandler
                                 match outcome with
                                 | Admitted _ -> return Accepted
                                 | Failed -> return AdmitFailed
+                            | Error msg ->
+                                do! enqueueReply update.UpdateId update.Chat ("⚠️ " + msg)
+                                return Accepted
+                        | None ->
+                            let! payload, replyImage = replyPayload update (update.Text |> Option.defaultValue "")
+
+                            let envelope =
+                                { Origin = Telegram
+                                  ExternalKey = Some(sprintf "tg:%d" update.UpdateId)
+                                  UserId = update.From.Id
+                                  ChatId = update.Chat.Id
+                                  Payload = payload
+                                  Priority = 0
+                                  Images =
+                                    match replyImage with
+                                    | Some b -> [ Convert.ToBase64String b ]
+                                    | None -> [] }
+
+                            let! outcome = admit envelope
+
+                            match outcome with
+                            | Admitted _ -> return Accepted
+                            | Failed -> return AdmitFailed
         }
