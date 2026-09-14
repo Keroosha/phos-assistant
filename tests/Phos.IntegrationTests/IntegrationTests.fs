@@ -156,6 +156,8 @@ type FakeTransport(?voiceBytes: byte[], ?photoBytes: byte[]) =
 
         member _.GetMessageSummary _ _ = task { return None }
 
+        member _.DownloadMessagePhoto _ _ = task { return None }
+
         member _.GetHistory _ _ _ = task { return [] }
 
 type FakeVoiceProcessor(result: Result<string, string>) =

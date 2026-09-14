@@ -72,39 +72,57 @@ type UpdateHandler
                 index <- index + 1
         }
 
-    /// Resolves a short human-readable summary of the message this update replies
-    /// to, so the bot can see its own context in the prompt. Any transport
-    /// failure degrades to `None` (no prefix) rather than blocking the admit.
-    let replyContext (chat: ChatId) (replyToId: int64) : Task<string option> =
+    /// Resolves a short human-readable summary and, when the replied message
+    /// carries a photo, its bytes, so the bot can see its own context in the
+    /// prompt. Any transport failure degrades to `(None, None)` (no prefix, no
+    /// image) rather than blocking the admit.
+    let replyContext (chat: ChatId) (replyToId: int64) : Task<string option * byte[] option> =
         task {
             try
                 let! s = transport.GetMessageSummary chat replyToId
+                let! photo = transport.DownloadMessagePhoto chat replyToId
 
-                return
+                let text =
                     match s with
                     | Some(MessageSummary.Text t) -> Some t
                     | Some MessageSummary.Voice -> Some "🎤 голосовое сообщение"
                     | Some MessageSummary.Photo -> Some "📷 фото"
                     | Some MessageSummary.Other -> Some "сообщение"
                     | None -> None
+
+                // A photo without a caption yields no summary text; surface the
+                // "📷 фото" marker so the reply is still labelled.
+                let text =
+                    match text with
+                    | Some _ -> text
+                    | None ->
+                        match photo with
+                        | Some _ -> Some "📷 фото"
+                        | None -> None
+
+                return (text, photo)
             with _ ->
-                return None
+                return (None, None)
         }
 
     /// Builds the admit payload, prefixing the reply-context when the update is
     /// a reply to an earlier message. Existing payload behavior is unchanged when
-    /// there is no reply (or the replied message cannot be resolved).
-    let replyPayload (update: IncomingUpdate) (basePayload: string) : Task<string> =
+    /// there is no reply (or the replied message cannot be resolved). Also
+    /// returns the replied message's photo bytes, when any, to attach as an
+    /// image.
+    let replyPayload (update: IncomingUpdate) (basePayload: string) : Task<string * byte[] option> =
         task {
-            let! replyText =
+            let! replyText, replyImage =
                 match update.ReplyToMessageId with
                 | Some rid -> replyContext update.Chat.Id rid
-                | None -> task { return None }
+                | None -> task { return (None, None) }
 
-            return
+            let payload =
                 match replyText with
                 | Some ctx -> sprintf "[в ответ на: %s]\n\n%s" ctx basePayload
                 | None -> basePayload
+
+            return (payload, replyImage)
         }
 
     member _.HandleAsync(update: IncomingUpdate) : Task<HandleResult> =
@@ -139,7 +157,7 @@ type UpdateHandler
 
                         match bytesOpt with
                         | Some bytes ->
-                            let! payload = replyPayload update (update.Text |> Option.defaultValue "")
+                            let! payload, replyImage = replyPayload update (update.Text |> Option.defaultValue "")
 
                             let envelope =
                                 { Origin = Telegram
@@ -148,7 +166,11 @@ type UpdateHandler
                                   ChatId = update.Chat.Id
                                   Payload = payload
                                   Priority = 0
-                                  Images = [ Convert.ToBase64String bytes ] }
+                                  Images =
+                                    (match replyImage with
+                                     | Some b -> [ Convert.ToBase64String b ]
+                                     | None -> [])
+                                    @ [ Convert.ToBase64String bytes ] }
 
                             let! outcome = admit envelope
 
@@ -181,7 +203,7 @@ type UpdateHandler
 
                                 match result with
                                 | Ok text ->
-                                    let! payload = replyPayload update text
+                                    let! payload, replyImage = replyPayload update text
 
                                     let envelope =
                                         { Origin = Telegram
@@ -190,7 +212,10 @@ type UpdateHandler
                                           ChatId = update.Chat.Id
                                           Payload = payload
                                           Priority = 0
-                                          Images = [] }
+                                          Images =
+                                            match replyImage with
+                                            | Some b -> [ Convert.ToBase64String b ]
+                                            | None -> [] }
 
                                     let! outcome = admit envelope
 
@@ -201,7 +226,7 @@ type UpdateHandler
                                     do! enqueueReply update.UpdateId update.Chat ("⚠️ " + msg)
                                     return Accepted
                             | None ->
-                                let! payload = replyPayload update (update.Text |> Option.defaultValue "")
+                                let! payload, replyImage = replyPayload update (update.Text |> Option.defaultValue "")
 
                                 let envelope =
                                     { Origin = Telegram
@@ -210,7 +235,10 @@ type UpdateHandler
                                       ChatId = update.Chat.Id
                                       Payload = payload
                                       Priority = 0
-                                      Images = [] }
+                                      Images =
+                                        match replyImage with
+                                        | Some b -> [ Convert.ToBase64String b ]
+                                        | None -> [] }
 
                                 let! outcome = admit envelope
 

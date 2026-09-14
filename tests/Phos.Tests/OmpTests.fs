@@ -177,6 +177,8 @@ type FakeTransport
 
         member _.GetMessageSummary _ _ = task { return summary }
 
+        member _.DownloadMessagePhoto _ _ = task { return None }
+
         member _.GetHistory (chat: ChatId) (beforeId: int64) (limit: int) =
             task {
                 historyCalls.Add(chat, beforeId, limit)
@@ -2525,6 +2527,8 @@ let ``uri resolver returns error on download failure`` () =
 
                 member _.GetMessageSummary _ _ = task { return None }
 
+                member _.DownloadMessagePhoto _ _ = task { return None }
+
                 member _.GetHistory _ _ _ = task { return [] } }
 
         let resolver = HostUriResolver(transport, NullLogger<HostUriResolver>.Instance)
@@ -2778,6 +2782,8 @@ let ``executor maps flood wait to an error`` () =
 
                 member _.GetMessageSummary _ _ = task { return None }
 
+                member _.DownloadMessagePhoto _ _ = task { return None }
+
                 member _.GetHistory _ _ _ = task { return [] } }
 
         let executor =
@@ -2821,6 +2827,8 @@ let ``executor maps slowmode wait to an error`` () =
                 member _.SetTyping(_: ChatId) = Task.FromResult(())
 
                 member _.GetMessageSummary _ _ = task { return None }
+
+                member _.DownloadMessagePhoto _ _ = task { return None }
 
                 member _.GetHistory _ _ _ = task { return [] } }
 

@@ -88,7 +88,13 @@ let private mkUpdate
 
 /// Fake transport that records `SendTarget` calls and can be made to fail or
 /// flood-wait a fixed number of times before succeeding.
-type FakeTransport(?photoBytes: byte[], ?summaryResult: MessageSummary option, ?historyResult: HistoryEntry list) =
+type FakeTransport
+    (
+        ?photoBytes: byte[],
+        ?summaryResult: MessageSummary option,
+        ?historyResult: HistoryEntry list,
+        ?messagePhotoResult: byte[] option
+    ) =
     let sendCalls = ResizeArray<SendTarget>()
     let reactions = ResizeArray<int64 * string>()
     let mutable remoteId = 1L
@@ -98,6 +104,8 @@ type FakeTransport(?photoBytes: byte[], ?summaryResult: MessageSummary option, ?
     let mutable slowmodeCount = 0
     let mutable floodSeconds = 0
     let mutable photoDownloadFail = false
+    let mutable messagePhoto = defaultArg messagePhotoResult None
+    let mutable messagePhotoFail = false
     let mutable summary = defaultArg summaryResult None
     let mutable history = defaultArg historyResult []
 
@@ -122,6 +130,12 @@ type FakeTransport(?photoBytes: byte[], ?summaryResult: MessageSummary option, ?
 
     member _.FailPhotoDownload
         with set (v: bool) = photoDownloadFail <- v
+
+    member _.FailMessagePhoto
+        with set (v: bool) = messagePhotoFail <- v
+
+    member _.MessagePhoto
+        with set (v: byte[] option) = messagePhoto <- v
 
     member _.Summary
         with set (v: MessageSummary option) = summary <- v
@@ -167,6 +181,14 @@ type FakeTransport(?photoBytes: byte[], ?summaryResult: MessageSummary option, ?
         member _.SetTyping(_: ChatId) = Task.FromResult(())
 
         member _.GetMessageSummary _ _ = task { return summary }
+
+        member _.DownloadMessagePhoto _ _ =
+            task {
+                if messagePhotoFail then
+                    return failwith "message photo download exploded"
+                else
+                    return messagePhoto
+            }
 
         member _.GetHistory _ _ _ = task { return history }
 
@@ -2732,6 +2754,185 @@ let ``handler proceeds when replied message missing`` () =
                 result |> should equal Accepted
                 admitCalls.Count |> should equal 1
                 admitCalls.[0].Payload |> should equal "привет"
+            finally
+                dispose exec
+        }
+    finally
+        deleteDir dir
+
+[<Fact>]
+let ``handler attaches replied photo image to text reply`` () =
+    let dir = makeTempDir ()
+    let dbPath = Path.Combine(dir, "phos.db")
+
+    try
+        task {
+            let exec = createExecutor dbPath
+
+            try
+                let inbox, _, users = mkRepos exec
+                let dedupe = UpdateDedupe(1000)
+                let admitCalls = ResizeArray<CommandEnvelope>()
+                let enqueue (env: OutboxEnvelope) = task { () }
+
+                let admit (env: CommandEnvelope) =
+                    task {
+                        admitCalls.Add env
+                        return Admitted 1L
+                    }
+
+                let whitelist =
+                    Phos.Core.Whitelist.create (Map.ofList [ (UserId 1L, User) ]) Set.empty
+
+                let transport =
+                    FakeTransport(summaryResult = Some MessageSummary.Photo, messagePhotoResult = Some [| 1uy; 2uy |])
+
+                let handler =
+                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, noopVoice, transport)
+
+                let update =
+                    mkUpdateWith 935L testChat testUser (Some "привет") None None false (Some 5L)
+
+                let! result = handler.HandleAsync update
+                result |> should equal Accepted
+                admitCalls.Count |> should equal 1
+                admitCalls.[0].Payload |> should startWith "[в ответ на: 📷 фото]"
+                admitCalls.[0].Images |> should equal [ Convert.ToBase64String [| 1uy; 2uy |] ]
+            finally
+                dispose exec
+        }
+    finally
+        deleteDir dir
+
+[<Fact>]
+let ``handler attaches replied photo image with caption`` () =
+    let dir = makeTempDir ()
+    let dbPath = Path.Combine(dir, "phos.db")
+
+    try
+        task {
+            let exec = createExecutor dbPath
+
+            try
+                let inbox, _, users = mkRepos exec
+                let dedupe = UpdateDedupe(1000)
+                let admitCalls = ResizeArray<CommandEnvelope>()
+                let enqueue (env: OutboxEnvelope) = task { () }
+
+                let admit (env: CommandEnvelope) =
+                    task {
+                        admitCalls.Add env
+                        return Admitted 1L
+                    }
+
+                let whitelist =
+                    Phos.Core.Whitelist.create (Map.ofList [ (UserId 1L, User) ]) Set.empty
+
+                let transport =
+                    FakeTransport(
+                        summaryResult = Some(MessageSummary.Text "кот"),
+                        messagePhotoResult = Some [| 3uy; 4uy |]
+                    )
+
+                let handler =
+                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, noopVoice, transport)
+
+                let update =
+                    mkUpdateWith 936L testChat testUser (Some "привет") None None false (Some 5L)
+
+                let! result = handler.HandleAsync update
+                result |> should equal Accepted
+                admitCalls.Count |> should equal 1
+                admitCalls.[0].Payload |> should startWith "[в ответ на: кот]"
+                admitCalls.[0].Images |> should equal [ Convert.ToBase64String [| 3uy; 4uy |] ]
+            finally
+                dispose exec
+        }
+    finally
+        deleteDir dir
+
+[<Fact>]
+let ``handler no image for text reply`` () =
+    let dir = makeTempDir ()
+    let dbPath = Path.Combine(dir, "phos.db")
+
+    try
+        task {
+            let exec = createExecutor dbPath
+
+            try
+                let inbox, _, users = mkRepos exec
+                let dedupe = UpdateDedupe(1000)
+                let admitCalls = ResizeArray<CommandEnvelope>()
+                let enqueue (env: OutboxEnvelope) = task { () }
+
+                let admit (env: CommandEnvelope) =
+                    task {
+                        admitCalls.Add env
+                        return Admitted 1L
+                    }
+
+                let whitelist =
+                    Phos.Core.Whitelist.create (Map.ofList [ (UserId 1L, User) ]) Set.empty
+
+                let transport =
+                    FakeTransport(summaryResult = Some(MessageSummary.Text "старое"), messagePhotoResult = None)
+
+                let handler =
+                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, noopVoice, transport)
+
+                let update =
+                    mkUpdateWith 937L testChat testUser (Some "привет") None None false (Some 5L)
+
+                let! result = handler.HandleAsync update
+                result |> should equal Accepted
+                admitCalls.Count |> should equal 1
+                admitCalls.[0].Payload |> should startWith "[в ответ на: старое]"
+                admitCalls.[0].Images |> should be Empty
+            finally
+                dispose exec
+        }
+    finally
+        deleteDir dir
+
+[<Fact>]
+let ``handler degrades when replied photo download fails`` () =
+    let dir = makeTempDir ()
+    let dbPath = Path.Combine(dir, "phos.db")
+
+    try
+        task {
+            let exec = createExecutor dbPath
+
+            try
+                let inbox, _, users = mkRepos exec
+                let dedupe = UpdateDedupe(1000)
+                let admitCalls = ResizeArray<CommandEnvelope>()
+                let enqueue (env: OutboxEnvelope) = task { () }
+
+                let admit (env: CommandEnvelope) =
+                    task {
+                        admitCalls.Add env
+                        return Admitted 1L
+                    }
+
+                let whitelist =
+                    Phos.Core.Whitelist.create (Map.ofList [ (UserId 1L, User) ]) Set.empty
+
+                let transport = FakeTransport(summaryResult = Some MessageSummary.Photo)
+                transport.FailMessagePhoto <- true
+
+                let handler =
+                    UpdateHandler(whitelist, inbox, users, dedupe, admit, enqueue, noopVoice, transport)
+
+                let update =
+                    mkUpdateWith 938L testChat testUser (Some "привет") None None false (Some 5L)
+
+                let! result = handler.HandleAsync update
+                result |> should equal Accepted
+                admitCalls.Count |> should equal 1
+                admitCalls.[0].Payload |> should equal "привет"
+                admitCalls.[0].Images |> should be Empty
             finally
                 dispose exec
         }

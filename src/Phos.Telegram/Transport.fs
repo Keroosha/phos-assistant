@@ -325,4 +325,7 @@ type ITelegramTransport =
     abstract SetReaction: ChatId -> int64 -> string -> Task<unit>
     abstract SetTyping: ChatId -> Task<unit>
     abstract GetMessageSummary: ChatId -> int64 -> Task<MessageSummary option>
+    /// Downloads the photo bytes of one message by id; None when the message is
+    /// missing or carries no photo media. Used for reply-to-photo context.
+    abstract DownloadMessagePhoto: ChatId -> int64 -> Task<byte[] option>
     abstract GetHistory: ChatId -> beforeId: int64 -> limit: int -> Task<HistoryEntry list>
