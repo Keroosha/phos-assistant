@@ -27,6 +27,7 @@ let private mkJob (id: int64) : ScheduleJob =
       Prompt = "prompt"
       CronExpr = None
       IntervalSeconds = Some 60
+      AfterSeconds = None
       Timezone = "UTC"
       Catchup = SkipMissed
       Status = ScheduleStatus.Active

@@ -54,12 +54,13 @@ module HostTools =
           { Name = "schedule_add"
             Label = "Add schedule job"
             Description =
-              "Create a scheduled prompt for the user. Provide exactly one of cron_expr or interval_seconds."
+              "Create a scheduled prompt for the user. Provide exactly one of cron_expr, interval_seconds or after_seconds (a one-shot job that fires once and completes itself)."
             Parameters =
               jsonSchema
                   [ "prompt", "string", true
                     "cron_expr", "string", false
                     "interval_seconds", "integer", false
+                    "after_seconds", "integer", false
                     "timezone", "string", false
                     "catch_up", "string", false
                     "chat_id", "integer", false ] }
@@ -189,6 +190,7 @@ type HostToolExecutor
                 | Some prompt ->
                     let cron = Json.getString "cron_expr" args
                     let interval = Json.getInt "interval_seconds" args
+                    let after = Json.getInt64 "after_seconds" args |> Option.map int
                     let timezone = Json.getString "timezone" args |> Option.defaultValue "UTC"
 
                     let catchup =
@@ -216,6 +218,7 @@ type HostToolExecutor
                                   Prompt = prompt
                                   CronExpr = cron
                                   IntervalSeconds = interval
+                                  AfterSeconds = after
                                   Timezone = timezone
                                   Catchup = catchup }
 
@@ -224,21 +227,36 @@ type HostToolExecutor
                             | Ok _ ->
                                 let! job = jobs.Insert draft (Some toolCallId)
 
-                                let next5 =
-                                    ScheduleJobs.nextOccurrences
-                                        job.CronExpr
-                                        job.IntervalSeconds
-                                        job.Timezone
-                                        DateTimeOffset.UtcNow
-                                        5
+                                match after with
+                                | Some _ ->
+                                    let timeText =
+                                        ScheduleJobs.nextRunAfter draft DateTimeOffset.UtcNow
+                                        |> Option.map (fun occ -> ScheduleJobs.formatOccurrences draft.Timezone [ occ ])
+                                        |> Option.defaultValue ""
 
-                                let text =
-                                    sprintf
-                                        "Задание #%d создано (ожидает подтверждения). Ближайшие:\n%s\nСпроси у пользователя подтверждение."
-                                        job.Id
-                                        (ScheduleJobs.formatOccurrences job.Timezone next5)
+                                    let text =
+                                        sprintf
+                                            "Задание #%d создано (сработает один раз, ожидает подтверждения).\nСработает примерно в %s\nСпроси у пользователя подтверждение."
+                                            job.Id
+                                            timeText
 
-                                return Ok text
+                                    return Ok text
+                                | None ->
+                                    let next5 =
+                                        ScheduleJobs.nextOccurrences
+                                            job.CronExpr
+                                            job.IntervalSeconds
+                                            job.Timezone
+                                            DateTimeOffset.UtcNow
+                                            5
+
+                                    let text =
+                                        sprintf
+                                            "Задание #%d создано (ожидает подтверждения). Ближайшие:\n%s\nСпроси у пользователя подтверждение."
+                                            job.Id
+                                            (ScheduleJobs.formatOccurrences job.Timezone next5)
+
+                                    return Ok text
         }
 
     let scheduleConfirm (origin: Origin option) (args: JsonObject) : Task<Result<string, string>> =
@@ -280,7 +298,12 @@ type HostToolExecutor
                         |> Option.map (fun dto -> dto.UtcDateTime.ToString("yyyy-MM-dd HH:mm"))
                         |> Option.defaultValue ""
 
-                    sprintf "#%d [%s] %s next: %s" job.Id (ScheduleJobs.statusToString job.Status) prompt next)
+                    let statusText =
+                        let s = ScheduleJobs.statusToString job.Status
+
+                        if job.AfterSeconds.IsSome then s + " (разово)" else s
+
+                    sprintf "#%d [%s] %s next: %s" job.Id statusText prompt next)
 
             return Ok(String.concat "\n" lines)
         }

@@ -1264,6 +1264,7 @@ let private mkDraft (cron: string option) (interval: int option) (catchup: Catch
       Prompt = "remind me"
       CronExpr = cron
       IntervalSeconds = interval
+      AfterSeconds = None
       Timezone = "UTC"
       Catchup = catchup }
 
@@ -1332,6 +1333,20 @@ let ``migration 9 extends schedule jobs and drops enabled`` () =
                 cols |> List.contains "last_error" |> should be True
                 cols |> List.contains "enabled" |> should be False
                 indexExists exec "ux_schedule_jobs_origin_tool_call_id" |> should be True
+            })
+    finally
+        deleteDir dir
+
+[<Fact>]
+let ``migration 10 adds after_seconds column`` () =
+    let dir = makeTempDir ()
+    let dbPath = Path.Combine(dir, "phos.db")
+
+    try
+        withExecutor dbPath (fun exec ->
+            task {
+                let cols = tableColumns exec "schedule_jobs"
+                cols |> List.contains "after_seconds" |> should be True
             })
     finally
         deleteDir dir
@@ -1563,7 +1578,7 @@ let ``claim due occurrence enqueues exactly one command`` () =
                 let (origin, priority, payload, extKey) = cmd.Value
                 origin |> should equal "schedule"
                 priority |> should equal 10
-                payload |> should equal "remind me"
+                payload |> should startWith "[по расписанию]"
                 extKey |> should equal (sprintf "sched:%d:%d" job.Id nextRun.UtcTicks)
 
                 let run = queryRun exec job.Id nextRun
@@ -1680,6 +1695,82 @@ let ``claim due cron job enqueues command`` () =
                 let! after = repo.GetById job.Id
                 after.Value.NextRun |> should not' (be None)
                 after.Value.NextRun.Value |> should be (greaterThan nextRun)
+            })
+    finally
+        deleteDir dir
+
+[<Fact>]
+let ``one-shot job fires once and completes`` () =
+    let dir = makeTempDir ()
+    let dbPath = Path.Combine(dir, "phos.db")
+
+    try
+        withExecutor dbPath (fun exec ->
+            task {
+                let repo = Repositories.scheduleJobRepository exec
+
+                let draft =
+                    { mkDraft None None SkipMissed with
+                        AfterSeconds = Some 300 }
+
+                let! job = repo.Insert draft None
+                do! repo.Confirm job.Id
+                let! confirmed = repo.GetById job.Id
+                let nextRun = confirmed.Value.NextRun.Value
+                nextRun |> should be (greaterThan (DateTimeOffset.UtcNow.AddSeconds 299.0))
+
+                let! claim = repo.ClaimDueOccurrence nextRun
+                claim |> should not' (be None)
+                claim.Value.ScheduledFor |> should equal nextRun
+
+                let cmd = queryCommand exec claim.Value.CommandId
+                cmd |> should not' (be None)
+                let (_, _, payload, _) = cmd.Value
+                payload |> should startWith "[по расписанию]"
+
+                let! after = repo.GetById job.Id
+                after.Value.Status |> should equal ScheduleStatus.Completed
+
+                let! claim2 = repo.ClaimDueOccurrence(nextRun.AddSeconds 1.0)
+                claim2 |> should equal None
+                commandCount exec |> should equal 1
+            })
+    finally
+        deleteDir dir
+
+[<Fact>]
+let ``one-shot fires late after restart semantics`` () =
+    let dir = makeTempDir ()
+    let dbPath = Path.Combine(dir, "phos.db")
+
+    try
+        withExecutor dbPath (fun exec ->
+            task {
+                let repo = Repositories.scheduleJobRepository exec
+
+                let draft =
+                    { mkDraft None None SkipMissed with
+                        AfterSeconds = Some 300 }
+
+                let! job = repo.Insert draft None
+                do! repo.Confirm job.Id
+                let! confirmed = repo.GetById job.Id
+                let nextRun = confirmed.Value.NextRun.Value
+
+                // Claim late (simulating a restart after the due moment): a one-shot
+                // fires even when it is past its scheduled time.
+                let lateNow = nextRun.AddSeconds 301.0
+                let! claim = repo.ClaimDueOccurrence lateNow
+                claim |> should not' (be None)
+                claim.Value.ScheduledFor |> should equal nextRun
+                commandCount exec |> should equal 1
+
+                let! after = repo.GetById job.Id
+                after.Value.Status |> should equal ScheduleStatus.Completed
+
+                let! claim2 = repo.ClaimDueOccurrence(lateNow.AddSeconds 1.0)
+                claim2 |> should equal None
+                commandCount exec |> should equal 1
             })
     finally
         deleteDir dir

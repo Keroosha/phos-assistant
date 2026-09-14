@@ -227,6 +227,7 @@ type FakeScheduleRepo() =
                       Prompt = draft.Prompt
                       CronExpr = draft.CronExpr
                       IntervalSeconds = draft.IntervalSeconds
+                      AfterSeconds = draft.AfterSeconds
                       Timezone = draft.Timezone
                       Catchup = draft.Catchup
                       Status = ScheduleStatus.Pending
@@ -1084,7 +1085,8 @@ let ``scheduler prompt-driven loop end to end`` () =
             cmd |> should not' (be None)
             cmd.Value.Envelope.Origin |> should equal Schedule
             cmd.Value.Envelope.Priority |> should equal 10
-            cmd.Value.Envelope.Payload |> should equal "напоминай каждый час"
+            cmd.Value.Envelope.Payload |> should startWith "[по расписанию]"
+            cmd.Value.Envelope.Payload.Contains "напоминай каждый час" |> should be True
 
             // (f) Restart survival: a fresh executor/repo on the same DB does not
             // re-claim the already-advanced occurrence, and no duplicate command
@@ -1141,6 +1143,171 @@ let ``scheduler prompt-driven loop end to end`` () =
 
             let! afterRemove = scheduler2.RunOnce(DateTimeOffset.UtcNow.AddSeconds 1.0)
             afterRemove |> should equal 0
+        finally
+            match execRef with
+            | Some e -> e.Dispose()
+            | None -> ()
+
+            deleteDir dir
+    }
+
+[<Fact>]
+let ``scheduler one-shot fires once end to end`` () =
+    task {
+        let dir = tempDir ()
+        let mutable execRef: StorageExecutor option = None
+
+        try
+            let dbPath = Path.Combine(dir, "phos.db")
+
+            let storageOpts =
+                { DatabasePath = dbPath
+                  BusyTimeout = TimeSpan.FromSeconds 2.0
+                  ReadPoolSize = 4
+                  CheckpointEvery = 10 }
+
+            let exec = StorageExecutor.Create storageOpts
+            execRef <- Some exec
+            Schema.run storageOpts
+
+            let jobs = Repositories.scheduleJobRepository exec
+            let inbox = Repositories.commandInbox exec
+
+            let quota =
+                { MaxJobsPerUser = 20
+                  MinIntervalSeconds = 60
+                  MaxPromptLength = 2000 }
+
+            let hostTools =
+                HostToolExecutor(
+                    FakeTransport(),
+                    FakeVoiceProcessor(Ok "hi"),
+                    jobs,
+                    quota,
+                    NullLogger<HostToolExecutor>.Instance
+                )
+
+            let mutable wakes = 0
+
+            let scheduler =
+                new SchedulerService(
+                    jobs,
+                    (fun () -> wakes <- wakes + 1),
+                    { TickSeconds = 15
+                      PendingTtlHours = 24
+                      MaxFailedTicks = 3 },
+                    NullLogger<SchedulerService>.Instance
+                )
+
+            // (a) schedule_add with after_seconds creates a PENDING one-shot job.
+            let addArgs = JsonObject()
+            addArgs["prompt"] <- "напиши мне"
+            addArgs["after_seconds"] <- 300
+            addArgs["timezone"] <- "UTC"
+
+            let! addResult =
+                hostTools.TryExecute(
+                    UserId 1L,
+                    Some(ChatId 7L),
+                    Some Telegram,
+                    mkToolCall "r1" "t1" "schedule_add" addArgs
+                )
+
+            match addResult with
+            | Some r ->
+                Json.getBool "isError" r |> should equal None
+                (resultText r).Contains "сработает один раз" |> should be True
+                (resultText r).Contains "ожидает подтверждения" |> should be True
+            | None -> failwith "schedule_add (one-shot): expected a host_tool_result"
+
+            let! job = jobs.FindByToolCallId "t1"
+            job |> should not' (be None)
+            job.Value.AfterSeconds |> should equal (Some 300)
+            let jobId = job.Value.Id
+
+            // (b) schedule_confirm activates the job.
+            let confirmArgs = JsonObject()
+            confirmArgs["job_id"] <- jobId
+
+            let! confirmResult =
+                hostTools.TryExecute(
+                    UserId 1L,
+                    Some(ChatId 7L),
+                    Some Telegram,
+                    mkToolCall "r2" "t2" "schedule_confirm" confirmArgs
+                )
+
+            match confirmResult with
+            | Some r -> Json.getBool "isError" r |> should equal None
+            | None -> failwith "schedule_confirm (one-shot): expected a host_tool_result"
+
+            // (c) schedule_run_now makes the active one-shot due on the next tick.
+            let runNowArgs = JsonObject()
+            runNowArgs["job_id"] <- jobId
+
+            let! runNowResult =
+                hostTools.TryExecute(
+                    UserId 1L,
+                    Some(ChatId 7L),
+                    Some Telegram,
+                    mkToolCall "r3" "t3" "schedule_run_now" runNowArgs
+                )
+
+            match runNowResult with
+            | Some r -> Json.getBool "isError" r |> should equal None
+            | None -> failwith "schedule_run_now (one-shot): expected a host_tool_result"
+
+            // (d) One tick claims the due occurrence, wakes the worker and completes.
+            let! claimed = scheduler.RunOnce(DateTimeOffset.UtcNow.AddSeconds 1.0)
+            claimed |> should be (greaterThanOrEqualTo 1)
+            wakes |> should be (greaterThanOrEqualTo 1)
+
+            // (e) The one-shot prompt is now a durable inbox command for the chat.
+            let lease =
+                { Until = DateTimeOffset.UtcNow.AddMinutes 5.0
+                  HeartbeatAt = DateTimeOffset.UtcNow }
+
+            let! cmd = inbox.ClaimNextForChat (ChatId 7L) lease
+            cmd |> should not' (be None)
+            cmd.Value.Envelope.Origin |> should equal Schedule
+            cmd.Value.Envelope.Priority |> should equal 10
+            cmd.Value.Envelope.Payload |> should startWith "[по расписанию]"
+            cmd.Value.Envelope.Payload.Contains "напиши мне" |> should be True
+
+            // (f) The one-shot job is auto-completed and does not fire again.
+            let! completed = jobs.GetById jobId
+            completed |> should not' (be None)
+            completed.Value.Status |> should equal ScheduleStatus.Completed
+
+            let! again = scheduler.RunOnce(DateTimeOffset.UtcNow.AddSeconds 1.0)
+            again |> should equal 0
+
+            // (g) Restart survival: a fresh executor/repo on the same DB does not
+            // re-fire the completed one-shot, and no second command is enqueued.
+            exec.Dispose()
+            execRef <- None
+
+            let exec2 = StorageExecutor.Create storageOpts
+            execRef <- Some exec2
+
+            let jobs2 = Repositories.scheduleJobRepository exec2
+            let inbox2 = Repositories.commandInbox exec2
+
+            let scheduler2 =
+                new SchedulerService(
+                    jobs2,
+                    (fun () -> wakes <- wakes + 1),
+                    { TickSeconds = 15
+                      PendingTtlHours = 24
+                      MaxFailedTicks = 3 },
+                    NullLogger<SchedulerService>.Instance
+                )
+
+            let! afterRestart = scheduler2.RunOnce(DateTimeOffset.UtcNow.AddSeconds 1.0)
+            afterRestart |> should equal 0
+
+            let! cmd2 = inbox2.ClaimNextForChat (ChatId 7L) lease
+            cmd2 |> should equal None
         finally
             match execRef with
             | Some e -> e.Dispose()

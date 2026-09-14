@@ -782,6 +782,7 @@ let private validCronDraft: Sj.ScheduleJobDraft =
       Prompt = "напомни мне"
       CronExpr = Some "0 9 * * *"
       IntervalSeconds = None
+      AfterSeconds = None
       Timezone = "Europe/Berlin"
       Catchup = SkipMissed }
 
@@ -791,6 +792,7 @@ let private validIntervalDraft: Sj.ScheduleJobDraft =
       Prompt = "проверь деплой"
       CronExpr = None
       IntervalSeconds = Some 300
+      AfterSeconds = None
       Timezone = "UTC"
       Catchup = CatchUpOnce }
 
@@ -879,6 +881,98 @@ let ``validate errors name the offending field`` () =
     with
     | Error e -> e.Contains "timezone" |> should be True
     | Ok _ -> failwith "expected an error for unknown timezone"
+
+[<Fact>]
+let ``validate rejects two of three schedule kinds`` () =
+    // cron + interval
+    Sj.validate
+        testQuota
+        { validCronDraft with
+            IntervalSeconds = Some 300 }
+    |> Result.isError
+    |> should be True
+
+    // cron + after_seconds
+    Sj.validate
+        testQuota
+        { validCronDraft with
+            AfterSeconds = Some 60 }
+    |> Result.isError
+    |> should be True
+
+    // interval + after_seconds
+    Sj.validate
+        testQuota
+        { validIntervalDraft with
+            AfterSeconds = Some 60 }
+    |> Result.isError
+    |> should be True
+
+[<Fact>]
+let ``validate rejects none of three`` () =
+    let draft =
+        { validCronDraft with
+            CronExpr = None
+            IntervalSeconds = None
+            AfterSeconds = None }
+
+    Sj.validate testQuota draft |> Result.isError |> should be True
+
+[<Fact>]
+let ``validate accepts after_seconds`` () =
+    let draft =
+        { validCronDraft with
+            CronExpr = None
+            IntervalSeconds = None
+            AfterSeconds = Some 300 }
+
+    match Sj.validate testQuota draft with
+    | Ok d -> d |> should equal draft
+    | Error e -> failwith (sprintf "expected Ok, got %A" e)
+
+[<Fact>]
+let ``validate rejects after_seconds below 1`` () =
+    let draft =
+        { validCronDraft with
+            CronExpr = None
+            IntervalSeconds = None
+            AfterSeconds = Some 0 }
+
+    Sj.validate testQuota draft |> Result.isError |> should be True
+
+[<Fact>]
+let ``nextRunAfter cron interval and after`` () =
+    let now = DateTimeOffset(2026, 3, 28, 0, 0, 0, TimeSpan.Zero)
+
+    // cron: next occurrence strictly after now
+    let cronNext = Sj.nextRunAfter validCronDraft now
+    cronNext |> should not' (be None)
+    cronNext.Value |> should be (greaterThan now)
+
+    // interval: now + interval seconds
+    let intervalDraft =
+        { validIntervalDraft with
+            IntervalSeconds = Some 60 }
+
+    Sj.nextRunAfter intervalDraft now |> should equal (Some(now.AddSeconds 60.0))
+
+    // after_seconds: now + after seconds
+    let afterDraft =
+        { validCronDraft with
+            CronExpr = None
+            IntervalSeconds = None
+            AfterSeconds = Some 300 }
+
+    Sj.nextRunAfter afterDraft now |> should equal (Some(now.AddSeconds 300.0))
+
+    // no schedule kind: None
+    let noneDraft =
+        { validCronDraft with
+            CronExpr = None
+            IntervalSeconds = None
+            AfterSeconds = None }
+
+    Sj.nextRunAfter noneDraft now |> should equal None
 
 [<Fact>]
 let ``nextOccurrences cron returns strictly after in timezone`` () =
@@ -1005,8 +1099,18 @@ let ``statusOfString round-trips`` () =
     Sj.statusOfString "paused" |> should equal (Some Sj.ScheduleStatus.Paused)
     Sj.statusOfString "cancelled" |> should equal (Some Sj.ScheduleStatus.Cancelled)
     Sj.statusOfString "expired" |> should equal (Some Sj.ScheduleStatus.Expired)
+    Sj.statusOfString "completed" |> should equal (Some Sj.ScheduleStatus.Completed)
     Sj.statusOfString "PENDING" |> should equal (Some Sj.ScheduleStatus.Pending)
     Sj.statusOfString "unknown" |> should equal None
+
+[<Fact>]
+let ``statusOfString completed`` () =
+    Sj.statusOfString "completed" |> should equal (Some Sj.ScheduleStatus.Completed)
+    Sj.statusOfString "COMPLETED" |> should equal (Some Sj.ScheduleStatus.Completed)
+
+[<Fact>]
+let ``statusToString completed`` () =
+    Sj.statusToString Sj.ScheduleStatus.Completed |> should equal "completed"
 
 [<Fact>]
 let ``statusToString matches statusOfString`` () =
@@ -1014,7 +1118,8 @@ let ``statusToString matches statusOfString`` () =
       Sj.ScheduleStatus.Active
       Sj.ScheduleStatus.Paused
       Sj.ScheduleStatus.Cancelled
-      Sj.ScheduleStatus.Expired ]
+      Sj.ScheduleStatus.Expired
+      Sj.ScheduleStatus.Completed ]
     |> List.forall (fun s -> Sj.statusOfString (Sj.statusToString s) = Some s)
     |> should be True
 

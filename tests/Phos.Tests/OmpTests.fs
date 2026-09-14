@@ -241,6 +241,7 @@ type FakeScheduleRepo() =
                       Prompt = draft.Prompt
                       CronExpr = draft.CronExpr
                       IntervalSeconds = draft.IntervalSeconds
+                      AfterSeconds = draft.AfterSeconds
                       Timezone = draft.Timezone
                       Catchup = draft.Catchup
                       Status = ScheduleStatus.Pending
@@ -3090,6 +3091,46 @@ let ``schedule_add creates pending job and shows next occurrences`` () =
     }
 
 [<Fact>]
+let ``schedule_add with after_seconds creates one-shot pending job`` () =
+    task {
+        let repo = FakeScheduleRepo()
+
+        let executor =
+            HostToolExecutor(
+                FakeTransport(),
+                FakeVoiceProcessor(Ok "hi"),
+                repo,
+                defaultQuota,
+                NullLogger<HostToolExecutor>.Instance
+            )
+
+        let frame = JsonObject()
+        frame["type"] <- "host_tool_call"
+        frame["id"] <- "host_oneshot"
+        frame["toolCallId"] <- "toolu_oneshot"
+        frame["toolName"] <- "schedule_add"
+        let args = JsonObject()
+        args["prompt"] <- "напиши"
+        args["after_seconds"] <- 300
+        args["timezone"] <- "UTC"
+        frame["arguments"] <- (args :> JsonNode)
+
+        let! result = executor.TryExecute(UserId 1L, Some(ChatId 1L), Some Telegram, frame)
+
+        match result with
+        | Some r ->
+            Json.getBool "isError" r |> should equal None
+            let text = hostToolResultText r
+            Assert.Contains("один раз", text)
+            Assert.Contains("Сработает примерно в", text)
+        | None -> failwith "expected a result frame for schedule_add one-shot"
+
+        repo.InsertCount |> should equal 1
+        repo.Jobs.Head.AfterSeconds |> should equal (Some 300)
+        repo.Jobs.Head.Status |> should equal ScheduleStatus.Pending
+    }
+
+[<Fact>]
 let ``schedule_add rejects over quota`` () =
     task {
         let repo = FakeScheduleRepo()
@@ -3136,6 +3177,7 @@ let ``schedule_confirm requires user origin`` () =
               Prompt = "remind"
               CronExpr = None
               IntervalSeconds = Some 3600
+              AfterSeconds = None
               Timezone = "UTC"
               Catchup = SkipMissed }
 
@@ -3200,6 +3242,7 @@ let ``schedule_list renders jobs`` () =
               Prompt = "pending job"
               CronExpr = None
               IntervalSeconds = Some 3600
+              AfterSeconds = None
               Timezone = "UTC"
               Catchup = SkipMissed }
 
@@ -3211,6 +3254,7 @@ let ``schedule_list renders jobs`` () =
               Prompt = "active job"
               CronExpr = None
               IntervalSeconds = Some 3600
+              AfterSeconds = None
               Timezone = "UTC"
               Catchup = SkipMissed }
 
@@ -3245,6 +3289,49 @@ let ``schedule_list renders jobs`` () =
     }
 
 [<Fact>]
+let ``schedule_list shows one-shot marker`` () =
+    task {
+        let repo = FakeScheduleRepo()
+
+        let draft: ScheduleJobDraft =
+            { UserId = UserId 1L
+              ChatId = ChatId 1L
+              Prompt = "one-shot job"
+              CronExpr = None
+              IntervalSeconds = None
+              AfterSeconds = Some 300
+              Timezone = "UTC"
+              Catchup = SkipMissed }
+
+        let! _ = (repo :> IScheduleJobRepository).Insert draft None
+
+        let executor =
+            HostToolExecutor(
+                FakeTransport(),
+                FakeVoiceProcessor(Ok "hi"),
+                repo,
+                defaultQuota,
+                NullLogger<HostToolExecutor>.Instance
+            )
+
+        let frame = JsonObject()
+        frame["type"] <- "host_tool_call"
+        frame["id"] <- "host_list_oneshot"
+        frame["toolCallId"] <- "toolu_list_oneshot"
+        frame["toolName"] <- "schedule_list"
+        frame["arguments"] <- (JsonObject() :> JsonNode)
+
+        let! result = executor.TryExecute(UserId 1L, Some(ChatId 1L), Some Telegram, frame)
+
+        match result with
+        | Some r ->
+            Json.getBool "isError" r |> should equal None
+            let text = hostToolResultText r
+            Assert.Contains("#1 [pending (разово)] one-shot job next:", text)
+        | None -> failwith "expected a result frame for schedule_list one-shot"
+    }
+
+[<Fact>]
 let ``schedule_pause resume remove run_now transitions`` () =
     task {
         let repo = FakeScheduleRepo()
@@ -3255,6 +3342,7 @@ let ``schedule_pause resume remove run_now transitions`` () =
               Prompt = "job"
               CronExpr = None
               IntervalSeconds = Some 3600
+              AfterSeconds = None
               Timezone = "UTC"
               Catchup = SkipMissed }
 
@@ -3309,6 +3397,7 @@ let ``schedule_add idempotent via toolCallId`` () =
               Prompt = "job"
               CronExpr = None
               IntervalSeconds = Some 3600
+              AfterSeconds = None
               Timezone = "UTC"
               Catchup = SkipMissed }
 

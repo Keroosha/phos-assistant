@@ -66,7 +66,7 @@ type ScheduleJobRepository(exec: StorageExecutor) =
         | None -> failwithf "unknown schedule status: %s" s
 
     let selectColumns =
-        "id, user_id, chat_id, cron_expr, interval_seconds, timezone, prompt, catchup_policy, status, next_run, last_run_at, last_error, created_at, updated_at"
+        "id, user_id, chat_id, cron_expr, interval_seconds, timezone, prompt, catchup_policy, status, next_run, last_run_at, last_error, created_at, updated_at, after_seconds"
 
     let readJob (reader: SqliteDataReader) : ScheduleJob =
         let id = reader.GetInt64 0
@@ -100,12 +100,19 @@ type ScheduleJobRepository(exec: StorageExecutor) =
         let createdAt = fromUnix (reader.GetInt64 12)
         let updatedAt = fromUnix (reader.GetInt64 13)
 
+        let after =
+            if reader.IsDBNull 14 then
+                None
+            else
+                Some(reader.GetInt32 14)
+
         { Id = id
           UserId = uid
           ChatId = cid
           Prompt = prompt
           CronExpr = cron
           IntervalSeconds = interval
+          AfterSeconds = after
           Timezone = tz
           Catchup = catchup
           Status = status
@@ -141,12 +148,13 @@ type ScheduleJobRepository(exec: StorageExecutor) =
                 use cmd = conn.CreateCommand()
 
                 cmd.CommandText <-
-                    "INSERT INTO schedule_jobs(user_id, chat_id, cron_expr, interval_seconds, timezone, prompt, catchup_policy, status, next_run, origin_tool_call_id, created_at, updated_at) VALUES ($userId, $chatId, $cron, $interval, $timezone, $prompt, $catchup, 'pending', NULL, $origin, $now, $now) RETURNING id;"
+                    "INSERT INTO schedule_jobs(user_id, chat_id, cron_expr, interval_seconds, after_seconds, timezone, prompt, catchup_policy, status, next_run, origin_tool_call_id, created_at, updated_at) VALUES ($userId, $chatId, $cron, $interval, $after, $timezone, $prompt, $catchup, 'pending', NULL, $origin, $now, $now) RETURNING id;"
 
                 cmd.Parameters.AddWithValue("$userId", userId draft.UserId) |> ignore
                 cmd.Parameters.AddWithValue("$chatId", chatId draft.ChatId) |> ignore
                 addOpt cmd "$cron" draft.CronExpr
                 addOpt cmd "$interval" draft.IntervalSeconds
+                addOpt cmd "$after" draft.AfterSeconds
                 cmd.Parameters.AddWithValue("$timezone", draft.Timezone) |> ignore
                 cmd.Parameters.AddWithValue("$prompt", draft.Prompt) |> ignore
                 cmd.Parameters.AddWithValue("$catchup", catchupToString draft.Catchup) |> ignore
@@ -163,6 +171,7 @@ type ScheduleJobRepository(exec: StorageExecutor) =
                       Prompt = draft.Prompt
                       CronExpr = draft.CronExpr
                       IntervalSeconds = draft.IntervalSeconds
+                      AfterSeconds = draft.AfterSeconds
                       Timezone = draft.Timezone
                       Catchup = draft.Catchup
                       Status = ScheduleStatus.Pending
@@ -218,9 +227,17 @@ type ScheduleJobRepository(exec: StorageExecutor) =
                 | Some job when job.Status = ScheduleStatus.Pending ->
                     let now = DateTimeOffset.UtcNow
 
-                    let nextRun =
-                        ScheduleJobs.nextOccurrences job.CronExpr job.IntervalSeconds job.Timezone now 1
-                        |> List.tryHead
+                    let draft =
+                        { UserId = job.UserId
+                          ChatId = job.ChatId
+                          Prompt = job.Prompt
+                          CronExpr = job.CronExpr
+                          IntervalSeconds = job.IntervalSeconds
+                          AfterSeconds = job.AfterSeconds
+                          Timezone = job.Timezone
+                          Catchup = job.Catchup }
+
+                    let nextRun = ScheduleJobs.nextRunAfter draft now
 
                     use upd = conn.CreateCommand()
 
@@ -264,9 +281,17 @@ type ScheduleJobRepository(exec: StorageExecutor) =
                 | Some job when job.Status = ScheduleStatus.Paused ->
                     let now = DateTimeOffset.UtcNow
 
-                    let nextRun =
-                        ScheduleJobs.nextOccurrences job.CronExpr job.IntervalSeconds job.Timezone now 1
-                        |> List.tryHead
+                    let draft =
+                        { UserId = job.UserId
+                          ChatId = job.ChatId
+                          Prompt = job.Prompt
+                          CronExpr = job.CronExpr
+                          IntervalSeconds = job.IntervalSeconds
+                          AfterSeconds = job.AfterSeconds
+                          Timezone = job.Timezone
+                          Catchup = job.Catchup }
+
+                    let nextRun = ScheduleJobs.nextRunAfter draft now
 
                     use upd = conn.CreateCommand()
 
@@ -342,30 +367,9 @@ type ScheduleJobRepository(exec: StorageExecutor) =
                     None
                 | Some job ->
                     let scheduled = job.NextRun.Value
-                    let policy = duePolicy job.Catchup
-                    let due = isDue policy now job.LastRunAt scheduled
+                    let payload = "[по расписанию]\n" + job.Prompt
 
-                    let nextRun =
-                        ScheduleJobs.nextOccurrences job.CronExpr job.IntervalSeconds job.Timezone scheduled 1
-                        |> List.tryHead
-
-                    let advanceNextRun () =
-                        use upd = conn.CreateCommand()
-                        upd.Transaction <- tx
-
-                        upd.CommandText <-
-                            "UPDATE schedule_jobs SET next_run = $nextRun, updated_at = $now WHERE id = $id;"
-
-                        addOpt upd "$nextRun" (nextRun |> Option.map toUnix)
-                        upd.Parameters.AddWithValue("$now", toUnix now) |> ignore
-                        upd.Parameters.AddWithValue("$id", job.Id) |> ignore
-                        upd.ExecuteNonQuery() |> ignore
-                        tx.Commit()
-
-                    if not due then
-                        advanceNextRun ()
-                        None
-                    else
+                    let enqueueCommand () =
                         let externalKey = sprintf "sched:%d:%d" job.Id scheduled.UtcTicks
                         use ins = conn.CreateCommand()
                         ins.Transaction <- tx
@@ -382,7 +386,7 @@ type ScheduleJobRepository(exec: StorageExecutor) =
                         addOpt ins "$externalKey" (Some externalKey)
                         ins.Parameters.AddWithValue("$userId", userId job.UserId) |> ignore
                         ins.Parameters.AddWithValue("$chatId", chatId job.ChatId) |> ignore
-                        ins.Parameters.AddWithValue("$payload", job.Prompt) |> ignore
+                        ins.Parameters.AddWithValue("$payload", payload) |> ignore
                         ins.Parameters.AddWithValue("$priority", 10) |> ignore
                         ins.Parameters.AddWithValue("$images", "") |> ignore
                         ins.Parameters.AddWithValue("$now", toUnix now) |> ignore
@@ -399,14 +403,21 @@ type ScheduleJobRepository(exec: StorageExecutor) =
                             run.Parameters.AddWithValue("$scheduledFor", toUnix scheduled) |> ignore
                             run.Parameters.AddWithValue("$commandId", commandId) |> ignore
                             run.ExecuteNonQuery() |> ignore
+                            Some commandId
+                        | _ -> None
 
+                    if job.AfterSeconds.IsSome then
+                        // One-shot: fires once (even when late — the user asked "in 5
+                        // minutes", so delivering at +6min after a restart is correct),
+                        // then the job auto-completes without advancing next_run.
+                        match enqueueCommand () with
+                        | Some commandId ->
                             use upd = conn.CreateCommand()
                             upd.Transaction <- tx
 
                             upd.CommandText <-
-                                "UPDATE schedule_jobs SET next_run = $nextRun, last_run_at = $now, updated_at = $now WHERE id = $id;"
+                                "UPDATE schedule_jobs SET status = 'completed', last_run_at = $now, updated_at = $now WHERE id = $id;"
 
-                            addOpt upd "$nextRun" (nextRun |> Option.map toUnix)
                             upd.Parameters.AddWithValue("$now", toUnix now) |> ignore
                             upd.Parameters.AddWithValue("$id", job.Id) |> ignore
                             upd.ExecuteNonQuery() |> ignore
@@ -415,11 +426,62 @@ type ScheduleJobRepository(exec: StorageExecutor) =
                             Some
                                 { Job =
                                     { job with
-                                        NextRun = nextRun
+                                        Status = ScheduleStatus.Completed
+                                        NextRun = None
                                         LastRunAt = Some now
                                         UpdatedAt = now }
                                   ScheduledFor = scheduled
                                   CommandId = commandId }
-                        | _ ->
+                        | None ->
+                            tx.Rollback()
+                            None
+                    else
+                        let policy = duePolicy job.Catchup
+                        let due = isDue policy now job.LastRunAt scheduled
+
+                        let nextRun =
+                            ScheduleJobs.nextOccurrences job.CronExpr job.IntervalSeconds job.Timezone scheduled 1
+                            |> List.tryHead
+
+                        let advanceNextRun () =
+                            use upd = conn.CreateCommand()
+                            upd.Transaction <- tx
+
+                            upd.CommandText <-
+                                "UPDATE schedule_jobs SET next_run = $nextRun, updated_at = $now WHERE id = $id;"
+
+                            addOpt upd "$nextRun" (nextRun |> Option.map toUnix)
+                            upd.Parameters.AddWithValue("$now", toUnix now) |> ignore
+                            upd.Parameters.AddWithValue("$id", job.Id) |> ignore
+                            upd.ExecuteNonQuery() |> ignore
+                            tx.Commit()
+
+                        if not due then
                             advanceNextRun ()
-                            None)
+                            None
+                        else
+                            match enqueueCommand () with
+                            | Some commandId ->
+                                use upd = conn.CreateCommand()
+                                upd.Transaction <- tx
+
+                                upd.CommandText <-
+                                    "UPDATE schedule_jobs SET next_run = $nextRun, last_run_at = $now, updated_at = $now WHERE id = $id;"
+
+                                addOpt upd "$nextRun" (nextRun |> Option.map toUnix)
+                                upd.Parameters.AddWithValue("$now", toUnix now) |> ignore
+                                upd.Parameters.AddWithValue("$id", job.Id) |> ignore
+                                upd.ExecuteNonQuery() |> ignore
+                                tx.Commit()
+
+                                Some
+                                    { Job =
+                                        { job with
+                                            NextRun = nextRun
+                                            LastRunAt = Some now
+                                            UpdatedAt = now }
+                                      ScheduledFor = scheduled
+                                      CommandId = commandId }
+                            | None ->
+                                advanceNextRun ()
+                                None)

@@ -13,6 +13,7 @@ type ScheduleStatus =
     | Paused
     | Cancelled
     | Expired
+    | Completed
 
 /// A persisted schedule job (the Core-side model; storage lives in Phos.Storage).
 type ScheduleJob =
@@ -22,6 +23,7 @@ type ScheduleJob =
       Prompt: string
       CronExpr: string option
       IntervalSeconds: int option
+      AfterSeconds: int option
       Timezone: string
       Catchup: CatchupPolicy
       Status: ScheduleStatus
@@ -38,6 +40,7 @@ type ScheduleJobDraft =
       Prompt: string
       CronExpr: string option
       IntervalSeconds: int option
+      AfterSeconds: int option
       Timezone: string
       Catchup: CatchupPolicy }
 
@@ -56,18 +59,21 @@ let private tryResolveTimezone (tzName: string) : TimeZoneInfo option =
 /// Validates a draft against the quota. Pure; no IO.
 ///
 /// Rules: prompt non-blank and within `MaxPromptLength`; exactly one of
-/// `CronExpr`/`IntervalSeconds`; the chosen schedule expression is well-formed
-/// and within the minimum interval; the timezone is a known IANA zone.
+/// `CronExpr`/`IntervalSeconds`/`AfterSeconds`; `AfterSeconds >= 1`; the chosen
+/// schedule expression is well-formed and within the minimum interval; the
+/// timezone is a known IANA zone.
 let validate (quota: ScheduleQuota) (draft: ScheduleJobDraft) : Result<ScheduleJobDraft, string> =
     if String.IsNullOrWhiteSpace draft.Prompt then
         Error "поле prompt не может быть пустым"
     elif draft.Prompt.Length > quota.MaxPromptLength then
         Error(sprintf "поле prompt: длина %d превышает максимум %d" draft.Prompt.Length quota.MaxPromptLength)
     else
-        match draft.CronExpr, draft.IntervalSeconds with
-        | Some _, Some _ -> Error "поля cron_expr и interval_seconds: задайте ровно одно из них"
-        | None, None -> Error "поля cron_expr и interval_seconds: задайте ровно одно из них"
-        | Some c, None ->
+        match draft.CronExpr, draft.IntervalSeconds, draft.AfterSeconds with
+        | Some _, Some _, _
+        | Some _, _, Some _
+        | _, Some _, Some _ -> Error "укажите ровно один из cron_expr, interval_seconds или after_seconds"
+        | None, None, None -> Error "укажите ровно один из cron_expr, interval_seconds или after_seconds"
+        | Some c, None, None ->
             match tryResolveTimezone draft.Timezone with
             | None -> Error(sprintf "поле timezone: неизвестная таймзона '%s'" draft.Timezone)
             | Some _ ->
@@ -76,7 +82,7 @@ let validate (quota: ScheduleQuota) (draft: ScheduleJobDraft) : Result<ScheduleJ
                     Ok draft
                 with _ ->
                     Error(sprintf "поле cron_expr: некорректное cron-выражение '%s'" c)
-        | None, Some s ->
+        | None, Some s, None ->
             match tryResolveTimezone draft.Timezone with
             | None -> Error(sprintf "поле timezone: неизвестная таймзона '%s'" draft.Timezone)
             | Some _ ->
@@ -84,6 +90,11 @@ let validate (quota: ScheduleQuota) (draft: ScheduleJobDraft) : Result<ScheduleJ
                     Error(sprintf "поле interval_seconds: %d меньше минимального %d" s quota.MinIntervalSeconds)
                 else
                     Ok draft
+        | None, None, Some a ->
+            if a < 1 then
+                Error "after_seconds должен быть >= 1"
+            else
+                Ok draft
 
 /// Computes the next `count` occurrences strictly after `after`.
 ///
@@ -107,6 +118,18 @@ let nextOccurrences
         SchedulePolicy.nextOccurrences parsed tz after count
     | None, Some s -> [ 1..count ] |> List.map (fun k -> after.AddSeconds(float (k * s)))
     | _ -> []
+
+/// Computes the single next run for a draft strictly after `now`.
+///
+/// Cron/interval schedules delegate to `nextOccurrences`; a one-shot
+/// (`AfterSeconds`) fires exactly `AfterSeconds` seconds from `now`.
+let nextRunAfter (draft: ScheduleJobDraft) (now: DateTimeOffset) : DateTimeOffset option =
+    match draft.CronExpr, draft.IntervalSeconds with
+    | Some _, _
+    | _, Some _ ->
+        nextOccurrences draft.CronExpr draft.IntervalSeconds draft.Timezone now 1
+        |> List.tryHead
+    | None, None -> draft.AfterSeconds |> Option.map (fun a -> now.AddSeconds(float a))
 
 /// Renders occurrences one per line: `"2026-09-14 09:00 UTC (11:00 Europe/Berlin)"`.
 /// The UTC label is fixed; the local time is shown in the job's timezone.
@@ -153,6 +176,7 @@ let statusToString (status: ScheduleStatus) : string =
     | ScheduleStatus.Paused -> "paused"
     | ScheduleStatus.Cancelled -> "cancelled"
     | ScheduleStatus.Expired -> "expired"
+    | ScheduleStatus.Completed -> "completed"
 
 /// Case-insensitive parse of a status string; `None` for unknown values.
 let statusOfString (s: string) : ScheduleStatus option =
@@ -162,6 +186,7 @@ let statusOfString (s: string) : ScheduleStatus option =
     | "paused" -> Some ScheduleStatus.Paused
     | "cancelled" -> Some ScheduleStatus.Cancelled
     | "expired" -> Some ScheduleStatus.Expired
+    | "completed" -> Some ScheduleStatus.Completed
     | _ -> None
 
 /// Builds the `SchedulePolicy` that drives a job: catch-up per job, at most one

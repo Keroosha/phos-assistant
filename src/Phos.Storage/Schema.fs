@@ -381,6 +381,19 @@ type ExtendScheduleJobs() =
         this.Delete.Column("last_run_at").FromTable("schedule_jobs") |> ignore
         this.Delete.Column("last_error").FromTable("schedule_jobs") |> ignore
 
+[<Migration(10L)>]
+type AddScheduleAfterSeconds() =
+    inherit Migration()
+
+    override this.Up() =
+        // One-shot schedule: `after_seconds` fires a job exactly once that many
+        // seconds after confirmation, then the job auto-completes.
+        this.Alter.Table("schedule_jobs").AddColumn("after_seconds").AsInt32().Nullable()
+        |> ignore
+
+    override this.Down() =
+        this.Delete.Column("after_seconds").FromTable("schedule_jobs") |> ignore
+
 // ---------------------------------------------------------------------------
 // Runner
 // ---------------------------------------------------------------------------
