@@ -223,14 +223,15 @@ omp --mode rpc \
 
 ### 2.6. Задачи по расписанию
 
-Выбор: **Cronos 0.13.0 + собственный durable registry** (без изменений из v1).
+Выбор: **Cronos 0.13.0 + собственный durable registry** (без изменений из v1). **Управление — только через промпт** (host tools, см. `docs/phase6-scheduler.md`): слэш-команда `/schedule_add` из v1-плана **отменена** (команды удалены, остался `/stop`).
 
-- `schedule_jobs`: cron, IANA timezone, prompt, enabled, catch-up policy, next_run.
+- `schedule_jobs`: cron/interval, IANA timezone, prompt, status, catch-up policy, next_run (+ `chat_id`, миграция 9).
 - `schedule_runs(job_id, scheduled_for)` с UNIQUE — дедупликация конкретного occurrence.
-- Scheduler транзакционно claims due run, затем кладёт обычную команду `origin=schedule` в `command_inbox` → доставка в OMP-сессию пользователя как `prompt` (или host tool `schedule_run`).
+- Scheduler транзакционно claims due run, затем кладёт обычную команду `origin=schedule` в `command_inbox` → доставка в OMP-сессию пользователя как `prompt`.
 - Default misfire: skip missed runs; максимум один catch-up только при явном выборе.
-- `schedule_add` всегда показывает следующие 5 UTC+local timestamps и требует confirm.
-- Минимальный интервал, per-user quota, запрет саморепликации расписаний без нового явного подтверждения.
+- **Только loop** (зеркало Claude Code `/loop`, но персистентный): бессрочный цикл по cron/интервалу; goal-режим **не нужен** (решение владельца). Цикл переживает рестарты и завершается только промптом пользователя (`schedule_pause`/`schedule_remove` через агента).
+- `schedule_add` (host tool) всегда показывает следующие 5 UTC+local timestamps; активация — только через `schedule_confirm` из user-хода.
+- Минимальный интервал, per-user quota (**настраиваются через конфиг**, секция `Scheduler`; дефолты в `docs/phase6-scheduler.md`), запрет саморепликации расписаний без подтверждения человеком (guard на origin хода).
 
 ### 2.7. Storage, encryption и backups
 
@@ -280,7 +281,7 @@ SQLite поддерживает concurrency, но только одного writ
 
 `command_inbox` в SQLite — source of truth для команд пользователя и scheduled jobs:
 
-1. Telegram handler валидирует whitelist и классифицирует control command (`/stop`, `/schedule_add`, ...).
+1. Telegram handler валидирует whitelist; `/stop` — abort (в OmpWorker), всё остальное — обычная команда в inbox.
 2. Через storage executor — короткая транзакция dedupe + INSERT `pending`.
 3. Роутер пробуждается (coalescing wake-channel; его переполнение не критично — периодический скан `pending`).
 4. Роутер: пользователь без процесса → spawn `omp --mode rpc --profile phos` с cwd=`~/.phos/workspace/<uid>` и `--resume`; команда → `prompt` (или `abort` для `/stop`; `streamingBehavior: "followUp"` если turn идёт).
@@ -417,10 +418,13 @@ backup_log(id PK, started_at, finished_at, path, checksum, status, error);
 - Интеграционные тесты против реального `omp` с fake LLM endpoint; контрактные тесты на wire-протокол.
 - **Acceptance:** два пользователя → один профиль, изолированные workspace (сессии, банки памяти, персональность); `agent_end` дожидается `isTerminal`; `/stop` прерывает ход; убийство процесса → respawn + resume без потери и без дубля; переполнение очереди не теряет команду.
 
-### Phase 6 — Scheduler
+### Phase 6 — Scheduler (управление через промпт)
 
 - Cronos registry; occurrence uniqueness; claim/lease; skip/catch-up; enqueue via command inbox.
-- **Acceptance:** DST spring/fall fixtures, restart, duplicate tick, quota and confirmation; one scheduled occurrence produces one command.
+- Host tools `schedule_*` (add/confirm/cancel/list/pause/resume/remove/run_now) с двухфазным confirm и guard'ами; per-turn origin; квоты.
+- **Loop-only** (решение владельца): бессрочный цикл по cron/интервалу, переживает рестарты, завершается только промптом (`schedule_pause`/`schedule_remove`); goal-режима нет.
+- Детальный дизайн: `docs/phase6-scheduler.md`.
+- **Acceptance:** DST spring/fall fixtures, restart (loop продолжает тикать), duplicate tick, quota and confirmation; one scheduled occurrence produces one command; prompt-driven E2E (add→confirm→tick→reply→stop промптом); self-replication rejected.
 
 ### Phase 7 — Backups
 
