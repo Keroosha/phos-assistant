@@ -14,6 +14,7 @@ open Phos.Storage
 open Phos.Speech
 open Phos.Telegram
 open Phos.Omp
+open Phos.Scheduler
 open Phos.App
 
 /// Entry point. Binds and validates config (appsettings.json + `PHOS_` env vars
@@ -62,6 +63,10 @@ let main (argv: string[]) : int =
 
             builder.Services.AddSingleton<IMessageOutbox>(fun sp ->
                 MessageOutbox(sp.GetRequiredService<StorageExecutor>()) :> IMessageOutbox)
+            |> ignore
+
+            builder.Services.AddSingleton<IScheduleJobRepository>(fun sp ->
+                Repositories.scheduleJobRepository (sp.GetRequiredService<StorageExecutor>()))
             |> ignore
 
             builder.Services.AddSingleton<UpdateDedupe>(UpdateDedupe 1000) |> ignore
@@ -122,6 +127,8 @@ let main (argv: string[]) : int =
                 HostToolExecutor(
                     sp.GetRequiredService<ITelegramTransport>(),
                     sp.GetRequiredService<IVoiceProcessor>(),
+                    sp.GetRequiredService<IScheduleJobRepository>(),
+                    Config.toScheduleQuota cfg,
                     sp.GetRequiredService<ILogger<HostToolExecutor>>()
                 ))
             |> ignore
@@ -185,6 +192,15 @@ let main (argv: string[]) : int =
                         sp.GetRequiredService<ConcurrentDictionary<int64, CancellationTokenSource>>(),
                         sp.GetRequiredService<ITelegramTransport>(),
                         sp.GetRequiredService<ILogger<OmpWorker>>()
+                    ))
+                |> ignore
+
+                builder.Services.AddHostedService<SchedulerService>(fun sp ->
+                    new SchedulerService(
+                        sp.GetRequiredService<IScheduleJobRepository>(),
+                        sp.GetRequiredService<WakeChannel>().Wake,
+                        Config.toSchedulerOptions cfg,
+                        sp.GetRequiredService<ILogger<SchedulerService>>()
                     ))
                 |> ignore
 

@@ -75,7 +75,7 @@ last_error         TEXT NULL
 
 ## 6. DST и таймзоны
 
-`SchedulePolicy.resolveLocal`/`nextOccurrences` уже решают spring-forward gap (invalid → skip) и fall-back ambiguity (детерминированный winter offset). Таймзона — per-job (IANA), default UTC; агент при неясности спрашивает пользователя. Колонка `users.timezone` больше не пишется (команды удалены) — источник истины таймзона задания.
+Поведение проверено фикстурами (`nextOccurrences`, CoreTests): spring-forward gap — Cronos **сдвигает** несуществующее локальное время на пост-прыжковое (02:30 → 03:00 local), детерминированно: ежедневное задание срабатывает и в день перевода часов. Fall-back — одно детерминированное срабатывание в 02:30 local (не два). `SchedulePolicy.resolveLocal` (invalid → None, ambiguous → winter offset) остаётся для локального разрешения. Таймзона — per-job (IANA), default UTC; агент при неясности спрашивает пользователя. Колонка `users.timezone` больше не пишется (команды удалены) — источник истины таймзона задания.
 
 ## 7. Acceptance (расширение из research-plan Phase 6)
 

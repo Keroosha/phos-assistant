@@ -5,8 +5,10 @@ open System.IO
 open FsToolkit.ErrorHandling
 open Microsoft.Extensions.Configuration
 open Phos.Core.DomainTypes
+open Phos.Core.ScheduleJobs
 open Phos.Core.Whitelist
 open Phos.Storage
+open Phos.Scheduler
 open Phos.Omp
 
 /// Telegram connection settings, bound from the `Telegram` config section.
@@ -69,6 +71,16 @@ type OmpSettings =
       MaxTime: string
       ReadyTimeoutSeconds: int }
 
+/// Scheduler settings, bound from the `Scheduler` config section.
+[<CLIMutable>]
+type SchedulerSettings =
+    { MaxJobsPerUser: int
+      MinIntervalSeconds: int
+      MaxPromptLength: int
+      MaxFailedTicks: int
+      TickSeconds: int
+      PendingTtlHours: int }
+
 /// App-wide configuration bound from `IConfiguration` (appsettings.json +
 /// `PHOS_` environment variables + command line).
 [<CLIMutable>]
@@ -77,7 +89,8 @@ type AppConfig =
       Storage: StorageSettings
       Whitelist: WhitelistSettings
       Stt: SttSettings
-      Omp: OmpSettings }
+      Omp: OmpSettings
+      Scheduler: SchedulerSettings }
 
 /// Binds and validates the app configuration.
 module Config =
@@ -143,6 +156,13 @@ module Config =
                 do! Result.requireTrue "Omp:MaxQueuePerUser must be >= 1" (cfg.Omp.MaxQueuePerUser >= 1)
                 do! Result.requireTrue "Omp:ReadyTimeoutSeconds must be >= 1" (cfg.Omp.ReadyTimeoutSeconds >= 1)
 
+            do! Result.requireTrue "Scheduler:MaxJobsPerUser must be >= 1" (cfg.Scheduler.MaxJobsPerUser >= 1)
+            do! Result.requireTrue "Scheduler:MinIntervalSeconds must be >= 1" (cfg.Scheduler.MinIntervalSeconds >= 1)
+            do! Result.requireTrue "Scheduler:MaxPromptLength must be >= 1" (cfg.Scheduler.MaxPromptLength >= 1)
+            do! Result.requireTrue "Scheduler:MaxFailedTicks must be >= 1" (cfg.Scheduler.MaxFailedTicks >= 1)
+            do! Result.requireTrue "Scheduler:TickSeconds must be >= 1" (cfg.Scheduler.TickSeconds >= 1)
+            do! Result.requireTrue "Scheduler:PendingTtlHours must be >= 1" (cfg.Scheduler.PendingTtlHours >= 1)
+
             if cfg.Stt.Enabled then
                 do!
                     Result.requireTrue
@@ -173,7 +193,7 @@ module Config =
     /// vars) yields an `Error` describing the missing file.
     let bind (configuration: IConfiguration) : Result<AppConfig, string> =
         let sections =
-            [ "Telegram"; "Storage"; "Whitelist"; "Stt"; "Omp" ]
+            [ "Telegram"; "Storage"; "Whitelist"; "Stt"; "Omp"; "Scheduler" ]
             |> List.forall (fun name -> configuration.GetSection(name).Exists())
 
         if not sections then
@@ -261,3 +281,15 @@ module Config =
           ProbeTimeoutSeconds = cfg.Stt.ProbeTimeoutSeconds
           MaxConcurrentStt = cfg.Stt.MaxConcurrentStt
           ModelSha256 = cfg.Stt.ModelSha256 }
+
+    /// Builds the per-user scheduling quota from the config.
+    let toScheduleQuota (cfg: AppConfig) : ScheduleQuota =
+        { MaxJobsPerUser = cfg.Scheduler.MaxJobsPerUser
+          MinIntervalSeconds = cfg.Scheduler.MinIntervalSeconds
+          MaxPromptLength = cfg.Scheduler.MaxPromptLength }
+
+    /// Builds the scheduler runtime options from the config.
+    let toSchedulerOptions (cfg: AppConfig) : SchedulerOptions =
+        { TickSeconds = cfg.Scheduler.TickSeconds
+          PendingTtlHours = cfg.Scheduler.PendingTtlHours
+          MaxFailedTicks = cfg.Scheduler.MaxFailedTicks }

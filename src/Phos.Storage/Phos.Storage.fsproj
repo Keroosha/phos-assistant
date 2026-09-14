@@ -9,6 +9,7 @@
     <Compile Include="Schema.fs" />
     <Compile Include="Users.fs" />
     <Compile Include="CommandInbox.fs" />
+    <Compile Include="ScheduleJobs.fs" />
     <Compile Include="MessageOutbox.fs" />
     <Compile Include="Repositories.fs" />
   </ItemGroup>

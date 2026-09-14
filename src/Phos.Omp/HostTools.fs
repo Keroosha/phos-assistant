@@ -5,7 +5,11 @@ open System.Collections.Concurrent
 open System.Threading.Tasks
 open System.Text.Json.Nodes
 open Microsoft.Extensions.Logging
+open Phos.Core
 open Phos.Core.DomainTypes
+open Phos.Core.ScheduleJobs
+open Phos.Core.SchedulePolicy
+open Phos.Storage
 open Phos.Telegram
 
 /// Host-owned Telegram tools exposed to the agent via `set_host_tools`.
@@ -46,13 +50,60 @@ module HostTools =
           { Name = "stt_transcribe"
             Label = "Transcribe voice"
             Description = "Transcribe a Telegram voice message."
-            Parameters = jsonSchema [ "chat_id", "integer", true; "message_id", "integer", true ] } ]
+            Parameters = jsonSchema [ "chat_id", "integer", true; "message_id", "integer", true ] }
+          { Name = "schedule_add"
+            Label = "Add schedule job"
+            Description =
+              "Create a scheduled prompt for the user. Provide exactly one of cron_expr or interval_seconds."
+            Parameters =
+              jsonSchema
+                  [ "prompt", "string", true
+                    "cron_expr", "string", false
+                    "interval_seconds", "integer", false
+                    "timezone", "string", false
+                    "catch_up", "string", false
+                    "chat_id", "integer", false ] }
+          { Name = "schedule_confirm"
+            Label = "Confirm schedule job"
+            Description = "Confirm a pending schedule job so it becomes active."
+            Parameters = jsonSchema [ "job_id", "integer", true ] }
+          { Name = "schedule_cancel"
+            Label = "Cancel schedule job"
+            Description = "Cancel a pending schedule job."
+            Parameters = jsonSchema [ "job_id", "integer", true ] }
+          { Name = "schedule_pause"
+            Label = "Pause schedule job"
+            Description = "Pause an active schedule job."
+            Parameters = jsonSchema [ "job_id", "integer", true ] }
+          { Name = "schedule_resume"
+            Label = "Resume schedule job"
+            Description = "Resume a paused schedule job."
+            Parameters = jsonSchema [ "job_id", "integer", true ] }
+          { Name = "schedule_remove"
+            Label = "Remove schedule job"
+            Description = "Remove a schedule job."
+            Parameters = jsonSchema [ "job_id", "integer", true ] }
+          { Name = "schedule_run_now"
+            Label = "Run schedule job now"
+            Description = "Trigger a schedule job on the next tick."
+            Parameters = jsonSchema [ "job_id", "integer", true ] }
+          { Name = "schedule_list"
+            Label = "List schedule jobs"
+            Description = "List the user's schedule jobs."
+            Parameters = jsonSchema [] } ]
 
 /// Executes `host_tool_call` frames for the registered Telegram tools and
 /// produces the matching `host_tool_result` frames. Execution is idempotent per
 /// `toolCallId` (best-effort, in-memory): a repeated call for the same id
 /// returns the cached result without repeating the side effect.
-type HostToolExecutor(transport: ITelegramTransport, voice: IVoiceProcessor, logger: ILogger) =
+type HostToolExecutor
+    (
+        transport: ITelegramTransport,
+        voice: IVoiceProcessor,
+        jobs: IScheduleJobRepository,
+        quota: ScheduleQuota,
+        logger: ILogger
+    ) =
 
     // toolCallId -> (text, isError); in-memory best-effort idempotency cache.
     let cache = ConcurrentDictionary<string, string * bool>()
@@ -123,16 +174,180 @@ type HostToolExecutor(transport: ITelegramTransport, voice: IVoiceProcessor, log
             | _ -> return Error "stt_transcribe requires chat_id and message_id"
         }
 
-    let execute (toolName: string) (args: JsonObject) : Task<Result<string, string>> =
+    let scheduleAdd
+        (userId: UserId)
+        (chatId: ChatId option)
+        (toolCallId: string)
+        (args: JsonObject)
+        : Task<Result<string, string>> =
+        task {
+            match! jobs.FindByToolCallId toolCallId with
+            | Some job -> return Ok(sprintf "задание #%d уже создано (pending)" job.Id)
+            | None ->
+                match Json.getString "prompt" args with
+                | None -> return Error "поле prompt обязательно"
+                | Some prompt ->
+                    let cron = Json.getString "cron_expr" args
+                    let interval = Json.getInt "interval_seconds" args
+                    let timezone = Json.getString "timezone" args |> Option.defaultValue "UTC"
+
+                    let catchup =
+                        match Json.getString "catch_up" args with
+                        | Some "once" -> CatchUpOnce
+                        | _ -> SkipMissed
+
+                    let targetChatId =
+                        match Json.getInt64 "chat_id" args, chatId with
+                        | Some cid, _ -> Some(ChatId cid)
+                        | None, Some cid -> Some cid
+                        | None, None -> None
+
+                    match targetChatId with
+                    | None -> return Error "неизвестен chat_id"
+                    | Some targetChatId ->
+                        let! active = jobs.CountActiveForUser userId
+
+                        if active >= quota.MaxJobsPerUser then
+                            return Error(sprintf "достигнут лимит заданий (%d)" quota.MaxJobsPerUser)
+                        else
+                            let draft =
+                                { UserId = userId
+                                  ChatId = targetChatId
+                                  Prompt = prompt
+                                  CronExpr = cron
+                                  IntervalSeconds = interval
+                                  Timezone = timezone
+                                  Catchup = catchup }
+
+                            match ScheduleJobs.validate quota draft with
+                            | Error e -> return Error e
+                            | Ok _ ->
+                                let! job = jobs.Insert draft (Some toolCallId)
+
+                                let next5 =
+                                    ScheduleJobs.nextOccurrences
+                                        job.CronExpr
+                                        job.IntervalSeconds
+                                        job.Timezone
+                                        DateTimeOffset.UtcNow
+                                        5
+
+                                let text =
+                                    sprintf
+                                        "Задание #%d создано (ожидает подтверждения). Ближайшие:\n%s\nСпроси у пользователя подтверждение."
+                                        job.Id
+                                        (ScheduleJobs.formatOccurrences job.Timezone next5)
+
+                                return Ok text
+        }
+
+    let scheduleConfirm (origin: Origin option) (args: JsonObject) : Task<Result<string, string>> =
+        task {
+            match Json.getInt64 "job_id" args with
+            | None -> return Error "поле job_id обязательно"
+            | Some id ->
+                match origin with
+                | Some Telegram ->
+                    do! jobs.Confirm id
+                    return Ok(sprintf "Задание #%d активно." id)
+                | _ -> return Error "подтверждение доступно только из хода пользователя"
+        }
+
+    let scheduleCancel (args: JsonObject) : Task<Result<string, string>> =
+        task {
+            match Json.getInt64 "job_id" args with
+            | None -> return Error "поле job_id обязательно"
+            | Some id ->
+                do! jobs.Cancel id
+                return Ok(sprintf "Задание #%d отменено." id)
+        }
+
+    let scheduleList (userId: UserId) (args: JsonObject) : Task<Result<string, string>> =
+        task {
+            let! userJobs = jobs.ListForUser userId
+
+            let lines =
+                userJobs
+                |> List.map (fun job ->
+                    let prompt =
+                        if job.Prompt.Length > 80 then
+                            job.Prompt.Substring(0, 80)
+                        else
+                            job.Prompt
+
+                    let next =
+                        job.NextRun
+                        |> Option.map (fun dto -> dto.UtcDateTime.ToString("yyyy-MM-dd HH:mm"))
+                        |> Option.defaultValue ""
+
+                    sprintf "#%d [%s] %s next: %s" job.Id (ScheduleJobs.statusToString job.Status) prompt next)
+
+            return Ok(String.concat "\n" lines)
+        }
+
+    let schedulePause (args: JsonObject) : Task<Result<string, string>> =
+        task {
+            match Json.getInt64 "job_id" args with
+            | None -> return Error "поле job_id обязательно"
+            | Some id ->
+                do! jobs.Pause id
+                return Ok(sprintf "Задание #%d приостановлено." id)
+        }
+
+    let scheduleResume (args: JsonObject) : Task<Result<string, string>> =
+        task {
+            match Json.getInt64 "job_id" args with
+            | None -> return Error "поле job_id обязательно"
+            | Some id ->
+                do! jobs.Resume id
+                return Ok(sprintf "Задание #%d возобновлено." id)
+        }
+
+    let scheduleRemove (args: JsonObject) : Task<Result<string, string>> =
+        task {
+            match Json.getInt64 "job_id" args with
+            | None -> return Error "поле job_id обязательно"
+            | Some id ->
+                do! jobs.Remove id
+                return Ok(sprintf "Задание #%d удалено." id)
+        }
+
+    let scheduleRunNow (args: JsonObject) : Task<Result<string, string>> =
+        task {
+            match Json.getInt64 "job_id" args with
+            | None -> return Error "поле job_id обязательно"
+            | Some id ->
+                do! jobs.RunNow id
+                return Ok(sprintf "Задание #%d запущено (сработает на ближайшем тике)." id)
+        }
+
+    let execute
+        (userId: UserId)
+        (chatId: ChatId option)
+        (origin: Origin option)
+        (toolCallId: string)
+        (toolName: string)
+        (args: JsonObject)
+        : Task<Result<string, string>> =
         match toolName with
         | "tg_send_message" -> sendMessage args
         | "tg_edit_message" -> editMessage args
         | "stt_transcribe" -> transcribe args
+        | "schedule_add" -> scheduleAdd userId chatId toolCallId args
+        | "schedule_confirm" -> scheduleConfirm origin args
+        | "schedule_cancel" -> scheduleCancel args
+        | "schedule_list" -> scheduleList userId args
+        | "schedule_pause" -> schedulePause args
+        | "schedule_resume" -> scheduleResume args
+        | "schedule_remove" -> scheduleRemove args
+        | "schedule_run_now" -> scheduleRunNow args
         | _ -> Task.FromResult(Error(sprintf "unknown host tool: %s" toolName))
 
     /// Executes a frame if it is a `host_tool_call`, returning the
     /// `host_tool_result` frame to send, or `None` for any other frame.
-    member _.TryExecute(frame: JsonObject) : Task<JsonObject option> =
+    member _.TryExecute
+        (userId: UserId, chatId: ChatId option, origin: Origin option, frame: JsonObject)
+        : Task<JsonObject option> =
         task {
             if RpcProtocol.classify frame <> FrameKind.HostToolCall then
                 return None
@@ -147,7 +362,7 @@ type HostToolExecutor(transport: ITelegramTransport, voice: IVoiceProcessor, log
                     // Duplicate call: replay cached result without repeating the side effect.
                     return Some(buildResult id text isError)
                 | _ ->
-                    let! outcome = execute toolName args
+                    let! outcome = execute userId chatId origin toolCallId toolName args
 
                     match outcome with
                     | Ok text ->

@@ -198,7 +198,7 @@ type CreateScheduleJobs() =
             .NotNullable()
             .WithColumn("cron_expr")
             .AsString()
-            .NotNullable()
+            .Nullable()
             .WithColumn("timezone")
             .AsString()
             .NotNullable()
@@ -324,6 +324,62 @@ type AddCommandInboxImages() =
 
     override this.Down() =
         this.Delete.Column("images").FromTable("command_inbox") |> ignore
+
+[<Migration(9L)>]
+type ExtendScheduleJobs() =
+    inherit Migration()
+
+    override this.Up() =
+        // The `enabled` flag is absorbed by the richer `status` lifecycle
+        // (pending|active|paused|cancelled|expired). New columns carry the
+        // delivery chat, the interval sugar (exactly one of cron/interval), the
+        // restart-safe idempotency key for schedule_add, and last-run/last-error
+        // diagnostics.
+        this.Alter.Table("schedule_jobs").AddColumn("chat_id").AsInt64().NotNullable().WithDefaultValue(0L)
+        |> ignore
+
+        this.Alter.Table("schedule_jobs").AddColumn("interval_seconds").AsInt32().Nullable()
+        |> ignore
+
+        this.Alter.Table("schedule_jobs").AddColumn("status").AsString().NotNullable().WithDefaultValue("pending")
+        |> ignore
+
+        this.Alter.Table("schedule_jobs").AddColumn("origin_tool_call_id").AsString().Nullable()
+        |> ignore
+
+        this.Alter.Table("schedule_jobs").AddColumn("last_run_at").AsInt64().Nullable()
+        |> ignore
+
+        this.Alter.Table("schedule_jobs").AddColumn("last_error").AsString().Nullable()
+        |> ignore
+
+        // Restart-safe idempotency for schedule_add. SQLite allows multiple NULLs
+        // in a unique index, so the (mostly NULL) tool-call-id column stays unique
+        // per non-NULL value.
+        this.Create
+            .Index("ux_schedule_jobs_origin_tool_call_id")
+            .OnTable("schedule_jobs")
+            .OnColumn("origin_tool_call_id")
+            .Ascending()
+            .WithOptions()
+            .Unique()
+        |> ignore
+
+        this.Delete.Column("enabled").FromTable("schedule_jobs") |> ignore
+
+    override this.Down() =
+        this.Alter.Table("schedule_jobs").AddColumn("enabled").AsInt32().NotNullable().WithDefaultValue(1)
+        |> ignore
+
+        this.Delete.Index("ux_schedule_jobs_origin_tool_call_id").OnTable("schedule_jobs")
+        |> ignore
+
+        this.Delete.Column("chat_id").FromTable("schedule_jobs") |> ignore
+        this.Delete.Column("interval_seconds").FromTable("schedule_jobs") |> ignore
+        this.Delete.Column("status").FromTable("schedule_jobs") |> ignore
+        this.Delete.Column("origin_tool_call_id").FromTable("schedule_jobs") |> ignore
+        this.Delete.Column("last_run_at").FromTable("schedule_jobs") |> ignore
+        this.Delete.Column("last_error").FromTable("schedule_jobs") |> ignore
 
 // ---------------------------------------------------------------------------
 // Runner

@@ -19,6 +19,7 @@ module Wl = Phos.Core.Whitelist
 module Tp = Phos.Core.ToolPolicy
 module In = Phos.Core.InboxStateMachine
 module Out = Phos.Core.OutboxStateMachine
+module Sj = Phos.Core.ScheduleJobs
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -765,3 +766,264 @@ let ``chunk with tiny maxUnits and fences makes progress without looping`` () =
     let chunks = chunk 3 "```x```" []
     chunks |> List.isEmpty |> should be False
     chunks |> List.forall (fun c -> c.Text.Length <= 3) |> should be True
+
+// ---------------------------------------------------------------------------
+// ScheduleJobs
+// ---------------------------------------------------------------------------
+
+let private testQuota: Sj.ScheduleQuota =
+    { MaxJobsPerUser = 20
+      MinIntervalSeconds = 60
+      MaxPromptLength = 2000 }
+
+let private validCronDraft: Sj.ScheduleJobDraft =
+    { UserId = UserId 1L
+      ChatId = ChatId 10L
+      Prompt = "напомни мне"
+      CronExpr = Some "0 9 * * *"
+      IntervalSeconds = None
+      Timezone = "Europe/Berlin"
+      Catchup = SkipMissed }
+
+let private validIntervalDraft: Sj.ScheduleJobDraft =
+    { UserId = UserId 1L
+      ChatId = ChatId 10L
+      Prompt = "проверь деплой"
+      CronExpr = None
+      IntervalSeconds = Some 300
+      Timezone = "UTC"
+      Catchup = CatchUpOnce }
+
+[<Fact>]
+let ``validate rejects both cron and interval`` () =
+    let draft =
+        { validCronDraft with
+            IntervalSeconds = Some 300 }
+
+    Sj.validate testQuota draft |> Result.isError |> should be True
+
+[<Fact>]
+let ``validate rejects neither cron nor interval`` () =
+    let draft =
+        { validCronDraft with
+            CronExpr = None
+            IntervalSeconds = None }
+
+    Sj.validate testQuota draft |> Result.isError |> should be True
+
+[<Fact>]
+let ``validate rejects invalid cron`` () =
+    let draft =
+        { validCronDraft with
+            CronExpr = Some "not a cron" }
+
+    Sj.validate testQuota draft |> Result.isError |> should be True
+
+[<Fact>]
+let ``validate rejects interval below minimum`` () =
+    let draft =
+        { validIntervalDraft with
+            IntervalSeconds = Some 30 }
+
+    Sj.validate testQuota draft |> Result.isError |> should be True
+
+[<Fact>]
+let ``validate rejects blank prompt`` () =
+    let draft = { validCronDraft with Prompt = "   " }
+    Sj.validate testQuota draft |> Result.isError |> should be True
+
+[<Fact>]
+let ``validate rejects too long prompt`` () =
+    let draft =
+        { validCronDraft with
+            Prompt = String.replicate 2001 "a" }
+
+    Sj.validate testQuota draft |> Result.isError |> should be True
+
+[<Fact>]
+let ``validate rejects unknown timezone`` () =
+    let draft =
+        { validCronDraft with
+            Timezone = "Not/AZone" }
+
+    Sj.validate testQuota draft |> Result.isError |> should be True
+
+[<Fact>]
+let ``validate accepts valid cron draft`` () =
+    match Sj.validate testQuota validCronDraft with
+    | Ok draft -> draft |> should equal validCronDraft
+    | Error e -> failwith (sprintf "expected Ok, got %A" e)
+
+[<Fact>]
+let ``validate accepts valid interval draft`` () =
+    match Sj.validate testQuota validIntervalDraft with
+    | Ok draft -> draft |> should equal validIntervalDraft
+    | Error e -> failwith (sprintf "expected Ok, got %A" e)
+
+[<Fact>]
+let ``validate errors name the offending field`` () =
+    match
+        Sj.validate
+            testQuota
+            { validCronDraft with
+                IntervalSeconds = Some 300 }
+    with
+    | Error e -> e.Contains "cron_expr" |> should be True
+    | Ok _ -> failwith "expected an error for both cron and interval"
+
+    match
+        Sj.validate
+            testQuota
+            { validCronDraft with
+                Timezone = "Not/AZone" }
+    with
+    | Error e -> e.Contains "timezone" |> should be True
+    | Ok _ -> failwith "expected an error for unknown timezone"
+
+[<Fact>]
+let ``nextOccurrences cron returns strictly after in timezone`` () =
+    let after = DateTimeOffset(2026, 3, 28, 0, 0, 0, TimeSpan.Zero)
+    let occs = Sj.nextOccurrences (Some "30 2 * * *") None "Europe/Berlin" after 3
+    occs |> List.length |> should equal 3
+    occs |> List.forall (fun o -> o > after) |> should be True
+    occs |> List.pairwise |> List.forall (fun (a, b) -> a < b) |> should be True
+
+[<Fact>]
+let ``nextOccurrences handles DST spring-forward gap deterministically`` () =
+    // 2026-03-29 02:30 Europe/Berlin does not exist (clocks jump 02:00 -> 03:00
+    // CET -> CEST). Cronos shifts the nonexistent time to the post-jump local
+    // time (03:00 CEST == 01:00 UTC): the daily job still fires on the gap day.
+    let after = DateTimeOffset(2026, 3, 28, 12, 0, 0, TimeSpan.Zero)
+
+    Sj.nextOccurrences (Some "30 2 * * *") None "Europe/Berlin" after 1
+    |> should equal [ DateTimeOffset(2026, 3, 29, 1, 0, 0, TimeSpan.Zero) ]
+
+[<Fact>]
+let ``nextOccurrences is deterministic on DST fall-back`` () =
+    // 2026-10-25 02:30 Europe/Berlin occurs twice (CEST 00:30Z and CET 01:30Z).
+    // The engine must return a deterministic single occurrence at local 02:30.
+    let after = DateTimeOffset(2026, 10, 24, 12, 0, 0, TimeSpan.Zero)
+
+    match Sj.nextOccurrences (Some "30 2 * * *") None "Europe/Berlin" after 1 with
+    | [ occ ] ->
+        occ.LocalDateTime |> should equal (DateTime(2026, 10, 25, 2, 30, 0))
+        let offsets = [ TimeSpan.FromHours 1.0; TimeSpan.FromHours 2.0 ]
+        offsets |> should contain occ.Offset
+    | _ ->
+        failwithf
+            "expected exactly one fall-back occurrence, got %A"
+            (Sj.nextOccurrences (Some "30 2 * * *") None "Europe/Berlin" after 1)
+
+[<Fact>]
+let ``nextOccurrences interval returns k times interval steps`` () =
+    let after = DateTimeOffset(2026, 3, 28, 0, 0, 0, TimeSpan.Zero)
+    let occs = Sj.nextOccurrences None (Some 60) "UTC" after 3
+
+    occs
+    |> should equal [ after.AddSeconds 60.0; after.AddSeconds 120.0; after.AddSeconds 180.0 ]
+
+[<Fact>]
+let ``nextOccurrences clamps count to 1..100`` () =
+    let after = DateTimeOffset(2026, 3, 28, 0, 0, 0, TimeSpan.Zero)
+
+    Sj.nextOccurrences (Some "0 9 * * *") None "Europe/Berlin" after 0
+    |> List.length
+    |> should equal 1
+
+    Sj.nextOccurrences (Some "0 9 * * *") None "Europe/Berlin" after 150
+    |> List.length
+    |> should equal 100
+
+[<Fact>]
+let ``formatOccurrences renders UTC and local time`` () =
+    let occ = DateTimeOffset(2026, 9, 14, 9, 0, 0, TimeSpan.Zero)
+
+    Sj.formatOccurrences "Europe/Berlin" [ occ ]
+    |> should equal "2026-09-14 09:00 UTC (11:00 Europe/Berlin)"
+
+[<Fact>]
+let ``formatOccurrences empty returns empty string`` () =
+    Sj.formatOccurrences "Europe/Berlin" [] |> should equal ""
+
+[<Fact>]
+let ``confirmStatus pending to active`` () =
+    match Sj.confirmStatus Sj.ScheduleStatus.Pending with
+    | Ok s -> s |> should equal Sj.ScheduleStatus.Active
+    | Error e -> failwith (sprintf "expected Ok, got %A" e)
+
+[<Fact>]
+let ``confirmStatus rejects non pending`` () =
+    Sj.confirmStatus Sj.ScheduleStatus.Active |> Result.isError |> should be True
+    Sj.confirmStatus Sj.ScheduleStatus.Paused |> Result.isError |> should be True
+    Sj.confirmStatus Sj.ScheduleStatus.Cancelled |> Result.isError |> should be True
+    Sj.confirmStatus Sj.ScheduleStatus.Expired |> Result.isError |> should be True
+
+[<Fact>]
+let ``cancelStatus pending to cancelled`` () =
+    match Sj.cancelStatus Sj.ScheduleStatus.Pending with
+    | Ok s -> s |> should equal Sj.ScheduleStatus.Cancelled
+    | Error e -> failwith (sprintf "expected Ok, got %A" e)
+
+[<Fact>]
+let ``cancelStatus rejects non pending`` () =
+    Sj.cancelStatus Sj.ScheduleStatus.Active |> Result.isError |> should be True
+
+[<Fact>]
+let ``pauseStatus active to paused`` () =
+    match Sj.pauseStatus Sj.ScheduleStatus.Active with
+    | Ok s -> s |> should equal Sj.ScheduleStatus.Paused
+    | Error e -> failwith (sprintf "expected Ok, got %A" e)
+
+[<Fact>]
+let ``pauseStatus rejects non active`` () =
+    Sj.pauseStatus Sj.ScheduleStatus.Pending |> Result.isError |> should be True
+
+[<Fact>]
+let ``resumeStatus paused to active`` () =
+    match Sj.resumeStatus Sj.ScheduleStatus.Paused with
+    | Ok s -> s |> should equal Sj.ScheduleStatus.Active
+    | Error e -> failwith (sprintf "expected Ok, got %A" e)
+
+[<Fact>]
+let ``resumeStatus rejects non paused`` () =
+    Sj.resumeStatus Sj.ScheduleStatus.Active |> Result.isError |> should be True
+
+[<Fact>]
+let ``expireStatus pending to expired`` () =
+    match Sj.expireStatus Sj.ScheduleStatus.Pending with
+    | Ok s -> s |> should equal Sj.ScheduleStatus.Expired
+    | Error e -> failwith (sprintf "expected Ok, got %A" e)
+
+[<Fact>]
+let ``expireStatus rejects non pending`` () =
+    Sj.expireStatus Sj.ScheduleStatus.Active |> Result.isError |> should be True
+
+[<Fact>]
+let ``statusOfString round-trips`` () =
+    Sj.statusOfString "pending" |> should equal (Some Sj.ScheduleStatus.Pending)
+    Sj.statusOfString "active" |> should equal (Some Sj.ScheduleStatus.Active)
+    Sj.statusOfString "paused" |> should equal (Some Sj.ScheduleStatus.Paused)
+    Sj.statusOfString "cancelled" |> should equal (Some Sj.ScheduleStatus.Cancelled)
+    Sj.statusOfString "expired" |> should equal (Some Sj.ScheduleStatus.Expired)
+    Sj.statusOfString "PENDING" |> should equal (Some Sj.ScheduleStatus.Pending)
+    Sj.statusOfString "unknown" |> should equal None
+
+[<Fact>]
+let ``statusToString matches statusOfString`` () =
+    [ Sj.ScheduleStatus.Pending
+      Sj.ScheduleStatus.Active
+      Sj.ScheduleStatus.Paused
+      Sj.ScheduleStatus.Cancelled
+      Sj.ScheduleStatus.Expired ]
+    |> List.forall (fun s -> Sj.statusOfString (Sj.statusToString s) = Some s)
+    |> should be True
+
+[<Fact>]
+let ``duePolicy wraps catchup with max one catchup`` () =
+    Sj.duePolicy SkipMissed |> should equal { Catchup = SkipMissed; MaxCatchUp = 1 }
+
+    Sj.duePolicy CatchUpOnce
+    |> should
+        equal
+        { Catchup = CatchUpOnce
+          MaxCatchUp = 1 }

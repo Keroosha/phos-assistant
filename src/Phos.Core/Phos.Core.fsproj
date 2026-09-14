@@ -10,6 +10,7 @@
     <Compile Include="ToolPolicy.fs" />
     <Compile Include="Chunker.fs" />
     <Compile Include="SchedulePolicy.fs" />
+    <Compile Include="ScheduleJobs.fs" />
     <Compile Include="InboxStateMachine.fs" />
     <Compile Include="OutboxStateMachine.fs" />
   </ItemGroup>

@@ -18,9 +18,12 @@ open FsUnit.Xunit
 open Microsoft.Extensions.Logging.Abstractions
 open Phos.Core.DomainTypes
 open Phos.Core.Chunker
+open Phos.Core.ScheduleJobs
+open Phos.Core.SchedulePolicy
 open Phos.Storage
 open Phos.Telegram
 open Phos.Omp
+open Phos.Scheduler
 
 module Inbox = Phos.Core.InboxStateMachine
 
@@ -204,6 +207,49 @@ type FakeOutbox() =
         member _.Retry(_: int64) = Task.FromResult(())
         member _.GetByRandomId(_: int64) = task { return None }
         member _.CountPending() = task { return 0 }
+
+/// Minimal in-memory `IScheduleJobRepository` for integration tests. Schedule
+/// host tools are not exercised by the integration scenarios, so the interface
+/// is satisfied with sensible defaults.
+type FakeScheduleRepo() =
+    let mutable nextId = 1L
+
+    interface IScheduleJobRepository with
+        member _.Insert (draft: ScheduleJobDraft) (_: string option) =
+            task {
+                let id = nextId
+                nextId <- nextId + 1L
+
+                return
+                    { Id = id
+                      UserId = draft.UserId
+                      ChatId = draft.ChatId
+                      Prompt = draft.Prompt
+                      CronExpr = draft.CronExpr
+                      IntervalSeconds = draft.IntervalSeconds
+                      Timezone = draft.Timezone
+                      Catchup = draft.Catchup
+                      Status = ScheduleStatus.Pending
+                      NextRun = None
+                      LastRunAt = None
+                      LastError = None
+                      CreatedAt = DateTimeOffset.UtcNow
+                      UpdatedAt = DateTimeOffset.UtcNow }
+            }
+
+        member _.FindByToolCallId _ = task { return None }
+        member _.GetById _ = task { return None }
+        member _.ListForUser _ = task { return [] }
+        member _.CountActiveForUser _ = task { return 0 }
+        member _.Confirm _ = Task.FromResult(())
+        member _.Cancel _ = Task.FromResult(())
+        member _.Pause _ = Task.FromResult(())
+        member _.Resume _ = Task.FromResult(())
+        member _.Remove _ = Task.FromResult(())
+        member _.RunNow _ = Task.FromResult(())
+        member _.ExpirePending (_: DateTimeOffset) (_: DateTimeOffset) = task { return 0 }
+        member _.PauseDueToErrors (_: int64) (_: string) = Task.FromResult(())
+        member _.ClaimDueOccurrence _ = task { return None }
 
 /// A controllable `IOmpRpcClient` used where the real omp's event emission is
 /// not externally scriptable (e.g. scenario 2 terminal gating). Events are
@@ -423,7 +469,15 @@ let private makeSessionManager
           ReadyTimeoutSeconds = 30 }
 
     let hostTools =
-        HostToolExecutor(ctx.Transport, ctx.Voice, NullLogger<HostToolExecutor>.Instance)
+        HostToolExecutor(
+            ctx.Transport,
+            ctx.Voice,
+            FakeScheduleRepo(),
+            { MaxJobsPerUser = 20
+              MinIntervalSeconds = 60
+              MaxPromptLength = 2000 },
+            NullLogger<HostToolExecutor>.Instance
+        )
 
     let hostUris = HostUriResolver(ctx.Transport, NullLogger<HostUriResolver>.Instance)
 
@@ -875,4 +929,222 @@ let ``host tool call roundtrips through the executor`` () =
                             |> List.exists (fun p -> p.Contains "done after tool")
                             |> should be True
                         }))
+    }
+
+// ---------------------------------------------------------------------------
+// Scheduler E2E — prompt-driven loop (add → confirm → run_now → tick → inbox → restart → remove)
+// ---------------------------------------------------------------------------
+
+/// Extracts the concatenated text of a `host_tool_result` content array.
+let private resultText (r: JsonObject) : string =
+    let content =
+        Json.getObject "result" r
+        |> Option.bind (fun res -> Json.getArray "content" res)
+        |> Option.defaultValue (JsonArray())
+
+    let texts =
+        [ for item in content do
+              match item with
+              | :? JsonObject as o ->
+                  match Json.getString "text" o with
+                  | Some t -> yield t
+                  | None -> ()
+              | _ -> () ]
+
+    String.concat "\n" texts
+
+/// Builds a `host_tool_call` frame.
+let private mkToolCall (id: string) (toolCallId: string) (toolName: string) (args: JsonObject) : JsonObject =
+    let frame = JsonObject()
+    frame["type"] <- "host_tool_call"
+    frame["id"] <- id
+    frame["toolCallId"] <- toolCallId
+    frame["toolName"] <- toolName
+    frame["arguments"] <- (args :> JsonNode)
+    frame
+
+[<Fact>]
+let ``scheduler prompt-driven loop end to end`` () =
+    task {
+        let dir = tempDir ()
+        let mutable execRef: StorageExecutor option = None
+
+        try
+            let dbPath = Path.Combine(dir, "phos.db")
+
+            let storageOpts =
+                { DatabasePath = dbPath
+                  BusyTimeout = TimeSpan.FromSeconds 2.0
+                  ReadPoolSize = 4
+                  CheckpointEvery = 10 }
+
+            let exec = StorageExecutor.Create storageOpts
+            execRef <- Some exec
+            Schema.run storageOpts
+
+            let jobs = Repositories.scheduleJobRepository exec
+            let inbox = Repositories.commandInbox exec
+
+            let quota =
+                { MaxJobsPerUser = 20
+                  MinIntervalSeconds = 60
+                  MaxPromptLength = 2000 }
+
+            let hostTools =
+                HostToolExecutor(
+                    FakeTransport(),
+                    FakeVoiceProcessor(Ok "hi"),
+                    jobs,
+                    quota,
+                    NullLogger<HostToolExecutor>.Instance
+                )
+
+            let mutable wakes = 0
+
+            let scheduler =
+                new SchedulerService(
+                    jobs,
+                    (fun () -> wakes <- wakes + 1),
+                    { TickSeconds = 15
+                      PendingTtlHours = 24
+                      MaxFailedTicks = 3 },
+                    NullLogger<SchedulerService>.Instance
+                )
+
+            // (a) schedule_add creates a PENDING job and asks for confirmation.
+            let addArgs = JsonObject()
+            addArgs["prompt"] <- "напоминай каждый час"
+            addArgs["interval_seconds"] <- 3600
+            addArgs["timezone"] <- "UTC"
+            addArgs["catch_up"] <- "once"
+
+            let! addResult =
+                hostTools.TryExecute(
+                    UserId 1L,
+                    Some(ChatId 7L),
+                    Some Telegram,
+                    mkToolCall "r1" "t1" "schedule_add" addArgs
+                )
+
+            match addResult with
+            | Some r ->
+                Json.getBool "isError" r |> should equal None
+                (resultText r).Contains "ожидает подтверждения" |> should be True
+            | None -> failwith "schedule_add: expected a host_tool_result"
+
+            let! job = jobs.FindByToolCallId "t1"
+            job |> should not' (be None)
+            let jobId = job.Value.Id
+
+            // (b) schedule_confirm activates the job (only after explicit confirmation).
+            let confirmArgs = JsonObject()
+            confirmArgs["job_id"] <- jobId
+
+            let! confirmResult =
+                hostTools.TryExecute(
+                    UserId 1L,
+                    Some(ChatId 7L),
+                    Some Telegram,
+                    mkToolCall "r2" "t2" "schedule_confirm" confirmArgs
+                )
+
+            match confirmResult with
+            | Some r ->
+                Json.getBool "isError" r |> should equal None
+                (resultText r).Contains "активно" |> should be True
+            | None -> failwith "schedule_confirm: expected a host_tool_result"
+
+            // (c) schedule_run_now makes the active job due on the next tick.
+            let runNowArgs = JsonObject()
+            runNowArgs["job_id"] <- jobId
+
+            let! runNowResult =
+                hostTools.TryExecute(
+                    UserId 1L,
+                    Some(ChatId 7L),
+                    Some Telegram,
+                    mkToolCall "r3" "t3" "schedule_run_now" runNowArgs
+                )
+
+            match runNowResult with
+            | Some r -> Json.getBool "isError" r |> should equal None
+            | None -> failwith "schedule_run_now: expected a host_tool_result"
+
+            // (d) One tick claims the due occurrence and wakes the worker.
+            let! claimed = scheduler.RunOnce(DateTimeOffset.UtcNow.AddSeconds 1.0)
+            claimed |> should be (greaterThanOrEqualTo 1)
+            wakes |> should be (greaterThanOrEqualTo 1)
+
+            // (e) The scheduled prompt is now a durable inbox command for the chat.
+            let lease =
+                { Until = DateTimeOffset.UtcNow.AddMinutes 5.0
+                  HeartbeatAt = DateTimeOffset.UtcNow }
+
+            let! cmd = inbox.ClaimNextForChat (ChatId 7L) lease
+            cmd |> should not' (be None)
+            cmd.Value.Envelope.Origin |> should equal Schedule
+            cmd.Value.Envelope.Priority |> should equal 10
+            cmd.Value.Envelope.Payload |> should equal "напоминай каждый час"
+
+            // (f) Restart survival: a fresh executor/repo on the same DB does not
+            // re-claim the already-advanced occurrence, and no duplicate command
+            // is enqueued.
+            exec.Dispose()
+            execRef <- None
+
+            let exec2 = StorageExecutor.Create storageOpts
+            execRef <- Some exec2
+
+            let jobs2 = Repositories.scheduleJobRepository exec2
+            let inbox2 = Repositories.commandInbox exec2
+
+            let scheduler2 =
+                new SchedulerService(
+                    jobs2,
+                    (fun () -> wakes <- wakes + 1),
+                    { TickSeconds = 15
+                      PendingTtlHours = 24
+                      MaxFailedTicks = 3 },
+                    NullLogger<SchedulerService>.Instance
+                )
+
+            let! again = scheduler2.RunOnce(DateTimeOffset.UtcNow.AddSeconds 1.0)
+            again |> should equal 0
+
+            let! cmd2 = inbox2.ClaimNextForChat (ChatId 7L) lease
+            cmd2 |> should equal None
+
+            // (g) schedule_remove deletes the job; no further claims.
+            let hostTools2 =
+                HostToolExecutor(
+                    FakeTransport(),
+                    FakeVoiceProcessor(Ok "hi"),
+                    jobs2,
+                    quota,
+                    NullLogger<HostToolExecutor>.Instance
+                )
+
+            let removeArgs = JsonObject()
+            removeArgs["job_id"] <- jobId
+
+            let! removeResult =
+                hostTools2.TryExecute(
+                    UserId 1L,
+                    Some(ChatId 7L),
+                    Some Telegram,
+                    mkToolCall "r4" "t4" "schedule_remove" removeArgs
+                )
+
+            match removeResult with
+            | Some r -> Json.getBool "isError" r |> should equal None
+            | None -> failwith "schedule_remove: expected a host_tool_result"
+
+            let! afterRemove = scheduler2.RunOnce(DateTimeOffset.UtcNow.AddSeconds 1.0)
+            afterRemove |> should equal 0
+        finally
+            match execRef with
+            | Some e -> e.Dispose()
+            | None -> ()
+
+            deleteDir dir
     }

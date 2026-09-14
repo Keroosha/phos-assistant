@@ -19,6 +19,8 @@ open FsUnit.Xunit
 open Microsoft.Extensions.Logging.Abstractions
 open Phos.Core.DomainTypes
 open Phos.Core.Chunker
+open Phos.Core.ScheduleJobs
+open Phos.Core.SchedulePolicy
 open Phos.Storage
 open Phos.Telegram
 open Phos.Omp
@@ -188,6 +190,176 @@ type FakeTransport
 type FakeVoiceProcessor(result: Result<string, string>) =
     interface IVoiceProcessor with
         member _.ProcessAsync(_: VoiceRef) = task { return result }
+
+/// In-memory `IScheduleJobRepository` for host-tool tests. Tracks inserts,
+/// supports status transitions and a configurable active count / throw flag.
+type FakeScheduleRepo() =
+    let jobs = System.Collections.Generic.Dictionary<int64, ScheduleJob>()
+    let toolCallIds = System.Collections.Generic.Dictionary<string, int64>()
+    let mutable nextId = 1L
+    let mutable countActive = 0
+    let mutable insertCount = 0
+    let mutable throwOnInsert = false
+
+    let updateJob (id: int64) (f: ScheduleJob -> ScheduleJob) =
+        match jobs.TryGetValue id with
+        | true, j -> jobs[id] <- f j
+        | _ -> ()
+
+    member _.Jobs = jobs.Values |> Seq.toList
+    member _.InsertCount = insertCount
+    member _.JobCount = jobs.Count
+
+    member _.PendingCount =
+        jobs.Values
+        |> Seq.filter (fun j -> j.Status = ScheduleStatus.Pending)
+        |> Seq.length
+
+    member _.SetCountActive(n: int) = countActive <- n
+    member _.ThrowOnInsert = throwOnInsert <- true
+    member _.ClearThrowOnInsert = throwOnInsert <- false
+
+    member _.GetJob(id: int64) =
+        jobs.TryGetValue id
+        |> function
+            | true, j -> Some j
+            | _ -> None
+
+    interface IScheduleJobRepository with
+        member _.Insert (draft: ScheduleJobDraft) (origin: string option) =
+            if throwOnInsert then
+                failwith "fake schedule insert boom"
+            else
+                insertCount <- insertCount + 1
+                let id = nextId
+                nextId <- nextId + 1L
+
+                let job =
+                    { Id = id
+                      UserId = draft.UserId
+                      ChatId = draft.ChatId
+                      Prompt = draft.Prompt
+                      CronExpr = draft.CronExpr
+                      IntervalSeconds = draft.IntervalSeconds
+                      Timezone = draft.Timezone
+                      Catchup = draft.Catchup
+                      Status = ScheduleStatus.Pending
+                      NextRun = None
+                      LastRunAt = None
+                      LastError = None
+                      CreatedAt = DateTimeOffset.UtcNow
+                      UpdatedAt = DateTimeOffset.UtcNow }
+
+                jobs[id] <- job
+
+                match origin with
+                | Some t -> toolCallIds[t] <- id
+                | None -> ()
+
+                Task.FromResult job
+
+        member _.FindByToolCallId(t) =
+            match toolCallIds.TryGetValue t with
+            | true, id ->
+                Task.FromResult(
+                    jobs.TryGetValue id
+                    |> function
+                        | true, j -> Some j
+                        | _ -> None
+                )
+            | _ -> Task.FromResult None
+
+        member _.GetById(id) =
+            Task.FromResult(
+                jobs.TryGetValue id
+                |> function
+                    | true, j -> Some j
+                    | _ -> None
+            )
+
+        member _.ListForUser(uid) =
+            jobs.Values
+            |> Seq.filter (fun j -> j.UserId = uid)
+            |> Seq.toList
+            |> Task.FromResult
+
+        member _.CountActiveForUser(_) = Task.FromResult countActive
+
+        member _.Confirm(id) =
+            updateJob id (fun j ->
+                if j.Status = ScheduleStatus.Pending then
+                    { j with
+                        Status = ScheduleStatus.Active
+                        NextRun = Some(DateTimeOffset.UtcNow.AddSeconds 3600.0) }
+                else
+                    j)
+
+            Task.FromResult(())
+
+        member _.Cancel(id) =
+            updateJob id (fun j ->
+                if j.Status = ScheduleStatus.Pending then
+                    { j with
+                        Status = ScheduleStatus.Cancelled }
+                else
+                    j)
+
+            Task.FromResult(())
+
+        member _.Pause(id) =
+            updateJob id (fun j ->
+                if j.Status = ScheduleStatus.Active then
+                    { j with
+                        Status = ScheduleStatus.Paused }
+                else
+                    j)
+
+            Task.FromResult(())
+
+        member _.Resume(id) =
+            updateJob id (fun j ->
+                if j.Status = ScheduleStatus.Paused then
+                    { j with
+                        Status = ScheduleStatus.Active
+                        NextRun = Some(DateTimeOffset.UtcNow.AddSeconds 3600.0) }
+                else
+                    j)
+
+            Task.FromResult(())
+
+        member _.Remove(id) =
+            jobs.Remove(id) |> ignore
+            Task.FromResult(())
+
+        member _.RunNow(id) =
+            updateJob id (fun j ->
+                if j.Status = ScheduleStatus.Active then
+                    { j with
+                        NextRun = Some DateTimeOffset.UtcNow }
+                else
+                    j)
+
+            Task.FromResult(())
+
+        member _.ExpirePending (_: DateTimeOffset) (_: DateTimeOffset) = Task.FromResult 0
+
+        member _.PauseDueToErrors (id: int64) (err: string) =
+            updateJob id (fun j ->
+                if j.Status = ScheduleStatus.Active then
+                    { j with
+                        Status = ScheduleStatus.Paused
+                        LastError = Some err }
+                else
+                    j)
+
+            Task.FromResult(())
+
+        member _.ClaimDueOccurrence(_) = Task.FromResult None
+
+let private defaultQuota: ScheduleQuota =
+    { MaxJobsPerUser = 20
+      MinIntervalSeconds = 60
+      MaxPromptLength = 2000 }
 
 type FakeOmpProcess() =
     let exited = Event<unit>()
@@ -659,7 +831,7 @@ let ``executor sends message once and caches idempotently`` () =
         let voice = FakeVoiceProcessor(Ok "hi")
 
         let executor =
-            HostToolExecutor(transport, voice, NullLogger<HostToolExecutor>.Instance)
+            HostToolExecutor(transport, voice, FakeScheduleRepo(), defaultQuota, NullLogger<HostToolExecutor>.Instance)
 
         let frame = JsonObject()
         frame["type"] <- "host_tool_call"
@@ -671,7 +843,7 @@ let ``executor sends message once and caches idempotently`` () =
         args["text"] <- "hi"
         frame["arguments"] <- (args :> JsonNode)
 
-        let! result = executor.TryExecute frame
+        let! result = executor.TryExecute(UserId 1L, Some(ChatId 1L), Some Telegram, frame)
 
         match result with
         | Some r ->
@@ -681,7 +853,7 @@ let ``executor sends message once and caches idempotently`` () =
         | None -> failwith "expected a result frame #1"
 
         // Replaying the same toolCallId must not repeat the side effect.
-        let! result2 = executor.TryExecute frame
+        let! result2 = executor.TryExecute(UserId 1L, Some(ChatId 1L), Some Telegram, frame)
 
         match result2 with
         | Some r2 ->
@@ -694,7 +866,13 @@ let ``executor sends message once and caches idempotently`` () =
 let ``executor reports isError for unknown tool`` () =
     task {
         let executor =
-            HostToolExecutor(FakeTransport(), FakeVoiceProcessor(Ok "hi"), NullLogger<HostToolExecutor>.Instance)
+            HostToolExecutor(
+                FakeTransport(),
+                FakeVoiceProcessor(Ok "hi"),
+                FakeScheduleRepo(),
+                defaultQuota,
+                NullLogger<HostToolExecutor>.Instance
+            )
 
         let frame = JsonObject()
         frame["type"] <- "host_tool_call"
@@ -703,7 +881,7 @@ let ``executor reports isError for unknown tool`` () =
         frame["toolName"] <- "nope"
         frame["arguments"] <- (JsonObject() :> JsonNode)
 
-        let! result = executor.TryExecute frame
+        let! result = executor.TryExecute(UserId 1L, Some(ChatId 1L), Some Telegram, frame)
 
         match result with
         | Some r -> Json.getBool "isError" r |> should equal (Some true)
@@ -714,11 +892,17 @@ let ``executor reports isError for unknown tool`` () =
 let ``executor returns none for non tool frame`` () =
     task {
         let executor =
-            HostToolExecutor(FakeTransport(), FakeVoiceProcessor(Ok "hi"), NullLogger<HostToolExecutor>.Instance)
+            HostToolExecutor(
+                FakeTransport(),
+                FakeVoiceProcessor(Ok "hi"),
+                FakeScheduleRepo(),
+                defaultQuota,
+                NullLogger<HostToolExecutor>.Instance
+            )
 
         let frame = JsonObject()
         frame["type"] <- "agent_start"
-        let! result = executor.TryExecute frame
+        let! result = executor.TryExecute(UserId 1L, Some(ChatId 1L), Some Telegram, frame)
         result |> should equal None
     }
 
@@ -1154,7 +1338,7 @@ let private createSessionManager
     let voice = FakeVoiceProcessor(Ok "hi")
 
     let hostTools =
-        HostToolExecutor(transport, voice, NullLogger<HostToolExecutor>.Instance)
+        HostToolExecutor(transport, voice, FakeScheduleRepo(), defaultQuota, NullLogger<HostToolExecutor>.Instance)
 
     let hostUris = HostUriResolver(transport, NullLogger<HostUriResolver>.Instance)
     let enqueueOutbox (_: OutboxEnvelope) : Task<unit> = Task.FromResult(())
@@ -2671,7 +2855,7 @@ let ``client registers host tools and uri schemes with the server`` () =
                             Json.getArray "toolNames" (data :?> JsonObject)
                             |> Option.defaultWith (fun () -> JsonArray())
 
-                        names |> Seq.length |> should equal 3
+                        names |> Seq.length |> should equal 11
                     | Error e -> failwith e.Message
 
                     let! schemesRes =
@@ -2787,7 +2971,13 @@ let ``executor maps flood wait to an error`` () =
                 member _.GetHistory _ _ _ = task { return [] } }
 
         let executor =
-            HostToolExecutor(transport, FakeVoiceProcessor(Ok "hi"), NullLogger<HostToolExecutor>.Instance)
+            HostToolExecutor(
+                transport,
+                FakeVoiceProcessor(Ok "hi"),
+                FakeScheduleRepo(),
+                defaultQuota,
+                NullLogger<HostToolExecutor>.Instance
+            )
 
         let frame = JsonObject()
         frame["type"] <- "host_tool_call"
@@ -2799,7 +2989,7 @@ let ``executor maps flood wait to an error`` () =
         args["text"] <- "hi"
         frame["arguments"] <- (args :> JsonNode)
 
-        let! result = executor.TryExecute frame
+        let! result = executor.TryExecute(UserId 1L, Some(ChatId 1L), Some Telegram, frame)
 
         match result with
         | Some r ->
@@ -2833,7 +3023,13 @@ let ``executor maps slowmode wait to an error`` () =
                 member _.GetHistory _ _ _ = task { return [] } }
 
         let executor =
-            HostToolExecutor(transport, FakeVoiceProcessor(Ok "hi"), NullLogger<HostToolExecutor>.Instance)
+            HostToolExecutor(
+                transport,
+                FakeVoiceProcessor(Ok "hi"),
+                FakeScheduleRepo(),
+                defaultQuota,
+                NullLogger<HostToolExecutor>.Instance
+            )
 
         let frame = JsonObject()
         frame["type"] <- "host_tool_call"
@@ -2845,13 +3041,307 @@ let ``executor maps slowmode wait to an error`` () =
         args["text"] <- "hi"
         frame["arguments"] <- (args :> JsonNode)
 
-        let! result = executor.TryExecute frame
+        let! result = executor.TryExecute(UserId 1L, Some(ChatId 1L), Some Telegram, frame)
 
         match result with
         | Some r ->
             Json.getBool "isError" r |> should equal (Some true)
             Assert.Contains("slowmode wait", hostToolResultText r)
         | None -> failwith "expected a host_tool result frame for edit"
+    }
+
+[<Fact>]
+let ``schedule_add creates pending job and shows next occurrences`` () =
+    task {
+        let repo = FakeScheduleRepo()
+
+        let executor =
+            HostToolExecutor(
+                FakeTransport(),
+                FakeVoiceProcessor(Ok "hi"),
+                repo,
+                defaultQuota,
+                NullLogger<HostToolExecutor>.Instance
+            )
+
+        let frame = JsonObject()
+        frame["type"] <- "host_tool_call"
+        frame["id"] <- "host_add"
+        frame["toolCallId"] <- "toolu_add"
+        frame["toolName"] <- "schedule_add"
+        let args = JsonObject()
+        args["prompt"] <- "water the plants"
+        args["interval_seconds"] <- 3600
+        frame["arguments"] <- (args :> JsonNode)
+
+        let! result = executor.TryExecute(UserId 1L, Some(ChatId 1L), Some Telegram, frame)
+
+        match result with
+        | Some r ->
+            Json.getBool "isError" r |> should equal None
+            let text = hostToolResultText r
+            Assert.Contains("Задание #1 создано", text)
+            Assert.Contains("Ближайшие", text)
+        | None -> failwith "expected a result frame for schedule_add"
+
+        repo.InsertCount |> should equal 1
+        repo.Jobs |> List.length |> should equal 1
+        repo.Jobs.Head.Status |> should equal ScheduleStatus.Pending
+    }
+
+[<Fact>]
+let ``schedule_add rejects over quota`` () =
+    task {
+        let repo = FakeScheduleRepo()
+        repo.SetCountActive defaultQuota.MaxJobsPerUser
+
+        let executor =
+            HostToolExecutor(
+                FakeTransport(),
+                FakeVoiceProcessor(Ok "hi"),
+                repo,
+                defaultQuota,
+                NullLogger<HostToolExecutor>.Instance
+            )
+
+        let frame = JsonObject()
+        frame["type"] <- "host_tool_call"
+        frame["id"] <- "host_quota"
+        frame["toolCallId"] <- "toolu_quota"
+        frame["toolName"] <- "schedule_add"
+        let args = JsonObject()
+        args["prompt"] <- "water"
+        args["interval_seconds"] <- 3600
+        frame["arguments"] <- (args :> JsonNode)
+
+        let! result = executor.TryExecute(UserId 1L, Some(ChatId 1L), Some Telegram, frame)
+
+        match result with
+        | Some r ->
+            Json.getBool "isError" r |> should equal (Some true)
+            Assert.Contains("достигнут лимит заданий", hostToolResultText r)
+        | None -> failwith "expected a result frame for schedule_add over quota"
+
+        repo.InsertCount |> should equal 0
+    }
+
+[<Fact>]
+let ``schedule_confirm requires user origin`` () =
+    task {
+        let repo = FakeScheduleRepo()
+
+        let draft: ScheduleJobDraft =
+            { UserId = UserId 1L
+              ChatId = ChatId 1L
+              Prompt = "remind"
+              CronExpr = None
+              IntervalSeconds = Some 3600
+              Timezone = "UTC"
+              Catchup = SkipMissed }
+
+        let! job = (repo :> IScheduleJobRepository).Insert draft None
+
+        let executor =
+            HostToolExecutor(
+                FakeTransport(),
+                FakeVoiceProcessor(Ok "hi"),
+                repo,
+                defaultQuota,
+                NullLogger<HostToolExecutor>.Instance
+            )
+
+        // Schedule origin is rejected.
+        let frame = JsonObject()
+        frame["type"] <- "host_tool_call"
+        frame["id"] <- "host_cf"
+        frame["toolCallId"] <- "toolu_cf"
+        frame["toolName"] <- "schedule_confirm"
+        let args = JsonObject()
+        args["job_id"] <- job.Id
+        frame["arguments"] <- (args :> JsonNode)
+
+        let! result = executor.TryExecute(UserId 1L, Some(ChatId 1L), Some Schedule, frame)
+
+        match result with
+        | Some r ->
+            Json.getBool "isError" r |> should equal (Some true)
+            Assert.Contains("подтверждение доступно только из хода пользователя", hostToolResultText r)
+        | None -> failwith "expected a result frame for confirm (schedule origin)"
+
+        // Telegram origin confirms.
+        let frame2 = JsonObject()
+        frame2["type"] <- "host_tool_call"
+        frame2["id"] <- "host_cf2"
+        frame2["toolCallId"] <- "toolu_cf2"
+        frame2["toolName"] <- "schedule_confirm"
+        let args2 = JsonObject()
+        args2["job_id"] <- job.Id
+        frame2["arguments"] <- (args2 :> JsonNode)
+
+        let! result2 = executor.TryExecute(UserId 1L, Some(ChatId 1L), Some Telegram, frame2)
+
+        match result2 with
+        | Some r2 ->
+            Json.getBool "isError" r2 |> should equal None
+            Assert.Contains("Задание #1 активно", hostToolResultText r2)
+        | None -> failwith "expected a result frame for confirm (telegram origin)"
+
+        repo.GetJob(job.Id).Value.Status |> should equal ScheduleStatus.Active
+    }
+
+[<Fact>]
+let ``schedule_list renders jobs`` () =
+    task {
+        let repo = FakeScheduleRepo()
+
+        let draft1: ScheduleJobDraft =
+            { UserId = UserId 1L
+              ChatId = ChatId 1L
+              Prompt = "pending job"
+              CronExpr = None
+              IntervalSeconds = Some 3600
+              Timezone = "UTC"
+              Catchup = SkipMissed }
+
+        let! _ = (repo :> IScheduleJobRepository).Insert draft1 None
+
+        let draft2: ScheduleJobDraft =
+            { UserId = UserId 1L
+              ChatId = ChatId 1L
+              Prompt = "active job"
+              CronExpr = None
+              IntervalSeconds = Some 3600
+              Timezone = "UTC"
+              Catchup = SkipMissed }
+
+        let! j2 = (repo :> IScheduleJobRepository).Insert draft2 None
+        do! (repo :> IScheduleJobRepository).Confirm j2.Id
+
+        let executor =
+            HostToolExecutor(
+                FakeTransport(),
+                FakeVoiceProcessor(Ok "hi"),
+                repo,
+                defaultQuota,
+                NullLogger<HostToolExecutor>.Instance
+            )
+
+        let frame = JsonObject()
+        frame["type"] <- "host_tool_call"
+        frame["id"] <- "host_list"
+        frame["toolCallId"] <- "toolu_list"
+        frame["toolName"] <- "schedule_list"
+        frame["arguments"] <- (JsonObject() :> JsonNode)
+
+        let! result = executor.TryExecute(UserId 1L, Some(ChatId 1L), Some Telegram, frame)
+
+        match result with
+        | Some r ->
+            Json.getBool "isError" r |> should equal None
+            let text = hostToolResultText r
+            Assert.Contains("#1 [pending] pending job next:", text)
+            Assert.Contains("#2 [active] active job next:", text)
+        | None -> failwith "expected a result frame for schedule_list"
+    }
+
+[<Fact>]
+let ``schedule_pause resume remove run_now transitions`` () =
+    task {
+        let repo = FakeScheduleRepo()
+
+        let draft: ScheduleJobDraft =
+            { UserId = UserId 1L
+              ChatId = ChatId 1L
+              Prompt = "job"
+              CronExpr = None
+              IntervalSeconds = Some 3600
+              Timezone = "UTC"
+              Catchup = SkipMissed }
+
+        let! job = (repo :> IScheduleJobRepository).Insert draft None
+        do! (repo :> IScheduleJobRepository).Confirm job.Id
+
+        let executor =
+            HostToolExecutor(
+                FakeTransport(),
+                FakeVoiceProcessor(Ok "hi"),
+                repo,
+                defaultQuota,
+                NullLogger<HostToolExecutor>.Instance
+            )
+
+        let call (toolName: string) (toolCallId: string) : Task<JsonObject option> =
+            let frame = JsonObject()
+            frame["type"] <- "host_tool_call"
+            frame["id"] <- "host_" + toolName
+            frame["toolCallId"] <- toolCallId
+            frame["toolName"] <- toolName
+            let args = JsonObject()
+            args["job_id"] <- job.Id
+            frame["arguments"] <- (args :> JsonNode)
+            executor.TryExecute(UserId 1L, Some(ChatId 1L), Some Telegram, frame)
+
+        let! r1 = call "schedule_pause" "toolu_pause"
+        r1 |> should not' (be None)
+        repo.GetJob(job.Id).Value.Status |> should equal ScheduleStatus.Paused
+
+        let! r2 = call "schedule_resume" "toolu_resume"
+        r2 |> should not' (be None)
+        repo.GetJob(job.Id).Value.Status |> should equal ScheduleStatus.Active
+
+        let! r3 = call "schedule_run_now" "toolu_run"
+        r3 |> should not' (be None)
+        repo.GetJob(job.Id).Value.NextRun |> should not' (be None)
+
+        let! r4 = call "schedule_remove" "toolu_remove"
+        r4 |> should not' (be None)
+        repo.GetJob(job.Id) |> should equal None
+    }
+
+[<Fact>]
+let ``schedule_add idempotent via toolCallId`` () =
+    task {
+        let repo = FakeScheduleRepo()
+
+        let draft: ScheduleJobDraft =
+            { UserId = UserId 1L
+              ChatId = ChatId 1L
+              Prompt = "job"
+              CronExpr = None
+              IntervalSeconds = Some 3600
+              Timezone = "UTC"
+              Catchup = SkipMissed }
+
+        let! _ = (repo :> IScheduleJobRepository).Insert draft (Some "toolu_dup")
+
+        let executor =
+            HostToolExecutor(
+                FakeTransport(),
+                FakeVoiceProcessor(Ok "hi"),
+                repo,
+                defaultQuota,
+                NullLogger<HostToolExecutor>.Instance
+            )
+
+        let frame = JsonObject()
+        frame["type"] <- "host_tool_call"
+        frame["id"] <- "host_dup"
+        frame["toolCallId"] <- "toolu_dup"
+        frame["toolName"] <- "schedule_add"
+        let args = JsonObject()
+        args["prompt"] <- "job"
+        args["interval_seconds"] <- 3600
+        frame["arguments"] <- (args :> JsonNode)
+
+        let! result = executor.TryExecute(UserId 1L, Some(ChatId 1L), Some Telegram, frame)
+
+        match result with
+        | Some r ->
+            Json.getBool "isError" r |> should equal None
+            Assert.Contains("уже создано", hostToolResultText r)
+        | None -> failwith "expected a result frame for schedule_add idempotent"
+
+        repo.InsertCount |> should equal 1
     }
 
 // ---------------------------------------------------------------------------

@@ -9,6 +9,8 @@ open Microsoft.Data.Sqlite
 open Phos.Storage
 open Phos.Core
 open Phos.Core.DomainTypes
+open Phos.Core.ScheduleJobs
+open Phos.Core.SchedulePolicy
 
 // Module abbreviations to disambiguate the overlapping Status types.
 module In = Phos.Core.InboxStateMachine
@@ -1227,6 +1229,519 @@ let ``list pending chat ids includes failed and needs_review, excludes completed
 
                 let! ids = inbox.ListPendingChatIds()
                 ids |> List.sort |> should equal [ ChatId 1L; ChatId 2L ]
+            })
+    finally
+        deleteDir dir
+
+// ---------------------------------------------------------------------------
+// Schedule jobs
+// ---------------------------------------------------------------------------
+
+let private tableColumns (exec: StorageExecutor) (table: string) : string list =
+    exec.ReadAsync(fun conn ->
+        use cmd = conn.CreateCommand()
+        cmd.CommandText <- sprintf "PRAGMA table_info(%s);" table
+        use reader = cmd.ExecuteReader()
+        let cols = ResizeArray<string>()
+
+        while reader.Read() do
+            cols.Add(reader.GetString 1)
+
+        List.ofSeq cols)
+    |> fun t -> t.GetAwaiter().GetResult()
+
+let private indexExists (exec: StorageExecutor) (name: string) : bool =
+    exec.ReadAsync(fun conn ->
+        use cmd = conn.CreateCommand()
+        cmd.CommandText <- "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = $name;"
+        cmd.Parameters.AddWithValue("$name", name) |> ignore
+        cmd.ExecuteScalar() :?> int64 > 0L)
+    |> fun t -> t.GetAwaiter().GetResult()
+
+let private mkDraft (cron: string option) (interval: int option) (catchup: CatchupPolicy) : ScheduleJobDraft =
+    { UserId = UserId 1L
+      ChatId = ChatId 1L
+      Prompt = "remind me"
+      CronExpr = cron
+      IntervalSeconds = interval
+      Timezone = "UTC"
+      Catchup = catchup }
+
+let private queryCommand (exec: StorageExecutor) (id: int64) : (string * int * string * string) option =
+    exec.ReadAsync(fun conn ->
+        use cmd = conn.CreateCommand()
+        cmd.CommandText <- "SELECT origin, priority, payload, external_key FROM command_inbox WHERE id = $id;"
+        cmd.Parameters.AddWithValue("$id", id) |> ignore
+        use reader = cmd.ExecuteReader()
+
+        if reader.Read() then
+            Some(reader.GetString 0, reader.GetInt32 1, reader.GetString 2, reader.GetString 3)
+        else
+            None)
+    |> fun t -> t.GetAwaiter().GetResult()
+
+let private queryRun (exec: StorageExecutor) (jobId: int64) (scheduledFor: DateTimeOffset) : (string * int64) option =
+    exec.ReadAsync(fun conn ->
+        use cmd = conn.CreateCommand()
+
+        cmd.CommandText <-
+            "SELECT status, command_id FROM schedule_runs WHERE job_id = $jobId AND scheduled_for = $scheduledFor;"
+
+        cmd.Parameters.AddWithValue("$jobId", jobId) |> ignore
+
+        cmd.Parameters.AddWithValue("$scheduledFor", scheduledFor.ToUnixTimeSeconds())
+        |> ignore
+
+        use reader = cmd.ExecuteReader()
+
+        if reader.Read() then
+            Some(reader.GetString 0, reader.GetInt64 1)
+        else
+            None)
+    |> fun t -> t.GetAwaiter().GetResult()
+
+let private commandCount (exec: StorageExecutor) : int =
+    exec.ReadAsync(fun conn ->
+        use cmd = conn.CreateCommand()
+        cmd.CommandText <- "SELECT COUNT(*) FROM command_inbox;"
+        cmd.ExecuteScalar() :?> int64 |> int)
+    |> fun t -> t.GetAwaiter().GetResult()
+
+let private runsCount (exec: StorageExecutor) (jobId: int64) : int =
+    exec.ReadAsync(fun conn ->
+        use cmd = conn.CreateCommand()
+        cmd.CommandText <- "SELECT COUNT(*) FROM schedule_runs WHERE job_id = $jobId;"
+        cmd.Parameters.AddWithValue("$jobId", jobId) |> ignore
+        cmd.ExecuteScalar() :?> int64 |> int)
+    |> fun t -> t.GetAwaiter().GetResult()
+
+[<Fact>]
+let ``migration 9 extends schedule jobs and drops enabled`` () =
+    let dir = makeTempDir ()
+    let dbPath = Path.Combine(dir, "phos.db")
+
+    try
+        withExecutor dbPath (fun exec ->
+            task {
+                let cols = tableColumns exec "schedule_jobs"
+                cols |> List.contains "chat_id" |> should be True
+                cols |> List.contains "status" |> should be True
+                cols |> List.contains "interval_seconds" |> should be True
+                cols |> List.contains "origin_tool_call_id" |> should be True
+                cols |> List.contains "last_run_at" |> should be True
+                cols |> List.contains "last_error" |> should be True
+                cols |> List.contains "enabled" |> should be False
+                indexExists exec "ux_schedule_jobs_origin_tool_call_id" |> should be True
+            })
+    finally
+        deleteDir dir
+
+[<Fact>]
+let ``schedule job insert get list and count active round trip`` () =
+    let dir = makeTempDir ()
+    let dbPath = Path.Combine(dir, "phos.db")
+
+    try
+        withExecutor dbPath (fun exec ->
+            task {
+                let repo = Repositories.scheduleJobRepository exec
+                let! j1 = repo.Insert (mkDraft None (Some 3600) SkipMissed) None
+                j1.Id |> should be (greaterThan 0L)
+                j1.Status |> should equal ScheduleStatus.Pending
+                j1.NextRun |> should equal None
+
+                let cronDraft =
+                    { mkDraft (Some "0 9 * * *") None SkipMissed with
+                        ChatId = ChatId 2L }
+
+                let! _ = repo.Insert cronDraft None
+
+                let! got = repo.GetById j1.Id
+                got |> should not' (be None)
+                got.Value.IntervalSeconds |> should equal (Some 3600)
+                got.Value.CronExpr |> should equal None
+                got.Value.Catchup |> should equal SkipMissed
+                got.Value.UserId |> should equal (UserId 1L)
+
+                let! all = repo.ListForUser(UserId 1L)
+                all.Length |> should equal 2
+
+                let! active = repo.CountActiveForUser(UserId 1L)
+                active |> should equal 0
+
+                do! repo.Confirm j1.Id
+                let! active2 = repo.CountActiveForUser(UserId 1L)
+                active2 |> should equal 1
+            })
+    finally
+        deleteDir dir
+
+[<Fact>]
+let ``confirm activates pending job and sets next run`` () =
+    let dir = makeTempDir ()
+    let dbPath = Path.Combine(dir, "phos.db")
+
+    try
+        withExecutor dbPath (fun exec ->
+            task {
+                let repo = Repositories.scheduleJobRepository exec
+                let! job = repo.Insert (mkDraft (Some "0 9 * * *") None SkipMissed) None
+                do! repo.Confirm job.Id
+                let! after = repo.GetById job.Id
+                after.Value.Status |> should equal ScheduleStatus.Active
+                after.Value.NextRun |> should not' (be None)
+                after.Value.NextRun.Value |> should be (greaterThan DateTimeOffset.UtcNow)
+                let next1 = after.Value.NextRun
+
+                do! repo.Confirm job.Id
+                let! after2 = repo.GetById job.Id
+                after2.Value.Status |> should equal ScheduleStatus.Active
+                after2.Value.NextRun |> should equal next1
+            })
+    finally
+        deleteDir dir
+
+[<Fact>]
+let ``confirm interval job sets next run ahead`` () =
+    let dir = makeTempDir ()
+    let dbPath = Path.Combine(dir, "phos.db")
+
+    try
+        withExecutor dbPath (fun exec ->
+            task {
+                let repo = Repositories.scheduleJobRepository exec
+                let! job = repo.Insert (mkDraft None (Some 60) SkipMissed) None
+                do! repo.Confirm job.Id
+                let! after = repo.GetById job.Id
+                after.Value.NextRun |> should not' (be None)
+
+                (after.Value.NextRun.Value - DateTimeOffset.UtcNow).TotalSeconds
+                |> should be (greaterThan 50.0)
+            })
+    finally
+        deleteDir dir
+
+[<Fact>]
+let ``cancel pause resume status transitions`` () =
+    let dir = makeTempDir ()
+    let dbPath = Path.Combine(dir, "phos.db")
+
+    try
+        withExecutor dbPath (fun exec ->
+            task {
+                let repo = Repositories.scheduleJobRepository exec
+                let! j1 = repo.Insert (mkDraft None (Some 3600) SkipMissed) None
+                do! repo.Cancel j1.Id
+                let! c1 = repo.GetById j1.Id
+                c1.Value.Status |> should equal ScheduleStatus.Cancelled
+
+                let! j2 = repo.Insert (mkDraft None (Some 3600) SkipMissed) None
+                do! repo.Confirm j2.Id
+                do! repo.Pause j2.Id
+                let! p2 = repo.GetById j2.Id
+                p2.Value.Status |> should equal ScheduleStatus.Paused
+
+                do! repo.Resume j2.Id
+                let! r2 = repo.GetById j2.Id
+                r2.Value.Status |> should equal ScheduleStatus.Active
+                r2.Value.NextRun |> should not' (be None)
+                r2.Value.NextRun.Value |> should be (greaterThan DateTimeOffset.UtcNow)
+
+                do! repo.Pause j2.Id
+                let! p3 = repo.GetById j2.Id
+                p3.Value.Status |> should equal ScheduleStatus.Paused
+            })
+    finally
+        deleteDir dir
+
+[<Fact>]
+let ``remove deletes job and its runs`` () =
+    let dir = makeTempDir ()
+    let dbPath = Path.Combine(dir, "phos.db")
+
+    try
+        withExecutor dbPath (fun exec ->
+            task {
+                let repo = Repositories.scheduleJobRepository exec
+                let! job = repo.Insert (mkDraft None (Some 3600) CatchUpOnce) None
+                do! repo.Confirm job.Id
+                let! confirmed = repo.GetById job.Id
+                let nextRun = confirmed.Value.NextRun.Value
+                let! claim = repo.ClaimDueOccurrence(nextRun.AddSeconds 5.0)
+                claim |> should not' (be None)
+                runsCount exec job.Id |> should be (greaterThan 0)
+
+                do! repo.Remove job.Id
+                let! gone = repo.GetById job.Id
+                gone |> should equal None
+                runsCount exec job.Id |> should equal 0
+            })
+    finally
+        deleteDir dir
+
+[<Fact>]
+let ``expire pending expires only old pending jobs`` () =
+    let dir = makeTempDir ()
+    let dbPath = Path.Combine(dir, "phos.db")
+
+    try
+        withExecutor dbPath (fun exec ->
+            task {
+                let repo = Repositories.scheduleJobRepository exec
+                let! oldJob = repo.Insert (mkDraft None (Some 3600) SkipMissed) None
+                let! recentJob = repo.Insert (mkDraft None (Some 3600) SkipMissed) None
+                let! activeJob = repo.Insert (mkDraft None (Some 3600) SkipMissed) None
+                do! repo.Confirm activeJob.Id
+                let now = DateTimeOffset.UtcNow
+
+                do!
+                    exec.WriteAsync(fun conn ->
+                        use cmd = conn.CreateCommand()
+                        cmd.CommandText <- "UPDATE schedule_jobs SET created_at = $old WHERE id = $id;"
+
+                        cmd.Parameters.AddWithValue("$old", now.AddHours(-2.0).ToUnixTimeSeconds())
+                        |> ignore
+
+                        cmd.Parameters.AddWithValue("$id", oldJob.Id) |> ignore
+                        cmd.ExecuteNonQuery() |> ignore
+                        ())
+
+                let! expired = repo.ExpirePending now (now.AddHours(-1.0))
+                expired |> should equal 1
+
+                let! o = repo.GetById oldJob.Id
+                o.Value.Status |> should equal ScheduleStatus.Expired
+                let! r = repo.GetById recentJob.Id
+                r.Value.Status |> should equal ScheduleStatus.Pending
+                let! a = repo.GetById activeJob.Id
+                a.Value.Status |> should equal ScheduleStatus.Active
+            })
+    finally
+        deleteDir dir
+
+[<Fact>]
+let ``pause due to errors pauses active job and records error`` () =
+    let dir = makeTempDir ()
+    let dbPath = Path.Combine(dir, "phos.db")
+
+    try
+        withExecutor dbPath (fun exec ->
+            task {
+                let repo = Repositories.scheduleJobRepository exec
+                let! job = repo.Insert (mkDraft None (Some 3600) SkipMissed) None
+                do! repo.Confirm job.Id
+                do! repo.PauseDueToErrors job.Id "boom"
+                let! after = repo.GetById job.Id
+                after.Value.Status |> should equal ScheduleStatus.Paused
+                after.Value.LastError |> should equal (Some "boom")
+            })
+    finally
+        deleteDir dir
+
+[<Fact>]
+let ``claim due occurrence enqueues exactly one command`` () =
+    let dir = makeTempDir ()
+    let dbPath = Path.Combine(dir, "phos.db")
+
+    try
+        withExecutor dbPath (fun exec ->
+            task {
+                let repo = Repositories.scheduleJobRepository exec
+                let! job = repo.Insert (mkDraft None (Some 3600) CatchUpOnce) None
+                do! repo.Confirm job.Id
+                let! confirmed = repo.GetById job.Id
+                let nextRun = confirmed.Value.NextRun.Value
+                let now = nextRun.AddSeconds 5.0
+
+                let! claim = repo.ClaimDueOccurrence now
+                claim |> should not' (be None)
+                claim.Value.CommandId |> should be (greaterThan 0L)
+                claim.Value.ScheduledFor |> should equal nextRun
+
+                let cmd = queryCommand exec claim.Value.CommandId
+                cmd |> should not' (be None)
+                let (origin, priority, payload, extKey) = cmd.Value
+                origin |> should equal "schedule"
+                priority |> should equal 10
+                payload |> should equal "remind me"
+                extKey |> should equal (sprintf "sched:%d:%d" job.Id nextRun.UtcTicks)
+
+                let run = queryRun exec job.Id nextRun
+                run |> should not' (be None)
+                let (runStatus, runCommandId) = run.Value
+                runStatus |> should equal "claimed"
+                runCommandId |> should equal claim.Value.CommandId
+
+                let! after = repo.GetById job.Id
+                after.Value.NextRun |> should not' (be None)
+                after.Value.NextRun.Value |> should be (greaterThan nextRun)
+                after.Value.LastRunAt |> should not' (be None)
+
+                let! claim2 = repo.ClaimDueOccurrence now
+                claim2 |> should equal None
+                commandCount exec |> should equal 1
+            })
+    finally
+        deleteDir dir
+
+[<Fact>]
+let ``claim skips missed occurrence under skip catchup`` () =
+    let dir = makeTempDir ()
+    let dbPath = Path.Combine(dir, "phos.db")
+
+    try
+        withExecutor dbPath (fun exec ->
+            task {
+                let repo = Repositories.scheduleJobRepository exec
+                let! job = repo.Insert (mkDraft None (Some 3600) SkipMissed) None
+                do! repo.Confirm job.Id
+                let! confirmed = repo.GetById job.Id
+                let nextRun = confirmed.Value.NextRun.Value
+                let now = nextRun.AddSeconds 5.0
+
+                let! claim = repo.ClaimDueOccurrence now
+                claim |> should equal None
+                commandCount exec |> should equal 0
+
+                let! after = repo.GetById job.Id
+                after.Value.NextRun |> should not' (be None)
+                after.Value.NextRun.Value |> should be (greaterThan nextRun)
+                after.Value.LastRunAt |> should equal None
+            })
+    finally
+        deleteDir dir
+
+[<Fact>]
+let ``claim catch up once fires then returns none`` () =
+    let dir = makeTempDir ()
+    let dbPath = Path.Combine(dir, "phos.db")
+
+    try
+        withExecutor dbPath (fun exec ->
+            task {
+                let repo = Repositories.scheduleJobRepository exec
+                let! job = repo.Insert (mkDraft None (Some 3600) CatchUpOnce) None
+                do! repo.Confirm job.Id
+                let! confirmed = repo.GetById job.Id
+                let nextRun = confirmed.Value.NextRun.Value
+                let now = nextRun.AddSeconds 5.0
+
+                let! claim = repo.ClaimDueOccurrence now
+                claim |> should not' (be None)
+
+                let! claim2 = repo.ClaimDueOccurrence now
+                claim2 |> should equal None
+                commandCount exec |> should equal 1
+            })
+    finally
+        deleteDir dir
+
+[<Fact>]
+let ``claim due exactly on time fires under skip catchup`` () =
+    let dir = makeTempDir ()
+    let dbPath = Path.Combine(dir, "phos.db")
+
+    try
+        withExecutor dbPath (fun exec ->
+            task {
+                let repo = Repositories.scheduleJobRepository exec
+                let! job = repo.Insert (mkDraft None (Some 3600) SkipMissed) None
+                do! repo.Confirm job.Id
+                let! confirmed = repo.GetById job.Id
+                let nextRun = confirmed.Value.NextRun.Value
+
+                let! claim = repo.ClaimDueOccurrence nextRun
+                claim |> should not' (be None)
+                commandCount exec |> should equal 1
+            })
+    finally
+        deleteDir dir
+
+[<Fact>]
+let ``claim due cron job enqueues command`` () =
+    let dir = makeTempDir ()
+    let dbPath = Path.Combine(dir, "phos.db")
+
+    try
+        withExecutor dbPath (fun exec ->
+            task {
+                let repo = Repositories.scheduleJobRepository exec
+                let! job = repo.Insert (mkDraft (Some "0 9 * * *") None CatchUpOnce) None
+                do! repo.Confirm job.Id
+                let! confirmed = repo.GetById job.Id
+                let nextRun = confirmed.Value.NextRun.Value
+
+                let! claim = repo.ClaimDueOccurrence(nextRun.AddSeconds 5.0)
+                claim |> should not' (be None)
+                claim.Value.ScheduledFor |> should equal nextRun
+                commandCount exec |> should equal 1
+                runsCount exec job.Id |> should equal 1
+
+                let! after = repo.GetById job.Id
+                after.Value.NextRun |> should not' (be None)
+                after.Value.NextRun.Value |> should be (greaterThan nextRun)
+            })
+    finally
+        deleteDir dir
+
+[<Fact>]
+let ``claim returns none when no job is due`` () =
+    let dir = makeTempDir ()
+    let dbPath = Path.Combine(dir, "phos.db")
+
+    try
+        withExecutor dbPath (fun exec ->
+            task {
+                let repo = Repositories.scheduleJobRepository exec
+                // Pending (not confirmed) is not active.
+                let! _ = repo.Insert (mkDraft None (Some 3600) SkipMissed) None
+                // Confirmed but next_run is in the future.
+                let! j2 = repo.Insert (mkDraft None (Some 3600) SkipMissed) None
+                do! repo.Confirm j2.Id
+
+                let! claim = repo.ClaimDueOccurrence DateTimeOffset.UtcNow
+                claim |> should equal None
+                commandCount exec |> should equal 0
+            })
+    finally
+        deleteDir dir
+
+[<Fact>]
+let ``find by tool call id returns job or none`` () =
+    let dir = makeTempDir ()
+    let dbPath = Path.Combine(dir, "phos.db")
+
+    try
+        withExecutor dbPath (fun exec ->
+            task {
+                let repo = Repositories.scheduleJobRepository exec
+                let! _ = repo.Insert (mkDraft None (Some 3600) SkipMissed) (Some "tool-1")
+
+                let! found = repo.FindByToolCallId "tool-1"
+                found |> should not' (be None)
+                found.Value.Prompt |> should equal "remind me"
+
+                let! missing = repo.FindByToolCallId "tool-none"
+                missing |> should equal None
+            })
+    finally
+        deleteDir dir
+
+[<Fact>]
+let ``run now makes an active job due immediately`` () =
+    let dir = makeTempDir ()
+    let dbPath = Path.Combine(dir, "phos.db")
+
+    try
+        withExecutor dbPath (fun exec ->
+            task {
+                let repo = Repositories.scheduleJobRepository exec
+                let! job = repo.Insert (mkDraft None (Some 3600) CatchUpOnce) None
+                do! repo.Confirm job.Id
+                do! repo.RunNow job.Id
+                let! claim = repo.ClaimDueOccurrence DateTimeOffset.UtcNow
+                claim |> should not' (be None)
+                claim.Value.Job.Id |> should equal job.Id
             })
     finally
         deleteDir dir

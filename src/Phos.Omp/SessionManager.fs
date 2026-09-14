@@ -146,7 +146,13 @@ type SessionManager
             try
                 match RpcProtocol.classify frame with
                 | FrameKind.HostToolCall ->
-                    let! result = hostTools.TryExecute frame
+                    let! result =
+                        hostTools.TryExecute(
+                            rt.UserId,
+                            rt.CurrentCommand |> Option.map (fun c -> c.Envelope.ChatId),
+                            rt.CurrentCommand |> Option.map (fun c -> c.Envelope.Origin),
+                            frame
+                        )
 
                     match result with
                     | Some resFrame ->
