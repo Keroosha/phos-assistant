@@ -1250,6 +1250,20 @@ let private tableColumns (exec: StorageExecutor) (table: string) : string list =
         List.ofSeq cols)
     |> fun t -> t.GetAwaiter().GetResult()
 
+let private columnNotNull (exec: StorageExecutor) (table: string) (column: string) : int =
+    exec.ReadAsync(fun conn ->
+        use cmd = conn.CreateCommand()
+        cmd.CommandText <- sprintf "PRAGMA table_info(%s);" table
+        use reader = cmd.ExecuteReader()
+        let mutable notnull = -1
+
+        while reader.Read() do
+            if reader.GetString 1 = column then
+                notnull <- reader.GetInt32 3
+
+        notnull)
+    |> fun t -> t.GetAwaiter().GetResult()
+
 let private indexExists (exec: StorageExecutor) (name: string) : bool =
     exec.ReadAsync(fun conn ->
         use cmd = conn.CreateCommand()
@@ -1348,6 +1362,16 @@ let ``migration 10 adds after_seconds column`` () =
                 let cols = tableColumns exec "schedule_jobs"
                 cols |> List.contains "after_seconds" |> should be True
             })
+    finally
+        deleteDir dir
+
+[<Fact>]
+let ``migration 11 makes cron_expr nullable`` () =
+    let dir = makeTempDir ()
+    let dbPath = Path.Combine(dir, "phos.db")
+
+    try
+        withExecutor dbPath (fun exec -> task { columnNotNull exec "schedule_jobs" "cron_expr" |> should equal 0 })
     finally
         deleteDir dir
 

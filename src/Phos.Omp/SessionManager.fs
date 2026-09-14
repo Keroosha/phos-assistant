@@ -233,7 +233,20 @@ type SessionManager
                 rt.Process <- Some proc
                 rt.Client <- Some client
 
-                client.EventReceived.Add(fun frame -> handleEvent rt frame |> ignore)
+                client.EventReceived.Add(fun frame ->
+                    let t = handleEvent rt frame
+
+                    t.ContinueWith(
+                        (fun (t: Task) ->
+                            if t.IsFaulted then
+                                logger.LogError(
+                                    t.Exception,
+                                    "omp event handling failed for user {UserId}",
+                                    userInt rt.UserId
+                                )),
+                        TaskContinuationOptions.OnlyOnFaulted
+                    )
+                    |> ignore)
 
                 client.ParseError.Add(fun e -> logger.LogWarning("omp parse error: {Error}", e))
 

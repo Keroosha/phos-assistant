@@ -385,14 +385,20 @@ type HostToolExecutor
                     // Duplicate call: replay cached result without repeating the side effect.
                     return Some(buildResult id text isError)
                 | _ ->
-                    let! outcome = execute userId chatId origin toolCallId toolName args
+                    try
+                        let! outcome = execute userId chatId origin toolCallId toolName args
 
-                    match outcome with
-                    | Ok text ->
-                        cache[toolCallId] <- (text, false)
-                        return Some(buildResult id text false)
-                    | Error msg ->
+                        match outcome with
+                        | Ok text ->
+                            cache[toolCallId] <- (text, false)
+                            return Some(buildResult id text false)
+                        | Error msg ->
+                            cache[toolCallId] <- (msg, true)
+                            logger.LogWarning("host tool {Tool} failed: {Error}", toolName, msg)
+                            return Some(buildResult id msg true)
+                    with ex ->
+                        logger.LogError(ex, "host tool {Tool} threw", toolName)
+                        let msg = sprintf "внутренняя ошибка: %s" ex.Message
                         cache[toolCallId] <- (msg, true)
-                        logger.LogWarning("host tool {Tool} failed: {Error}", toolName, msg)
                         return Some(buildResult id msg true)
         }

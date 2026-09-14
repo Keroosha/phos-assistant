@@ -198,7 +198,7 @@ type CreateScheduleJobs() =
             .NotNullable()
             .WithColumn("cron_expr")
             .AsString()
-            .Nullable()
+            .NotNullable()
             .WithColumn("timezone")
             .AsString()
             .NotNullable()
@@ -393,6 +393,72 @@ type AddScheduleAfterSeconds() =
 
     override this.Down() =
         this.Delete.Column("after_seconds").FromTable("schedule_jobs") |> ignore
+
+[<Migration(11L)>]
+type MakeScheduleCronNullable() =
+    inherit Migration()
+
+    // SQLite cannot change a column's nullability via ALTER, so both Up and Down
+    // rebuild the table with the desired `cron_expr` constraint and copy the data.
+    member private this.Rebuild(cronNotNullable: bool, tempTable: string) =
+        let cronExpr = if cronNotNullable then "TEXT NOT NULL" else "TEXT"
+
+        this.Execute.Sql(
+            sprintf
+                """CREATE TABLE %s (
+                        id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                        user_id INTEGER NOT NULL,
+                        cron_expr %s,
+                        timezone TEXT NOT NULL,
+                        prompt TEXT NOT NULL,
+                        catchup_policy TEXT NOT NULL DEFAULT 'skip',
+                        next_run INTEGER,
+                        created_at INTEGER NOT NULL,
+                        updated_at INTEGER NOT NULL,
+                        chat_id INTEGER NOT NULL DEFAULT 0,
+                        interval_seconds INTEGER,
+                        status TEXT NOT NULL DEFAULT 'pending',
+                        origin_tool_call_id TEXT,
+                        last_run_at INTEGER,
+                        last_error TEXT,
+                        after_seconds INTEGER
+                    )"""
+                tempTable
+                cronExpr
+        )
+        |> ignore
+
+        this.Execute.Sql(
+            sprintf
+                """INSERT INTO %s
+                        (id, user_id, cron_expr, timezone, prompt, catchup_policy, next_run,
+                         created_at, updated_at, chat_id, interval_seconds, status,
+                         origin_tool_call_id, last_run_at, last_error, after_seconds)
+                    SELECT id, user_id, cron_expr, timezone, prompt, catchup_policy, next_run,
+                         created_at, updated_at, chat_id, interval_seconds, status,
+                         origin_tool_call_id, last_run_at, last_error, after_seconds
+                    FROM schedule_jobs"""
+                tempTable
+        )
+        |> ignore
+
+        this.Execute.Sql("DROP TABLE schedule_jobs") |> ignore
+
+        this.Execute.Sql(sprintf "ALTER TABLE %s RENAME TO schedule_jobs" tempTable)
+        |> ignore
+
+        this.Execute.Sql(
+            "CREATE UNIQUE INDEX ux_schedule_jobs_origin_tool_call_id ON schedule_jobs (origin_tool_call_id ASC)"
+        )
+        |> ignore
+
+    override this.Up() =
+        // One-shot (after_seconds) and interval jobs carry no cron expression;
+        // the historical migration 4 shipped cron_expr NOT NULL, so existing
+        // databases still enforce it — rebuild the table with a nullable column.
+        this.Rebuild(false, "schedule_jobs_new")
+
+    override this.Down() = this.Rebuild(true, "schedule_jobs_old")
 
 // ---------------------------------------------------------------------------
 // Runner

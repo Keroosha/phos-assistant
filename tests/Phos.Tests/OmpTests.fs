@@ -3131,6 +3131,43 @@ let ``schedule_add with after_seconds creates one-shot pending job`` () =
     }
 
 [<Fact>]
+let ``throwing host tool returns isError result frame`` () =
+    task {
+        let repo = FakeScheduleRepo()
+        repo.ThrowOnInsert
+
+        let executor =
+            HostToolExecutor(
+                FakeTransport(),
+                FakeVoiceProcessor(Ok "hi"),
+                repo,
+                defaultQuota,
+                NullLogger<HostToolExecutor>.Instance
+            )
+
+        let frame = JsonObject()
+        frame["type"] <- "host_tool_call"
+        frame["id"] <- "host_throw"
+        frame["toolCallId"] <- "toolu_throw"
+        frame["toolName"] <- "schedule_add"
+        let args = JsonObject()
+        args["prompt"] <- "напиши"
+        args["after_seconds"] <- 300
+        args["timezone"] <- "UTC"
+        frame["arguments"] <- (args :> JsonNode)
+
+        let! result = executor.TryExecute(UserId 1L, Some(ChatId 1L), Some Telegram, frame)
+
+        match result with
+        | Some r ->
+            Json.getBool "isError" r |> should equal (Some true)
+            Assert.Contains("внутренняя ошибка", hostToolResultText r)
+        | None -> failwith "expected a result frame for throwing host tool"
+
+        repo.InsertCount |> should equal 0
+    }
+
+[<Fact>]
 let ``schedule_add rejects over quota`` () =
     task {
         let repo = FakeScheduleRepo()
