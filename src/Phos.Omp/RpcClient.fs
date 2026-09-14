@@ -26,7 +26,10 @@ type IOmpRpcClient =
     /// Sends a raw frame (e.g. `host_tool_result`, `host_uri_result`) with no
     /// response correlation.
     abstract SendRawAsync: frame: JsonObject -> Task<unit>
-    abstract PromptAsync: message: string * ?streamingBehavior: string -> Task<Result<JsonNode, RpcError>>
+
+    abstract PromptAsync:
+        message: string * ?streamingBehavior: string * ?images: string list -> Task<Result<JsonNode, RpcError>>
+
     abstract AbortAsync: unit -> Task<Result<JsonNode, RpcError>>
     abstract AbortAndPromptAsync: message: string -> Task<Result<JsonNode, RpcError>>
     abstract FollowUpAsync: message: string -> Task<Result<JsonNode, RpcError>>
@@ -221,10 +224,27 @@ type OmpRpcClient(proc: Process, logger: ILogger, ?readyFrame: JsonObject) =
 
         member _.SendRawAsync(frame: JsonObject) : Task<unit> = task { writeFrame frame |> ignore }
 
-        member _.PromptAsync(message: string, ?streamingBehavior: string) : Task<Result<JsonNode, RpcError>> =
+        member _.PromptAsync
+            (message: string, ?streamingBehavior: string, ?images: string list)
+            : Task<Result<JsonNode, RpcError>> =
             let payload = JsonObject()
             payload["message"] <- message
             streamingBehavior |> Option.iter (fun sb -> payload["streamingBehavior"] <- sb)
+
+            images
+            |> Option.iter (fun imgs ->
+                if not (List.isEmpty imgs) then
+                    let arr = JsonArray()
+
+                    for b64 in imgs do
+                        let item = JsonObject()
+                        item["type"] <- "image"
+                        item["data"] <- b64
+                        item["mimeType"] <- "image/jpeg"
+                        arr.Add(item)
+
+                    payload["images"] <- (arr :> JsonNode))
+
             send "prompt" payload None
 
         member _.AbortAsync() : Task<Result<JsonNode, RpcError>> = send "abort" (JsonObject()) None

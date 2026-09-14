@@ -286,7 +286,8 @@ let private validEntityGen (maxOffset: int) : Gen<Entity> =
     |> Gen.map (fun ((offset, length), kind) ->
         { Offset = offset
           Length = min length (maxOffset - offset)
-          Kind = kind })
+          Kind = kind
+          Url = None })
 
 let private chunkInputGen: Gen<int * string * Entity list> =
     Gen.zip (Gen.choose (1, 64)) (Gen.zip stringGen (Gen.listOf (validEntityGen 64)))
@@ -348,7 +349,12 @@ let ``chunk fences are balanced`` () =
 
 [<Fact>]
 let ``chunk splits an entity crossing a boundary`` () =
-    let entities = [ { Offset = 0; Length = 7; Kind = Bold } ]
+    let entities =
+        [ { Offset = 0
+            Length = 7
+            Kind = Bold
+            Url = None } ]
+
     let chunks = chunk 4 "abcdefgh" entities
 
     let flattened =
@@ -356,6 +362,26 @@ let ``chunk splits an entity crossing a boundary`` () =
         |> List.map (fun c -> c.Entities |> List.map (fun e -> e.Offset, e.Length, e.Kind))
 
     flattened |> should equal [ [ (0, 4, Bold) ]; [ (0, 3, Bold) ] ]
+
+[<Fact>]
+let ``chunk rebase carries Url across a split entity`` () =
+    let entities =
+        [ { Offset = 0
+            Length = 7
+            Kind = TextUrl
+            Url = Some "https://example.com" } ]
+
+    let chunks = chunk 4 "abcdefgh" entities
+
+    let flattened =
+        chunks
+        |> List.map (fun c -> c.Entities |> List.map (fun e -> e.Offset, e.Length, e.Kind, e.Url))
+
+    flattened
+    |> should
+        equal
+        [ [ (0, 4, TextUrl, Some "https://example.com") ]
+          [ (0, 3, TextUrl, Some "https://example.com") ] ]
 
 [<Fact>]
 let ``chunk fences are never cut`` () =

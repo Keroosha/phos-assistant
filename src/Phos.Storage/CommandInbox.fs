@@ -1,6 +1,7 @@
 namespace Phos.Storage
 
 open System
+open System.Text.Json
 open System.Threading.Tasks
 open Microsoft.Data.Sqlite
 open Phos.Core
@@ -14,7 +15,8 @@ type CommandEnvelope =
       UserId: UserId
       ChatId: ChatId
       Payload: string
-      Priority: int }
+      Priority: int
+      Images: string list }
 
 /// A claim lease for a command.
 type Lease =
@@ -89,6 +91,31 @@ type CommandInbox(exec: StorageExecutor) =
         )
         |> ignore
 
+    /// Encodes the base64 image list to the inbox's JSON text column. An empty
+    /// list is stored as an empty string (round-trips back to `[]`).
+    let encodeImages (images: string list) : string =
+        if List.isEmpty images then
+            ""
+        else
+            JsonSerializer.Serialize(images)
+
+    /// Decodes the JSON text column back into the image list. Missing/NULL/empty
+    /// values become `[]`; any parse failure is treated as `[]` so a corrupt row
+    /// never blocks the worker.
+    let decodeImages (s: string) : string list =
+        if String.IsNullOrWhiteSpace s then
+            []
+        else
+            try
+                use doc = JsonDocument.Parse(s)
+
+                [ for el in doc.RootElement.EnumerateArray() do
+                      match Option.ofObj (el.GetString()) with
+                      | Some v -> yield v
+                      | None -> () ]
+            with _ ->
+                []
+
     let readCommand (reader: SqliteDataReader) : Command =
         let id = reader.GetInt64 0
         let origin = originOfString (reader.GetString 1)
@@ -97,21 +124,22 @@ type CommandInbox(exec: StorageExecutor) =
         let cid = ChatId(reader.GetInt64 4)
         let payload = reader.GetString 5
         let priority = reader.GetInt32 6
-        let status = statusOfString (reader.GetString 7)
-        let attempts = reader.GetInt32 8
-        let maxAttempts = reader.GetInt32 9
+        let images = decodeImages (if reader.IsDBNull 7 then "" else reader.GetString 7)
+        let status = statusOfString (reader.GetString 8)
+        let attempts = reader.GetInt32 9
+        let maxAttempts = reader.GetInt32 10
 
         let leaseUntil =
-            if reader.IsDBNull 10 then
-                None
-            else
-                Some(fromUnix (reader.GetInt64 10))
-
-        let heartbeatAt =
             if reader.IsDBNull 11 then
                 None
             else
                 Some(fromUnix (reader.GetInt64 11))
+
+        let heartbeatAt =
+            if reader.IsDBNull 12 then
+                None
+            else
+                Some(fromUnix (reader.GetInt64 12))
 
         { Id = id
           Envelope =
@@ -120,7 +148,8 @@ type CommandInbox(exec: StorageExecutor) =
               UserId = uid
               ChatId = cid
               Payload = payload
-              Priority = priority }
+              Priority = priority
+              Images = images }
           Status = status
           Attempts = attempts
           MaxAttempts = maxAttempts
@@ -132,7 +161,7 @@ type CommandInbox(exec: StorageExecutor) =
 
         cmd.CommandText <-
             """
-            SELECT id, origin, external_key, user_id, chat_id, payload, priority, status, attempts, max_attempts, lease_until, heartbeat_at
+            SELECT id, origin, external_key, user_id, chat_id, payload, priority, images, status, attempts, max_attempts, lease_until, heartbeat_at
             FROM command_inbox WHERE id = $id;
         """
 
@@ -148,8 +177,8 @@ type CommandInbox(exec: StorageExecutor) =
 
                 cmd.CommandText <-
                     """
-                    INSERT INTO command_inbox(origin, external_key, user_id, chat_id, payload, priority, status, created_at, updated_at)
-                    VALUES ($origin, $externalKey, $userId, $chatId, $payload, $priority, 'pending', $now, $now)
+                    INSERT INTO command_inbox(origin, external_key, user_id, chat_id, payload, priority, images, status, created_at, updated_at)
+                    VALUES ($origin, $externalKey, $userId, $chatId, $payload, $priority, $images, 'pending', $now, $now)
                     ON CONFLICT(external_key) DO NOTHING
                     RETURNING id;
                 """
@@ -160,6 +189,7 @@ type CommandInbox(exec: StorageExecutor) =
                 cmd.Parameters.AddWithValue("$chatId", chatId env.ChatId) |> ignore
                 cmd.Parameters.AddWithValue("$payload", env.Payload) |> ignore
                 cmd.Parameters.AddWithValue("$priority", env.Priority) |> ignore
+                cmd.Parameters.AddWithValue("$images", encodeImages env.Images) |> ignore
 
                 cmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToUnixTimeSeconds())
                 |> ignore

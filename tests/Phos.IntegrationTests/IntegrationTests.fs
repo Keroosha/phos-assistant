@@ -98,7 +98,8 @@ let private mkCommand (id: int64) (chatId: int64) (payload: string) : Command =
           UserId = UserId 1L
           ChatId = ChatId chatId
           Payload = payload
-          Priority = 0 }
+          Priority = 0
+          Images = [] }
       Status = Inbox.Status.Pending
       Attempts = 0
       MaxAttempts = 5
@@ -111,13 +112,14 @@ let private mkEnvelope (userId: int64) (chatId: int64) (payload: string) : Comma
       UserId = UserId userId
       ChatId = ChatId chatId
       Payload = payload
-      Priority = 0 }
+      Priority = 0
+      Images = [] }
 
 // ---------------------------------------------------------------------------
 // Fake transport / voice / client / outbox
 // ---------------------------------------------------------------------------
 
-type FakeTransport(?voiceBytes: byte[]) =
+type FakeTransport(?voiceBytes: byte[], ?photoBytes: byte[]) =
     let mutable sendCount = 0
     let mutable editCount = 0
     let mutable sentText = ""
@@ -144,6 +146,9 @@ type FakeTransport(?voiceBytes: byte[]) =
 
         member _.DownloadVoice(_: VoiceRef) =
             task { return defaultArg voiceBytes [||] }
+
+        member _.DownloadPhoto(_: PhotoRef) =
+            task { return defaultArg photoBytes [||] }
 
         member _.SetReaction (_: ChatId) (_: int64) (_: string) = Task.FromResult(())
 
@@ -233,7 +238,9 @@ type FakeRpcClient(sessionId: string) =
 
         member _.SendRawAsync(_: JsonObject) : Task<unit> = Task.FromResult(())
 
-        member _.PromptAsync(message: string, ?streamingBehavior: string) : Task<Result<JsonNode, RpcError>> =
+        member _.PromptAsync
+            (message: string, ?streamingBehavior: string, ?images: string list)
+            : Task<Result<JsonNode, RpcError>> =
             prompts.Add(message)
             promptCount <- promptCount + 1
             Task.FromResult(Ok(JsonObject() :> JsonNode))
@@ -285,8 +292,10 @@ type RecordingRpcClient(inner: IOmpRpcClient, states: ResizeArray<JsonObject>) =
 
         member _.SendRawAsync(frame: JsonObject) : Task<unit> = inner.SendRawAsync frame
 
-        member _.PromptAsync(message: string, ?streamingBehavior: string) : Task<Result<JsonNode, RpcError>> =
-            inner.PromptAsync(message, ?streamingBehavior = streamingBehavior)
+        member _.PromptAsync
+            (message: string, ?streamingBehavior: string, ?images: string list)
+            : Task<Result<JsonNode, RpcError>> =
+            inner.PromptAsync(message, ?streamingBehavior = streamingBehavior, ?images = images)
 
         member _.AbortAsync() : Task<Result<JsonNode, RpcError>> = inner.AbortAsync()
 

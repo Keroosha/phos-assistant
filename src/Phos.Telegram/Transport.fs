@@ -17,7 +17,8 @@ type BotInfo =
 type TelegramEntity =
     { Offset: int
       Length: int
-      Kind: EntityKind }
+      Kind: EntityKind
+      Url: string option }
 
 /// A message to send, with a stable MTProto `random_id`.
 type SendTarget =
@@ -41,6 +42,12 @@ type VoiceRef =
       MessageId: int64
       FileReference: byte[]
       AccessHash: int64 }
+
+/// Reference to a Telegram photo to download.
+type PhotoRef =
+    { ChatId: ChatId
+      MessageId: int64
+      Photo: TL.Photo }
 
 /// Credentials and session location for the bot transport.
 type TelegramConfig =
@@ -89,7 +96,15 @@ module Transport =
             | Italic -> TL.MessageEntityItalic() :> TL.MessageEntity
             | Code -> TL.MessageEntityCode() :> TL.MessageEntity
             | Pre -> TL.MessageEntityPre() :> TL.MessageEntity
-            | TextUrl -> TL.MessageEntityTextUrl() :> TL.MessageEntity
+            | TextUrl ->
+                let e = TL.MessageEntityTextUrl()
+
+                e.url <-
+                    (match entity.Url with
+                     | Some u -> u
+                     | None -> "")
+
+                e :> TL.MessageEntity
             | Mention -> TL.MessageEntityMention() :> TL.MessageEntity
             | Hashtag -> TL.MessageEntityHashtag() :> TL.MessageEntity
             | Unknown -> TL.MessageEntityUnknown() :> TL.MessageEntity
@@ -107,6 +122,7 @@ module Transport =
 
         if not (List.isEmpty target.Entities) then
             req.entities <- target.Entities |> List.map toTLMessageEntity |> List.toArray
+            req.flags <- req.flags ||| TL.Methods.Messages_SendMessage.Flags.has_entities
 
         req
 
@@ -122,8 +138,14 @@ module Transport =
         req.id <- int messageId
         req.message <- text
 
+        // `message` is an optional field gated by `flags.11` (has_message = 2048)
+        // in the TL schema; with flags left at zero it is never serialized and
+        // the edit silently no-ops. Always set it.
+        req.flags <- req.flags ||| TL.Methods.Messages_EditMessage.Flags.has_message
+
         if not (List.isEmpty entities) then
             req.entities <- entities |> List.map toTLMessageEntity |> List.toArray
+            req.flags <- req.flags ||| TL.Methods.Messages_EditMessage.Flags.has_entities
 
         req
 
@@ -247,5 +269,6 @@ type ITelegramTransport =
     abstract SendMessage: SendTarget -> TaskResult<SendResult, SendError>
     abstract EditMessage: ChatId -> int64 -> string -> TelegramEntity list -> Task<unit>
     abstract DownloadVoice: VoiceRef -> Task<byte[]>
+    abstract DownloadPhoto: PhotoRef -> Task<byte[]>
     abstract SetReaction: ChatId -> int64 -> string -> Task<unit>
     abstract SetTyping: ChatId -> Task<unit>

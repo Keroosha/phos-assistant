@@ -12,10 +12,13 @@ type EntityKind =
     | Unknown
 
 /// A message entity, with offsets measured in UTF-16 code units.
+/// `Url` carries the destination URL for `TextUrl` entities (e.g. a markdown
+/// link); it is `None` for all other kinds.
 type Entity =
     { Offset: int
       Length: int
-      Kind: EntityKind }
+      Kind: EntityKind
+      Url: string option }
 
 /// A chunk of the original text plus its rebased entities and fence state.
 type Chunk =
@@ -29,7 +32,7 @@ type Chunk =
 /// Invariants:
 /// - each `Chunk.Text` is at most `maxUnits` code units;
 /// - entity offsets/lengths are rebased into chunk-local coordinates (entities that
-///   cross a chunk boundary are split, keeping the same `Kind`);
+///   cross a chunk boundary are split, keeping the same `Kind` and `Url`);
 /// - ``` fences are never cut: a split inside a fence closes the fence in the current
 ///   chunk (`FenceClosed`) and reopens it in the next (`FenceOpened`);
 /// - for fence-free text the concatenation of `Chunk.Text` equals the original `text`.
@@ -119,7 +122,8 @@ let chunk (maxUnits: int) (text: string) (entities: Entity list) : Chunk list =
                     Some
                         { Offset = (eStart - chunkStart) + prefixLen
                           Length = eEnd - eStart
-                          Kind = e.Kind }
+                          Kind = e.Kind
+                          Url = e.Url }
                 else
                     None)
 

@@ -74,7 +74,8 @@ let private mkEnvelope (key: string) : CommandEnvelope =
       UserId = UserId 1L
       ChatId = ChatId 1L
       Payload = "payload"
-      Priority = 0 }
+      Priority = 0
+      Images = [] }
 
 // ---------------------------------------------------------------------------
 // Migrations
@@ -302,7 +303,8 @@ let ``parallel writes are all committed without loss`` () =
                                 UserId = UserId 1L
                                 ChatId = ChatId 1L
                                 Payload = sprintf "payload-%d" i
-                                Priority = 0 } ]
+                                Priority = 0
+                                Images = [] } ]
 
                 let! _ = Task.WhenAll(tasks)
                 let! count = inbox.CountPending()
@@ -483,6 +485,34 @@ let ``committed command survives executor close and reopen`` () =
             finally
                 dispose exec2
         }
+    finally
+        deleteDir dir
+
+[<Fact>]
+let ``command inbox images round trip`` () =
+    let dir = makeTempDir ()
+    let dbPath = Path.Combine(dir, "phos.db")
+
+    try
+        withExecutor dbPath (fun exec ->
+            task {
+                let inbox = Repositories.commandInbox exec
+                let images = [ "AQID"; "BAUG" ]
+
+                let! _ =
+                    inbox.Insert
+                        { Origin = Telegram
+                          ExternalKey = Some "img-key"
+                          UserId = UserId 1L
+                          ChatId = ChatId 1L
+                          Payload = "смотри"
+                          Priority = 0
+                          Images = images }
+
+                let! c = inbox.ClaimNextForChat (ChatId 1L) (lease ())
+                c |> Option.isSome |> should be True
+                c.Value.Envelope.Images |> should equal images
+            })
     finally
         deleteDir dir
 
@@ -767,16 +797,53 @@ let ``outbox entities roundtrip through insert and read`` () =
                 let entities: Phos.Core.Chunker.Entity list =
                     [ { Offset = 0
                         Length = 8
-                        Kind = Phos.Core.Chunker.Bold }
+                        Kind = Phos.Core.Chunker.Bold
+                        Url = None }
                       { Offset = 10
                         Length = 6
-                        Kind = Phos.Core.Chunker.Italic } ]
+                        Kind = Phos.Core.Chunker.Italic
+                        Url = None } ]
 
                 let! id = outbox.Insert 1L 0 (ChatId 1L) 42L "**bold** *italic*" entities
 
                 id |> should not' (equal 0L)
 
                 let! byRandom = outbox.GetByRandomId 42L
+                byRandom |> should not' (be None)
+                byRandom.Value.Entities |> should equal entities
+
+                let! next = outbox.NextPending()
+                next |> should not' (be None)
+                next.Value.Entities |> should equal entities
+            })
+    finally
+        deleteDir dir
+
+[<Fact>]
+let ``outbox roundtrips TextUrl entities with their url`` () =
+    let dir = makeTempDir ()
+    let dbPath = Path.Combine(dir, "phos.db")
+
+    try
+        withExecutor dbPath (fun exec ->
+            task {
+                let outbox = Repositories.messageOutbox exec
+
+                let entities: Phos.Core.Chunker.Entity list =
+                    [ { Offset = 0
+                        Length = 27
+                        Kind = Phos.Core.Chunker.TextUrl
+                        Url = Some "https://example.com" }
+                      { Offset = 30
+                        Length = 4
+                        Kind = Phos.Core.Chunker.Bold
+                        Url = None } ]
+
+                let! id = outbox.Insert 1L 0 (ChatId 1L) 77L "[text](https://example.com) **x**" entities
+
+                id |> should not' (equal 0L)
+
+                let! byRandom = outbox.GetByRandomId 77L
                 byRandom |> should not' (be None)
                 byRandom.Value.Entities |> should equal entities
 
@@ -824,7 +891,8 @@ let ``command origins round trip through claim`` () =
                               UserId = UserId 1L
                               ChatId = ChatId 2L
                               Payload = "p"
-                              Priority = 0 }
+                              Priority = 0
+                              Images = [] }
 
                     ()
 
@@ -1041,7 +1109,8 @@ let ``raw database bytes do not contain sentinel secret`` () =
                           UserId = UserId 1L
                           ChatId = ChatId 1L
                           Payload = "hello"
-                          Priority = 0 }
+                          Priority = 0
+                          Images = [] }
 
                 do! exec.CheckpointNow()
                 let dbBytes = File.ReadAllBytes dbPath
@@ -1107,7 +1176,8 @@ let private mkEnvFor (chatId: int64) (key: string) : CommandEnvelope =
       UserId = UserId 1L
       ChatId = ChatId chatId
       Payload = "payload"
-      Priority = 0 }
+      Priority = 0
+      Images = [] }
 
 [<Fact>]
 let ``list pending chat ids returns distinct chats with pending work`` () =

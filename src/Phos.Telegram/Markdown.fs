@@ -16,10 +16,12 @@ open Phos.Core.Chunker
 ///   - ``` fences (``` or ```lang ... ```) -> Pre spanning the WHOLE fenced
 ///     block, including the opening fence, language line, content and closing
 ///     fence (renders as one Telegram code block)
+///   - `[text](url)` -> TextUrl carrying the destination URL
 ///
-/// Links `[text](url)` are intentionally NOT parsed — they remain plaintext so
-/// Telegram renders the raw text. Unmatched markers are emitted as literal text
-/// with no entity.
+/// Links `[text](url)` are parsed into a `TextUrl` entity whose `Url` is the
+/// destination. Links are not parsed inside code spans or fenced blocks (those
+/// are consumed first). Unmatched markers are emitted as literal text with no
+/// entity.
 module Markdown =
 
     /// True when `p` begins a fence delimiter: exactly three backticks that are
@@ -86,7 +88,8 @@ module Markdown =
                     entities.Add
                         { Offset = i
                           Length = close + 3 - i
-                          Kind = Pre }
+                          Kind = Pre
+                          Url = None }
 
                     i <- close + 3
                 | None ->
@@ -100,7 +103,8 @@ module Markdown =
                     entities.Add
                         { Offset = i
                           Length = close + 1 - i
-                          Kind = Code }
+                          Kind = Code
+                          Url = None }
 
                     i <- close + 1
                 | None -> i <- i + 1
@@ -113,7 +117,8 @@ module Markdown =
                     entities.Add
                         { Offset = i
                           Length = close + 2 - i
-                          Kind = Bold }
+                          Kind = Bold
+                          Url = None }
 
                     i <- close + 2
                 else
@@ -125,10 +130,35 @@ module Markdown =
                     entities.Add
                         { Offset = i
                           Length = close + 1 - i
-                          Kind = Italic }
+                          Kind = Italic
+                          Url = None }
 
                     i <- close + 1
                 | None -> i <- i + 1
+            elif c = '[' then
+                // Markdown link `[text](url)`. The `](` must be a single unit
+                // (the `]` immediately preceding the `(`), so unrelated `]`
+                // later in the text never swallows a preceding `[`.
+                let labelClose = text.IndexOf(']', i + 1)
+
+                if labelClose >= 0 && labelClose + 1 < n && text.[labelClose + 1] = '(' then
+                    let urlStart = labelClose + 2
+                    let close = text.IndexOf(')', urlStart)
+
+                    if close >= 0 then
+                        let url = text.Substring(urlStart, close - urlStart)
+
+                        entities.Add
+                            { Offset = i
+                              Length = close + 1 - i
+                              Kind = TextUrl
+                              Url = Some url }
+
+                        i <- close + 1
+                    else
+                        i <- i + 1
+                else
+                    i <- i + 1
             else
                 i <- i + 1
 

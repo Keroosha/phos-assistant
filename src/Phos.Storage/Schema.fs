@@ -312,6 +312,19 @@ type AddOutboxEntities() =
     override this.Down() =
         this.Delete.Column("entities").FromTable("message_outbox") |> ignore
 
+[<Migration(8L)>]
+type AddCommandInboxImages() =
+    inherit Migration()
+
+    override this.Up() =
+        // Images (base64) accompanying a command are stored as a JSON text
+        // column; an empty list is stored as an empty string.
+        this.Alter.Table("command_inbox").AddColumn("images").AsString().Nullable()
+        |> ignore
+
+    override this.Down() =
+        this.Delete.Column("images").FromTable("command_inbox") |> ignore
+
 // ---------------------------------------------------------------------------
 // Runner
 // ---------------------------------------------------------------------------

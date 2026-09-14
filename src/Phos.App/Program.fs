@@ -231,7 +231,8 @@ let main (argv: string[]) : int =
                     dedupe,
                     admit,
                     enqueueOutbox,
-                    sp.GetRequiredService<IVoiceProcessor>()
+                    sp.GetRequiredService<IVoiceProcessor>(),
+                    sp.GetRequiredService<ITelegramTransport>()
                 ))
             |> ignore
 

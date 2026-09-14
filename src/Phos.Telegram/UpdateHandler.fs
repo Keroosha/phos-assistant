@@ -43,7 +43,8 @@ type UpdateHandler
         dedupe: UpdateDedupe,
         admit: CommandEnvelope -> Task<AdmitOutcome>,
         enqueueOutbox: OutboxEnvelope -> Task<unit>,
-        voice: IVoiceProcessor
+        voice: IVoiceProcessor,
+        transport: ITelegramTransport
     ) =
 
     let greetingText = "Привет! Я phos, твой ассистент в Telegram."
@@ -79,56 +80,100 @@ type UpdateHandler
                 match authorize whitelist update.From update.Chat with
                 | Deny reason -> return Denied reason
                 | Allow role ->
-                    match update.Text with
-                    | Some text when text.StartsWith "/start" ->
-                        let record =
-                            { Id = update.From.Id
-                              Username = update.From.Username
-                              Role = role
-                              WorkspacePath = workspacePath update.From.Id
-                              Timezone = None }
+                    if update.IsSticker then
+                        // A sticker is feedback-only: react with 👀 and never
+                        // admit a command. The reaction is best-effort — a
+                        // transport failure must never block the handler.
+                        try
+                            do! transport.SetReaction update.Chat.Id update.MessageId "👀"
+                        with _ ->
+                            ()
 
-                        do! users.Upsert record
-                        do! enqueueReply update.UpdateId update.Chat greetingText
                         return Accepted
-                    | Some text when text.StartsWith "/ping" ->
-                        do! enqueueReply update.UpdateId update.Chat "pong"
-                        return Accepted
-                    | _ ->
-                        match update.Voice with
-                        | Some v ->
-                            let! result = voice.ProcessAsync v
+                    elif update.Photo.IsSome then
+                        let photo = update.Photo.Value
 
-                            match result with
-                            | Ok text ->
-                                let envelope =
-                                    { Origin = Telegram
-                                      ExternalKey = Some(sprintf "tg:%d" update.UpdateId)
-                                      UserId = update.From.Id
-                                      ChatId = update.Chat.Id
-                                      Payload = text
-                                      Priority = 0 }
+                        let! bytesOpt =
+                            task {
+                                try
+                                    let! b = transport.DownloadPhoto photo
+                                    return Some b
+                                with _ ->
+                                    return None
+                            }
 
-                                let! outcome = admit envelope
-
-                                match outcome with
-                                | Admitted _ -> return Accepted
-                                | Failed -> return AdmitFailed
-                            | Error msg ->
-                                do! enqueueReply update.UpdateId update.Chat ("⚠️ " + msg)
-                                return Accepted
-                        | None ->
+                        match bytesOpt with
+                        | Some bytes ->
                             let envelope =
                                 { Origin = Telegram
                                   ExternalKey = Some(sprintf "tg:%d" update.UpdateId)
                                   UserId = update.From.Id
                                   ChatId = update.Chat.Id
                                   Payload = update.Text |> Option.defaultValue ""
-                                  Priority = 0 }
+                                  Priority = 0
+                                  Images = [ Convert.ToBase64String bytes ] }
 
                             let! outcome = admit envelope
 
                             match outcome with
                             | Admitted _ -> return Accepted
                             | Failed -> return AdmitFailed
+                        | None ->
+                            do! enqueueReply update.UpdateId update.Chat "⚠️ не удалось скачать фото"
+                            return Accepted
+                    else
+                        match update.Text with
+                        | Some text when text.StartsWith "/start" ->
+                            let record =
+                                { Id = update.From.Id
+                                  Username = update.From.Username
+                                  Role = role
+                                  WorkspacePath = workspacePath update.From.Id
+                                  Timezone = None }
+
+                            do! users.Upsert record
+                            do! enqueueReply update.UpdateId update.Chat greetingText
+                            return Accepted
+                        | Some text when text.StartsWith "/ping" ->
+                            do! enqueueReply update.UpdateId update.Chat "pong"
+                            return Accepted
+                        | _ ->
+                            match update.Voice with
+                            | Some v ->
+                                let! result = voice.ProcessAsync v
+
+                                match result with
+                                | Ok text ->
+                                    let envelope =
+                                        { Origin = Telegram
+                                          ExternalKey = Some(sprintf "tg:%d" update.UpdateId)
+                                          UserId = update.From.Id
+                                          ChatId = update.Chat.Id
+                                          Payload = text
+                                          Priority = 0
+                                          Images = [] }
+
+                                    let! outcome = admit envelope
+
+                                    match outcome with
+                                    | Admitted _ -> return Accepted
+                                    | Failed -> return AdmitFailed
+                                | Error msg ->
+                                    do! enqueueReply update.UpdateId update.Chat ("⚠️ " + msg)
+                                    return Accepted
+                            | None ->
+                                let envelope =
+                                    { Origin = Telegram
+                                      ExternalKey = Some(sprintf "tg:%d" update.UpdateId)
+                                      UserId = update.From.Id
+                                      ChatId = update.Chat.Id
+                                      Payload = update.Text |> Option.defaultValue ""
+                                      Priority = 0
+                                      Images = [] }
+
+                                let! outcome = admit envelope
+
+                                match outcome with
+                                | Admitted _ -> return Accepted
+                                | Failed -> return AdmitFailed
         }

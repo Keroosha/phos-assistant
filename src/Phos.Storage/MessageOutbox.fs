@@ -70,7 +70,8 @@ type MessageOutbox(exec: StorageExecutor) =
                 |> List.map (fun e ->
                     {| offset = e.Offset
                        length = e.Length
-                       kind = e.Kind.ToString() |})
+                       kind = e.Kind.ToString()
+                       url = e.Url |> Option.toObj |})
 
             JsonSerializer.Serialize(items)
 
@@ -96,9 +97,18 @@ type MessageOutbox(exec: StorageExecutor) =
                           | "Hashtag" -> EntityKind.Hashtag
                           | _ -> EntityKind.Unknown
 
+                      let url =
+                          match el.TryGetProperty("url") with
+                          | true, p when p.ValueKind = JsonValueKind.String ->
+                              match p.GetString() with
+                              | null -> None
+                              | s -> Some s
+                          | _ -> None
+
                       { Offset = el.GetProperty("offset").GetInt32()
                         Length = el.GetProperty("length").GetInt32()
-                        Kind = kind } ]
+                        Kind = kind
+                        Url = url } ]
             with _ ->
                 []
 

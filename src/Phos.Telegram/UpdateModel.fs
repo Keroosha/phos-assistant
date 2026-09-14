@@ -11,7 +11,10 @@ type IncomingUpdate =
       Chat: Chat
       From: User
       Text: string option
-      Voice: VoiceRef option }
+      Voice: VoiceRef option
+      MessageId: int64
+      Photo: PhotoRef option
+      IsSticker: bool }
 
 /// Mappers from WTelegramClient update/message objects to `IncomingUpdate`.
 module UpdateModel =
@@ -59,6 +62,38 @@ module UpdateModel =
             | _ -> None
         | _ -> None
 
+    /// Extracts a `PhotoRef` from a photo message, if any.
+    let private tryPhoto (m: TL.Message) (chat: Chat) : PhotoRef option =
+        match m.media with
+        | :? TL.MessageMediaPhoto as media ->
+            match media.photo with
+            | :? TL.Photo as p ->
+                Some
+                    { ChatId = chat.Id
+                      MessageId = int64 m.id
+                      Photo = p }
+            | _ -> None
+        | _ -> None
+
+    /// True when the document is a sticker: either it carries a
+    /// `DocumentAttributeSticker`, or its mime type is `image/webp`.
+    let private isStickerDocument (doc: TL.Document) : bool =
+        let hasStickerAttribute =
+            not (isNull doc.attributes)
+            && doc.attributes |> Array.exists (fun a -> a :? TL.DocumentAttributeSticker)
+
+        let mime = if isNull doc.mime_type then "" else doc.mime_type
+        hasStickerAttribute || mime.StartsWith "image/webp"
+
+    /// True when the message is a sticker (a document with a sticker attribute).
+    let private isStickerMessage (m: TL.Message) : bool =
+        match m.media with
+        | :? TL.MessageMediaDocument as media ->
+            match media.document with
+            | :? TL.Document as doc -> isStickerDocument doc
+            | _ -> false
+        | _ -> false
+
     /// Maps a `TL.MessageBase` to an `IncomingUpdate`, if it is a user message
     /// the bot can act on. Service messages and channel posts are ignored.
     let tryMapMessage (message: TL.MessageBase) : IncomingUpdate option =
@@ -79,6 +114,8 @@ module UpdateModel =
             match chat, fromId with
             | Some chat, Some uid ->
                 let voice = tryVoice m chat
+                let photo = tryPhoto m chat
+                let isSticker = isStickerMessage m
 
                 let text =
                     if String.IsNullOrEmpty m.message then
@@ -94,7 +131,10 @@ module UpdateModel =
                           Username = None
                           Role = User }
                       Text = text
-                      Voice = voice }
+                      Voice = voice
+                      MessageId = int64 m.id
+                      Photo = photo
+                      IsSticker = isSticker }
             | _ -> None
         | _ -> None
 

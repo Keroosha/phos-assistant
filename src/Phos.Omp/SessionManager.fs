@@ -113,7 +113,7 @@ type SessionManager
                 rt.CurrentCommand <- Some command
                 rt.Busy <- true
                 let message = command.Envelope.Payload
-                let! result = client.PromptAsync message
+                let! result = client.PromptAsync(message, images = command.Envelope.Images)
 
                 match result with
                 | Ok _ -> ()

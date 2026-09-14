@@ -99,7 +99,7 @@ let private deleteDir (dir: string) =
     with _ ->
         ()
 
-let private mkCommand (id: int64) (chatId: int64) (payload: string) : Command =
+let private mkCommandWithImages (id: int64) (chatId: int64) (payload: string) (images: string list) : Command =
     { Id = id
       Envelope =
         { Origin = Telegram
@@ -107,18 +107,22 @@ let private mkCommand (id: int64) (chatId: int64) (payload: string) : Command =
           UserId = UserId 1L
           ChatId = ChatId chatId
           Payload = payload
-          Priority = 0 }
+          Priority = 0
+          Images = images }
       Status = Inbox.Status.Pending
       Attempts = 0
       MaxAttempts = 5
       LeaseUntil = None
       HeartbeatAt = None }
 
+let private mkCommand (id: int64) (chatId: int64) (payload: string) : Command =
+    mkCommandWithImages id chatId payload []
+
 // ---------------------------------------------------------------------------
 // Fake transport / voice / client / process
 // ---------------------------------------------------------------------------
 
-type FakeTransport(?voiceBytes: byte[]) =
+type FakeTransport(?voiceBytes: byte[], ?photoBytes: byte[]) =
     let mutable sendCount = 0
     let mutable editCount = 0
     let mutable typingCount = 0
@@ -146,6 +150,9 @@ type FakeTransport(?voiceBytes: byte[]) =
 
         member _.DownloadVoice(_: VoiceRef) =
             task { return defaultArg voiceBytes [||] }
+
+        member _.DownloadPhoto(_: PhotoRef) =
+            task { return defaultArg photoBytes [||] }
 
         member _.SetReaction (_: ChatId) (messageId: int64) (emoji: string) =
             reactions.Add(messageId, emoji)
@@ -179,6 +186,7 @@ type FakeRpcClient(sessionId: string) =
     let mutable promptCount = 0
     let mutable disposed = false
     let prompts = ResizeArray<string>()
+    let imagePrompts = ResizeArray<string list>()
 
     let stateObj () : JsonObject =
         let state = JsonObject()
@@ -191,6 +199,7 @@ type FakeRpcClient(sessionId: string) =
     member _.AbortCount = abortCount
     member _.PromptCount = promptCount
     member _.Prompts = prompts
+    member _.ImagePrompts = List.ofSeq imagePrompts
     member _.IsDisposed = disposed
     member _.RaiseEvent(frame: JsonObject) = eventReceived.Trigger frame
 
@@ -208,8 +217,11 @@ type FakeRpcClient(sessionId: string) =
 
         member _.SendRawAsync(_: JsonObject) : Task<unit> = Task.FromResult(())
 
-        member _.PromptAsync(message: string, ?streamingBehavior: string) : Task<Result<JsonNode, RpcError>> =
+        member _.PromptAsync
+            (message: string, ?streamingBehavior: string, ?images: string list)
+            : Task<Result<JsonNode, RpcError>> =
             prompts.Add(message)
+            imagePrompts.Add(defaultArg images [])
             promptCount <- promptCount + 1
             Task.FromResult(Ok(JsonObject() :> JsonNode))
 
@@ -294,7 +306,9 @@ type ScriptedRpcClient() =
 
         member _.SendRawAsync(_: JsonObject) : Task<unit> = Task.FromResult(())
 
-        member _.PromptAsync(_: string, ?streamingBehavior: string) : Task<Result<JsonNode, RpcError>> =
+        member _.PromptAsync
+            (_: string, ?streamingBehavior: string, ?images: string list)
+            : Task<Result<JsonNode, RpcError>> =
             promptCount <- promptCount + 1
             Task.FromResult(promptResult)
 
@@ -1105,6 +1119,31 @@ let ``prompt enqueues when busy and rejects when queue full`` () =
     }
 
 [<Fact>]
+let ``prompt passes command images to the rpc client`` () =
+    task {
+        let fakeProc = FakeOmpProcess()
+        let client = FakeRpcClient("sess-img")
+        let spawn (_: OmpProcessOptions) : Result<IOmpProcess, string> = Ok(fakeProc :> IOmpProcess)
+        let createClient (_: Process) (_: JsonObject) : IOmpRpcClient = client :> IOmpRpcClient
+        let nowFn () = DateTimeOffset.UtcNow
+        let turnEnded (_: int64) : Task<unit> = Task.FromResult(())
+        let sm = createSessionManager spawn createClient turnEnded nowFn
+        let user = UserId 1L
+
+        let! _ = sm.EnsureRuntime user
+        let cmd = mkCommandWithImages 1L 1L "что на фото?" [ "AQID" ]
+
+        let! r = sm.Prompt(user, cmd)
+
+        match r with
+        | Ok() -> ()
+        | Error e -> failwithf "expected ok, got %s" e
+
+        client.PromptCount |> should equal 1
+        client.ImagePrompts |> should equal [ [ "AQID" ] ]
+    }
+
+[<Fact>]
 let ``respawns with resume after process exit`` () =
     task {
         let fakeProc = FakeOmpProcess()
@@ -1822,7 +1861,8 @@ let ``worker acknowledges accepted command with eyes reaction`` () =
                   UserId = UserId 1L
                   ChatId = ChatId chatId
                   Payload = "привет"
-                  Priority = 0 }
+                  Priority = 0
+                  Images = [] }
 
         do! worker.ProcessCommandForTest cmd
         transport.Reactions |> should haveCount 1
@@ -1848,7 +1888,8 @@ let ``worker stop aborts and completes command`` () =
                   UserId = UserId 1L
                   ChatId = ChatId 1L
                   Payload = "/stop"
-                  Priority = 0 }
+                  Priority = 0
+                  Images = [] }
 
         do! worker.ProcessCommandForTest cmd
         sessions.AbortCount |> should equal 1
@@ -1871,7 +1912,8 @@ let ``worker prompt marks command started`` () =
                   UserId = UserId 1L
                   ChatId = ChatId 1L
                   Payload = "hello"
-                  Priority = 0 }
+                  Priority = 0
+                  Images = [] }
 
         do! worker.ProcessCommandForTest cmd
         sessions.PromptCalls |> should equal 1
@@ -1894,7 +1936,8 @@ let ``worker prompt error fails and retries`` () =
                   UserId = UserId 1L
                   ChatId = ChatId 1L
                   Payload = "hello"
-                  Priority = 0 }
+                  Priority = 0
+                  Images = [] }
 
         do! worker.ProcessCommandForTest cmd
         let c = (inbox.GetById(cmd.Id).GetAwaiter().GetResult()) |> Option.get
@@ -1917,7 +1960,8 @@ let ``worker queue full leaves command durable`` () =
                   UserId = UserId 1L
                   ChatId = ChatId 1L
                   Payload = "hello"
-                  Priority = 0 }
+                  Priority = 0
+                  Images = [] }
 
         do! worker.ProcessCommandForTest cmd
         let c = (inbox.GetById(cmd.Id).GetAwaiter().GetResult()) |> Option.get
@@ -2049,7 +2093,8 @@ let ``worker scan loop claims and processes pending chat`` () =
               UserId = UserId 1L
               ChatId = ChatId 1L
               Payload = "/stop"
-              Priority = 0 }
+              Priority = 0
+              Images = [] }
         |> ignore
 
         use cts = new CancellationTokenSource()
@@ -2347,6 +2392,8 @@ let ``uri resolver returns error on download failure`` () =
                 member _.DownloadVoice(_: VoiceRef) =
                     task { return failwith "download exploded" }
 
+                member _.DownloadPhoto(_: PhotoRef) = task { return [||] }
+
                 member _.SetReaction (_: ChatId) (_: int64) (_: string) = Task.FromResult(())
 
                 member _.SetTyping(_: ChatId) = Task.FromResult(()) }
@@ -2594,6 +2641,8 @@ let ``executor maps flood wait to an error`` () =
                 member _.EditMessage (_: ChatId) (_: int64) (_: string) (_: TelegramEntity list) = Task.FromResult(())
                 member _.DownloadVoice(_: VoiceRef) = task { return [||] }
 
+                member _.DownloadPhoto(_: PhotoRef) = task { return [||] }
+
                 member _.SetReaction (_: ChatId) (_: int64) (_: string) = Task.FromResult(())
 
                 member _.SetTyping(_: ChatId) = Task.FromResult(()) }
@@ -2631,6 +2680,8 @@ let ``executor maps slowmode wait to an error`` () =
                 member _.SendMessage(_: SendTarget) = task { return Error(SlowModeWait 7) }
                 member _.EditMessage (_: ChatId) (_: int64) (_: string) (_: TelegramEntity list) = Task.FromResult(())
                 member _.DownloadVoice(_: VoiceRef) = task { return [||] }
+
+                member _.DownloadPhoto(_: PhotoRef) = task { return [||] }
 
                 member _.SetReaction (_: ChatId) (_: int64) (_: string) = Task.FromResult(())
 

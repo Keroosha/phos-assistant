@@ -86,6 +86,16 @@ type TelegramTransport(config: TelegramConfig) =
             | None -> return Array.empty
         }
 
+    let downloadPhotoCore (photo: PhotoRef) : Task<byte[]> =
+        task {
+            // Pick the largest size by area; `PhotoSizeBase` exposes Width/Height.
+            let size = photo.Photo.sizes |> Array.maxBy (fun s -> s.Width * s.Height)
+
+            use stream = new MemoryStream()
+            let! _ = client.DownloadFileAsync(photo.Photo, stream, size, null)
+            return stream.ToArray()
+        }
+
     let setReactionCore (chat: ChatId) (messageId: int64) (emoji: string) : Task<unit> =
         task {
             let peer = Transport.resolvePeer peers chat
@@ -117,6 +127,7 @@ type TelegramTransport(config: TelegramConfig) =
             editMessageCore chat messageId text entities
 
         member _.DownloadVoice(voice) = downloadVoiceCore voice
+        member _.DownloadPhoto(photo) = downloadPhotoCore photo
 
         member _.SetReaction (chat) (messageId) (emoji) = setReactionCore chat messageId emoji
 
