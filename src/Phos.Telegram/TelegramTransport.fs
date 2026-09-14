@@ -112,6 +112,49 @@ type TelegramTransport(config: TelegramConfig) =
             return ()
         }
 
+    let getMessageSummaryCore (chat: ChatId) (messageId: int64) : Task<MessageSummary option> =
+        task {
+            let peer = Transport.resolvePeer peers chat
+
+            let inputMessage = TL.InputMessageID()
+            inputMessage.id <- int messageId
+
+            let! messages = client.GetMessages(peer, [| inputMessage :> TL.InputMessage |])
+
+            return
+                messages.Messages
+                |> Array.tryFind (fun m -> m.ID = int messageId)
+                |> Option.map Transport.classifyMessage
+        }
+
+    let getHistoryCore (chat: ChatId) (beforeId: int64) (limit: int) : Task<HistoryEntry list> =
+        task {
+            let peer = Transport.resolvePeer peers chat
+            let req = Transport.buildGetHistoryRequest peer beforeId limit
+            let! result = client.Invoke(req)
+
+            return
+                match result with
+                | :? TL.Messages_Messages as mm ->
+                    mm.messages
+                    |> Array.map (fun m ->
+                        let fromBot =
+                            match m with
+                            | :? TL.Message as msg ->
+                                match msg.from_id with
+                                | :? TL.PeerUser as pu -> pu.user_id = client.UserId
+                                | _ -> false
+                            | _ -> false
+
+                        { Id = int64 m.ID
+                          FromBot = fromBot
+                          Date = DateTimeOffset m.Date
+                          Summary = Transport.classifyMessage m })
+                    |> List.ofArray
+                    |> List.rev
+                | _ -> []
+        }
+
     member _.OnUpdate(handler: TL.UpdatesBase -> Task<unit>) : unit =
         client.add_OnUpdates (fun (updates: TL.UpdatesBase) ->
             task {
@@ -132,3 +175,7 @@ type TelegramTransport(config: TelegramConfig) =
         member _.SetReaction (chat) (messageId) (emoji) = setReactionCore chat messageId emoji
 
         member _.SetTyping(chat) = typingCore chat
+
+        member _.GetMessageSummary (chat) (messageId) = getMessageSummaryCore chat messageId
+
+        member _.GetHistory (chat) (beforeId) (limit) = getHistoryCore chat beforeId limit

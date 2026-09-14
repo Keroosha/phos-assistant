@@ -72,6 +72,41 @@ type UpdateHandler
                 index <- index + 1
         }
 
+    /// Resolves a short human-readable summary of the message this update replies
+    /// to, so the bot can see its own context in the prompt. Any transport
+    /// failure degrades to `None` (no prefix) rather than blocking the admit.
+    let replyContext (chat: ChatId) (replyToId: int64) : Task<string option> =
+        task {
+            try
+                let! s = transport.GetMessageSummary chat replyToId
+
+                return
+                    match s with
+                    | Some(MessageSummary.Text t) -> Some t
+                    | Some MessageSummary.Voice -> Some "🎤 голосовое сообщение"
+                    | Some MessageSummary.Photo -> Some "📷 фото"
+                    | Some MessageSummary.Other -> Some "сообщение"
+                    | None -> None
+            with _ ->
+                return None
+        }
+
+    /// Builds the admit payload, prefixing the reply-context when the update is
+    /// a reply to an earlier message. Existing payload behavior is unchanged when
+    /// there is no reply (or the replied message cannot be resolved).
+    let replyPayload (update: IncomingUpdate) (basePayload: string) : Task<string> =
+        task {
+            let! replyText =
+                match update.ReplyToMessageId with
+                | Some rid -> replyContext update.Chat.Id rid
+                | None -> task { return None }
+
+            return
+                match replyText with
+                | Some ctx -> sprintf "[в ответ на: %s]\n\n%s" ctx basePayload
+                | None -> basePayload
+        }
+
     member _.HandleAsync(update: IncomingUpdate) : Task<HandleResult> =
         task {
             if not (dedupe.TryAdd update.UpdateId) then
@@ -104,12 +139,14 @@ type UpdateHandler
 
                         match bytesOpt with
                         | Some bytes ->
+                            let! payload = replyPayload update (update.Text |> Option.defaultValue "")
+
                             let envelope =
                                 { Origin = Telegram
                                   ExternalKey = Some(sprintf "tg:%d" update.UpdateId)
                                   UserId = update.From.Id
                                   ChatId = update.Chat.Id
-                                  Payload = update.Text |> Option.defaultValue ""
+                                  Payload = payload
                                   Priority = 0
                                   Images = [ Convert.ToBase64String bytes ] }
 
@@ -144,12 +181,14 @@ type UpdateHandler
 
                                 match result with
                                 | Ok text ->
+                                    let! payload = replyPayload update text
+
                                     let envelope =
                                         { Origin = Telegram
                                           ExternalKey = Some(sprintf "tg:%d" update.UpdateId)
                                           UserId = update.From.Id
                                           ChatId = update.Chat.Id
-                                          Payload = text
+                                          Payload = payload
                                           Priority = 0
                                           Images = [] }
 
@@ -162,12 +201,14 @@ type UpdateHandler
                                     do! enqueueReply update.UpdateId update.Chat ("⚠️ " + msg)
                                     return Accepted
                             | None ->
+                                let! payload = replyPayload update (update.Text |> Option.defaultValue "")
+
                                 let envelope =
                                     { Origin = Telegram
                                       ExternalKey = Some(sprintf "tg:%d" update.UpdateId)
                                       UserId = update.From.Id
                                       ChatId = update.Chat.Id
-                                      Payload = update.Text |> Option.defaultValue ""
+                                      Payload = payload
                                       Priority = 0
                                       Images = [] }
 

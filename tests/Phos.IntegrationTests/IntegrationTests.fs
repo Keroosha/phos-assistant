@@ -154,6 +154,10 @@ type FakeTransport(?voiceBytes: byte[], ?photoBytes: byte[]) =
 
         member _.SetTyping(_: ChatId) = Task.FromResult(())
 
+        member _.GetMessageSummary _ _ = task { return None }
+
+        member _.GetHistory _ _ _ = task { return [] }
+
 type FakeVoiceProcessor(result: Result<string, string>) =
     interface IVoiceProcessor with
         member _.ProcessAsync(_: VoiceRef) = task { return result }

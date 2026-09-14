@@ -122,15 +122,28 @@ let private mkCommand (id: int64) (chatId: int64) (payload: string) : Command =
 // Fake transport / voice / client / process
 // ---------------------------------------------------------------------------
 
-type FakeTransport(?voiceBytes: byte[], ?photoBytes: byte[]) =
+type FakeTransport
+    (?voiceBytes: byte[], ?photoBytes: byte[], ?summaryResult: MessageSummary option, ?historyResult: HistoryEntry list)
+    =
     let mutable sendCount = 0
     let mutable editCount = 0
     let mutable typingCount = 0
+    let mutable summary = defaultArg summaryResult None
+    let mutable history = defaultArg historyResult []
     let reactions = ResizeArray<int64 * string>()
+    let historyCalls = ResizeArray<ChatId * int64 * int>()
     member _.SendCount = sendCount
     member _.EditCount = editCount
     member _.TypingCount = typingCount
     member _.Reactions = reactions
+
+    member _.Summary
+        with set (v: MessageSummary option) = summary <- v
+
+    member _.History
+        with set (v: HistoryEntry list) = history <- v
+
+    member _.HistoryCalls = List.ofSeq historyCalls
 
     interface ITelegramTransport with
         member _.Login() =
@@ -161,6 +174,14 @@ type FakeTransport(?voiceBytes: byte[], ?photoBytes: byte[]) =
         member _.SetTyping(_: ChatId) =
             typingCount <- typingCount + 1
             Task.FromResult(())
+
+        member _.GetMessageSummary _ _ = task { return summary }
+
+        member _.GetHistory (chat: ChatId) (beforeId: int64) (limit: int) =
+            task {
+                historyCalls.Add(chat, beforeId, limit)
+                return history
+            }
 
 type FakeVoiceProcessor(result: Result<string, string>) =
     interface IVoiceProcessor with
@@ -733,6 +754,110 @@ let ``uri resolver reads voice as base64 and rejects write`` () =
         match result2 with
         | Some r2 -> Json.getBool "isError" r2 |> should equal (Some true)
         | None -> failwith "expected a result frame #5"
+    }
+
+[<Fact>]
+let ``host uri history read returns json`` () =
+    task {
+        let date = DateTimeOffset(2026, 9, 14, 18, 0, 0, TimeSpan.Zero)
+
+        let history =
+            [ { Id = 123L
+                FromBot = false
+                Date = date
+                Summary = MessageSummary.Text "привет" }
+              { Id = 124L
+                FromBot = true
+                Date = date
+                Summary = MessageSummary.Voice } ]
+
+        let transport = FakeTransport(historyResult = history)
+        let resolver = HostUriResolver(transport, NullLogger<HostUriResolver>.Instance)
+
+        let frame = JsonObject()
+        frame["type"] <- "host_uri_request"
+        frame["id"] <- "uri_h"
+        frame["operation"] <- "read"
+        frame["url"] <- "tg://history/42?limit=5&before=0"
+
+        let! result = resolver.TryResolve frame
+
+        match result with
+        | Some r ->
+            Json.getString "type" r |> should equal (Some "host_uri_result")
+            Json.getString "contentType" r |> should equal (Some "application/json")
+
+            let content = Json.getString "content" r |> Option.defaultValue ""
+
+            match JsonNode.Parse content with
+            | :? JsonArray as arr ->
+                arr.Count |> should equal 2
+
+                match arr.[0] with
+                | :? JsonObject as first ->
+                    Json.getInt64 "id" first |> should equal (Some 123L)
+                    Json.getBool "fromBot" first |> should equal (Some false)
+                    Json.getString "text" first |> should equal (Some "привет")
+                    Json.getString "date" first |> should equal (Some "2026-09-14T18:00:00Z")
+                | _ -> failwithf "expected history entry 0 to be an object: %A" arr.[0]
+
+                match arr.[1] with
+                | :? JsonObject as second ->
+                    Json.getInt64 "id" second |> should equal (Some 124L)
+                    Json.getString "kind" second |> should equal (Some "voice")
+                | _ -> failwithf "expected history entry 1 to be an object: %A" arr.[1]
+            | _ -> failwith "expected a JSON array in history"
+        | None -> failwithf "expected history result frame (read): %A" result
+    }
+
+[<Fact>]
+let ``host uri history parses limit and before`` () =
+    task {
+        let transport = FakeTransport(historyResult = [])
+        let resolver = HostUriResolver(transport, NullLogger<HostUriResolver>.Instance)
+
+        let frame = JsonObject()
+        frame["type"] <- "host_uri_request"
+        frame["id"] <- "uri_h2"
+        frame["operation"] <- "read"
+        frame["url"] <- "tg://history/42?limit=7&before=99"
+
+        let! result = resolver.TryResolve frame
+
+        match result with
+        | Some _ -> ()
+        | None -> failwithf "expected history result frame (parse): %A" result
+
+        transport.HistoryCalls |> should equal [ (ChatId 42L, 99L, 7) ]
+    }
+
+[<Fact>]
+let ``host uri history defaults and clamps limit`` () =
+    task {
+        let transport = FakeTransport(historyResult = [])
+        let resolver = HostUriResolver(transport, NullLogger<HostUriResolver>.Instance)
+
+        // No query: limit defaults to 50, before to 0.
+        let frame = JsonObject()
+        frame["type"] <- "host_uri_request"
+        frame["id"] <- "uri_h3"
+        frame["operation"] <- "read"
+        frame["url"] <- "tg://history/7"
+
+        let! _ = resolver.TryResolve frame
+        transport.HistoryCalls |> should equal [ (ChatId 7L, 0L, 50) ]
+
+        // Limit above the Telegram maximum is clamped to 100.
+        let frame2 = JsonObject()
+        frame2["type"] <- "host_uri_request"
+        frame2["id"] <- "uri_h4"
+        frame2["operation"] <- "read"
+        frame2["url"] <- "tg://history/7?limit=200"
+
+        let! _ = resolver.TryResolve frame2
+
+        transport.HistoryCalls
+        |> should equal [ (ChatId 7L, 0L, 50); (ChatId 7L, 0L, 100) ]
     }
 
 // ---------------------------------------------------------------------------
@@ -2396,7 +2521,11 @@ let ``uri resolver returns error on download failure`` () =
 
                 member _.SetReaction (_: ChatId) (_: int64) (_: string) = Task.FromResult(())
 
-                member _.SetTyping(_: ChatId) = Task.FromResult(()) }
+                member _.SetTyping(_: ChatId) = Task.FromResult(())
+
+                member _.GetMessageSummary _ _ = task { return None }
+
+                member _.GetHistory _ _ _ = task { return [] } }
 
         let resolver = HostUriResolver(transport, NullLogger<HostUriResolver>.Instance)
         let frame = JsonObject()
@@ -2645,7 +2774,11 @@ let ``executor maps flood wait to an error`` () =
 
                 member _.SetReaction (_: ChatId) (_: int64) (_: string) = Task.FromResult(())
 
-                member _.SetTyping(_: ChatId) = Task.FromResult(()) }
+                member _.SetTyping(_: ChatId) = Task.FromResult(())
+
+                member _.GetMessageSummary _ _ = task { return None }
+
+                member _.GetHistory _ _ _ = task { return [] } }
 
         let executor =
             HostToolExecutor(transport, FakeVoiceProcessor(Ok "hi"), NullLogger<HostToolExecutor>.Instance)
@@ -2685,7 +2818,11 @@ let ``executor maps slowmode wait to an error`` () =
 
                 member _.SetReaction (_: ChatId) (_: int64) (_: string) = Task.FromResult(())
 
-                member _.SetTyping(_: ChatId) = Task.FromResult(()) }
+                member _.SetTyping(_: ChatId) = Task.FromResult(())
+
+                member _.GetMessageSummary _ _ = task { return None }
+
+                member _.GetHistory _ _ _ = task { return [] } }
 
         let executor =
             HostToolExecutor(transport, FakeVoiceProcessor(Ok "hi"), NullLogger<HostToolExecutor>.Instance)

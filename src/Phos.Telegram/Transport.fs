@@ -49,6 +49,26 @@ type PhotoRef =
       MessageId: int64
       Photo: TL.Photo }
 
+/// A short human-readable summary of a single Telegram message.
+///
+/// `[<RequireQualifiedAccess>]` keeps the `Text`/`Voice`/`Photo`/`Other` cases
+/// out of unqualified scope: `Other` would otherwise clash with
+/// `SendError.Other` and break every unqualified `SendError` match in the
+/// solution. Consumers must write `MessageSummary.Text` etc.
+[<RequireQualifiedAccess>]
+type MessageSummary =
+    | Text of string
+    | Voice
+    | Photo
+    | Other
+
+/// One entry in a fetched chat history, chronological oldest first.
+type HistoryEntry =
+    { Id: int64
+      FromBot: bool
+      Date: DateTimeOffset
+      Summary: MessageSummary }
+
 /// Credentials and session location for the bot transport.
 type TelegramConfig =
     { ApiId: int
@@ -124,6 +144,24 @@ module Transport =
             req.entities <- target.Entities |> List.map toTLMessageEntity |> List.toArray
             req.flags <- req.flags ||| TL.Methods.Messages_SendMessage.Flags.has_entities
 
+        req
+
+    /// Builds a `messages.getHistory` request for paged history before `beforeId`.
+    ///
+    /// `offset_id` is exclusive: the returned history starts just before the
+    /// given message id. The remaining numeric fields are left at zero (no
+    /// additional offset/filter), and `limit` is clamped to 1..100 as Telegram
+    /// rejects limits outside that range.
+    let buildGetHistoryRequest (peer: TL.InputPeer) (beforeId: int64) (limit: int) : TL.Methods.Messages_GetHistory =
+        let req = TL.Methods.Messages_GetHistory()
+        req.peer <- peer
+        req.offset_id <- int beforeId
+        req.offset_date <- DateTime.UnixEpoch
+        req.add_offset <- 0
+        req.limit <- min 100 (max 1 limit)
+        req.max_id <- 0
+        req.min_id <- 0
+        req.hash <- 0L
         req
 
     /// Builds a `messages.editMessage` request.
@@ -244,6 +282,20 @@ module Transport =
             | _ -> None
         | _ -> None
 
+    /// Classifies a fetched message into a short summary for history/reply display.
+    let classifyMessage (m: TL.MessageBase) : MessageSummary =
+        match m with
+        | :? TL.Message as msg ->
+            if not (String.IsNullOrWhiteSpace msg.message) then
+                MessageSummary.Text msg.message
+            else
+                match msg.media with
+                | :? TL.MessageMediaPhoto -> MessageSummary.Photo
+                | :? TL.MessageMediaDocument when (tryVoiceDocument (Some(msg :> TL.MessageBase)) |> Option.isSome) ->
+                    MessageSummary.Voice
+                | _ -> MessageSummary.Other
+        | _ -> MessageSummary.Other
+
     /// Resolves a chat to its `InputPeer` from the cache.
     let resolvePeer (cache: PeerCache) (chat: ChatId) : TL.InputPeer =
         match cache.Get chat with
@@ -272,3 +324,5 @@ type ITelegramTransport =
     abstract DownloadPhoto: PhotoRef -> Task<byte[]>
     abstract SetReaction: ChatId -> int64 -> string -> Task<unit>
     abstract SetTyping: ChatId -> Task<unit>
+    abstract GetMessageSummary: ChatId -> int64 -> Task<MessageSummary option>
+    abstract GetHistory: ChatId -> beforeId: int64 -> limit: int -> Task<HistoryEntry list>

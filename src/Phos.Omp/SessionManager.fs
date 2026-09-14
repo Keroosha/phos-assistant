@@ -249,7 +249,7 @@ type SessionManager
                 match!
                     client.SetHostUriSchemesAsync
                         [ { Scheme = "tg"
-                            Description = "Telegram voice messages"
+                            Description = "Telegram voice messages and chat history"
                             Writable = false
                             Immutable = false } ]
                 with

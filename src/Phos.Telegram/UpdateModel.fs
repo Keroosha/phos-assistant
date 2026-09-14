@@ -14,7 +14,8 @@ type IncomingUpdate =
       Voice: VoiceRef option
       MessageId: int64
       Photo: PhotoRef option
-      IsSticker: bool }
+      IsSticker: bool
+      ReplyToMessageId: int64 option }
 
 /// Mappers from WTelegramClient update/message objects to `IncomingUpdate`.
 module UpdateModel =
@@ -134,7 +135,11 @@ module UpdateModel =
                       Voice = voice
                       MessageId = int64 m.id
                       Photo = photo
-                      IsSticker = isSticker }
+                      IsSticker = isSticker
+                      ReplyToMessageId =
+                        match m.reply_to with
+                        | :? TL.MessageReplyHeader as h -> Some(int64 h.reply_to_msg_id)
+                        | _ -> None }
             | _ -> None
         | _ -> None
 
