@@ -909,6 +909,88 @@ let ``profile ensure is idempotent`` () =
     finally
         deleteDir dir
 
+[<Fact>]
+let ``profile provisioning adopts source config with modelRoles`` () =
+    let dir = tempDir ()
+
+    try
+        let ompRoot = Path.Combine(dir, "omp")
+        let srcAgent = Path.Combine(ompRoot, "profiles", "deepseek", "agent")
+        Directory.CreateDirectory(srcAgent) |> ignore
+        File.WriteAllText(Path.Combine(srcAgent, "models.yml"), "models: {}")
+        File.WriteAllText(Path.Combine(srcAgent, ".env"), "KEY=value")
+
+        File.WriteAllText(
+            Path.Combine(srcAgent, "config.yml"),
+            "modelRoles:\n  default: vanbukin/DeepSeek-V4-Flash-Vision-Exp\n"
+        )
+
+        let pm = ProfileManager ompRoot
+
+        match pm.EnsureProfile("phos", "deepseek") with
+        | Ok() ->
+            let agent = Path.Combine(ompRoot, "profiles", "phos", "agent")
+            let config = File.ReadAllText(Path.Combine(agent, "config.yml"))
+            config.Contains("modelRoles:") |> should be True
+            config.Contains("vanbukin") |> should be True
+        | Error e -> failwith e
+    finally
+        deleteDir dir
+
+[<Fact>]
+let ``profile ensure repairs config without modelRoles`` () =
+    let dir = tempDir ()
+
+    try
+        let ompRoot = Path.Combine(dir, "omp")
+        let srcAgent = Path.Combine(ompRoot, "profiles", "deepseek", "agent")
+        let phosAgent = Path.Combine(ompRoot, "profiles", "phos", "agent")
+        Directory.CreateDirectory(srcAgent) |> ignore
+        Directory.CreateDirectory(phosAgent) |> ignore
+        File.WriteAllText(Path.Combine(srcAgent, "models.yml"), "models: {}")
+        File.WriteAllText(Path.Combine(srcAgent, ".env"), "KEY=value")
+
+        // Existing phos profile created by the old template: no modelRoles.
+        File.WriteAllText(Path.Combine(phosAgent, "config.yml"), "symbolPreset: unicode\n")
+
+        File.WriteAllText(
+            Path.Combine(srcAgent, "config.yml"),
+            "modelRoles:\n  default: vanbukin/DeepSeek-V4-Flash-Vision-Exp\n"
+        )
+
+        let pm = ProfileManager ompRoot
+
+        match pm.EnsureProfile("phos", "deepseek") with
+        | Ok() ->
+            File.ReadAllText(Path.Combine(phosAgent, "config.yml"))
+            |> fun c -> c.Contains("modelRoles:") |> should be True
+        | Error e -> failwith e
+    finally
+        deleteDir dir
+
+[<Fact>]
+let ``profile ensure keeps config with modelRoles unchanged`` () =
+    let dir = tempDir ()
+
+    try
+        let ompRoot = Path.Combine(dir, "omp")
+        let srcAgent = Path.Combine(ompRoot, "profiles", "deepseek", "agent")
+        let phosAgent = Path.Combine(ompRoot, "profiles", "phos", "agent")
+        Directory.CreateDirectory(srcAgent) |> ignore
+        Directory.CreateDirectory(phosAgent) |> ignore
+        File.WriteAllText(Path.Combine(srcAgent, "models.yml"), "models: {}")
+        File.WriteAllText(Path.Combine(srcAgent, ".env"), "KEY=value")
+        File.WriteAllText(Path.Combine(phosAgent, "config.yml"), "modelRoles:\n  default: custom/model\n")
+        let pm = ProfileManager ompRoot
+
+        match pm.EnsureProfile("phos", "deepseek") with
+        | Ok() ->
+            File.ReadAllText(Path.Combine(phosAgent, "config.yml"))
+            |> fun c -> c.Contains("custom/model") |> should be True
+        | Error e -> failwith e
+    finally
+        deleteDir dir
+
 // ---------------------------------------------------------------------------
 // SessionManager
 // ---------------------------------------------------------------------------
