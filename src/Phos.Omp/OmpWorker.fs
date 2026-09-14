@@ -1,0 +1,161 @@
+namespace Phos.Omp
+
+open System
+open System.Collections.Concurrent
+open System.Threading
+open System.Threading.Channels
+open System.Threading.Tasks
+open Microsoft.Extensions.Hosting
+open Microsoft.Extensions.Logging
+open Phos.Core.DomainTypes
+open Phos.Storage
+open Phos.Telegram
+
+module Inbox = Phos.Core.InboxStateMachine
+
+/// A coalescing wake signal. The bounded channel holds at most one pending wake;
+/// a write when it is already full is dropped (a scan is already scheduled), so
+/// the channel never blocks the Telegram admission path.
+type WakeChannel() =
+    let channel = Channel.CreateBounded<unit>(BoundedChannelOptions(1))
+
+    member _.Wake() : unit = channel.Writer.TryWrite(()) |> ignore
+
+    member _.WaitAsync(ct: CancellationToken) : Task<unit> =
+        task {
+            try
+                let! available = channel.Reader.WaitToReadAsync(ct)
+
+                if available then
+                    let mutable item = ()
+                    channel.Reader.TryRead(&item) |> ignore
+
+                return ()
+            with :? ChannelClosedException ->
+                return ()
+        }
+
+/// Background service that drains the durable `command_inbox` into OMP sessions.
+/// It owns the at-least-once path: expired leases are reclaimed, each pending
+/// command is claimed with a lease, `/stop` aborts the session, prompts are
+/// marked started with a heartbeat, and a terminal `agent_end` completes the
+/// command via the `turnEnded` callback shared with `SessionManager`.
+type OmpWorker
+    (
+        inbox: ICommandInbox,
+        outbox: IMessageOutbox,
+        sessions: IOmpSessionManager,
+        wake: WakeChannel,
+        heartbeats: ConcurrentDictionary<int64, CancellationTokenSource>,
+        logger: ILogger<OmpWorker>
+    ) =
+    inherit BackgroundService()
+
+    let now () = DateTimeOffset.UtcNow
+
+    let isStop (payload: string) : bool = payload.StartsWith "/stop"
+
+    let reply (cmd: Command) (text: string) : Task<unit> =
+        task {
+            let chunks = EntitySend.chunkForSend text []
+
+            for i, chunk in List.indexed chunks do
+                let! _ = outbox.Insert cmd.Id i cmd.Envelope.ChatId (Random.Shared.NextInt64()) chunk.Text
+                ()
+        }
+
+    /// Keeps the lease alive while the command runs. Stops when the command is
+    /// no longer running or the user's OMP process died (so the lease expires
+    /// and the command is reclaimed — no loss, no duplicate execution).
+    let startHeartbeat (cmdId: int64) (userId: UserId) : unit =
+        let cts = new CancellationTokenSource()
+        heartbeats.[cmdId] <- cts
+
+        let loop: Task =
+            task {
+                try
+                    let mutable running = true
+
+                    while running && not cts.IsCancellationRequested do
+                        do! Task.Delay(20000, cts.Token)
+
+                        if not (sessions.IsRuntimeAlive userId) then
+                            running <- false
+                        else
+                            let! cmd = inbox.GetById cmdId
+
+                            match cmd with
+                            | Some c when c.Status = Inbox.Status.Running ->
+                                do! inbox.Heartbeat cmdId (now ()) (now().AddSeconds 60.0)
+                            | _ -> running <- false
+                with :? OperationCanceledException ->
+                    ()
+            }
+
+        loop |> ignore
+
+    let processCommand (cmd: Command) : Task<unit> =
+        task {
+            let user = cmd.Envelope.UserId
+
+            if isStop cmd.Envelope.Payload then
+                do! sessions.Abort user
+                do! inbox.MarkStarted cmd.Id
+                do! inbox.MarkCompleted cmd.Id
+                do! reply cmd "⏹ остановлено"
+            else
+
+                match! sessions.Prompt(user, cmd) with
+                | Ok() ->
+                    do! inbox.MarkStarted cmd.Id
+                    startHeartbeat cmd.Id user
+                | Error msg when msg = "queue full" ->
+                    // Durable no-loss: the command stays `claimed`; its lease
+                    // expires and `ExpireLeases` returns it to `pending`, so the
+                    // next scan retries once the queue drains.
+                    logger.LogDebug("command {Id} deferred: queue full", cmd.Id)
+                | Error msg ->
+                    logger.LogWarning("omp prompt failed for command {Id}: {Error}", cmd.Id, msg)
+                    do! inbox.MarkFailed cmd.Id
+                    let! c = inbox.GetById cmd.Id
+
+                    match c with
+                    | Some c when c.Status <> Inbox.Status.DeadLetter -> do! inbox.Retry cmd.Id
+                    | _ -> ()
+        }
+
+    let processChat (chatId: ChatId) : Task<unit> =
+        task {
+            let lease =
+                { Until = now().AddSeconds 60.0
+                  HeartbeatAt = now () }
+
+            let! cmd = inbox.ClaimNextForChat chatId lease
+
+            match cmd with
+            | Some cmd -> do! processCommand cmd
+            | None -> ()
+        }
+
+    /// Test seam: runs the per-command processing logic directly (used by the
+    /// worker unit tests without driving the whole hosted loop).
+    member internal _.ProcessCommandForTest(cmd: Command) : Task<unit> = processCommand cmd
+
+    override _.ExecuteAsync(stoppingToken: CancellationToken) : Task =
+        task {
+            while not stoppingToken.IsCancellationRequested do
+                try
+                    let! _ = inbox.ExpireLeases(now ())
+                    let! chatIds = inbox.ListPendingChatIds()
+
+                    for chatId in chatIds do
+                        do! processChat chatId
+                with ex ->
+                    logger.LogError(ex, "omp worker scan failed")
+
+                let wakeTask: Task = wake.WaitAsync(stoppingToken)
+                let delayTask: Task = Task.Delay(5000, stoppingToken)
+                let! _ = Task.WhenAny(wakeTask, delayTask)
+
+                ()
+        }

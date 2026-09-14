@@ -1,11 +1,13 @@
 namespace Phos.App
 
 open System
+open System.IO
 open FsToolkit.ErrorHandling
 open Microsoft.Extensions.Configuration
 open Phos.Core.DomainTypes
 open Phos.Core.Whitelist
 open Phos.Storage
+open Phos.Omp
 
 /// Telegram connection settings, bound from the `Telegram` config section.
 [<CLIMutable>]
@@ -51,6 +53,22 @@ type SttSettings =
       MaxConcurrentStt: int
       ModelSha256: string }
 
+/// OMP session-manager settings, bound from the `Omp` config section.
+[<CLIMutable>]
+type OmpSettings =
+    { Enabled: bool
+      Profile: string
+      SourceProfile: string
+      OmpPath: string
+      WorkspaceRoot: string
+      PersonaFile: string
+      IdleTimeoutMinutes: int
+      MaxQueuePerUser: int
+      Tools: string
+      ApprovalMode: string
+      MaxTime: string
+      ReadyTimeoutSeconds: int }
+
 /// App-wide configuration bound from `IConfiguration` (appsettings.json +
 /// `PHOS_` environment variables + command line).
 [<CLIMutable>]
@@ -58,7 +76,8 @@ type AppConfig =
     { Telegram: TelegramSettings
       Storage: StorageSettings
       Whitelist: WhitelistSettings
-      Stt: SttSettings }
+      Stt: SttSettings
+      Omp: OmpSettings }
 
 /// Binds and validates the app configuration.
 module Config =
@@ -110,6 +129,20 @@ module Config =
 
             do! validateRoles cfg.Whitelist.Users
 
+            if cfg.Omp.Enabled then
+                do! Result.requireTrue "Omp:Profile must not be empty" (not (String.IsNullOrWhiteSpace cfg.Omp.Profile))
+
+                do! Result.requireTrue "Omp:OmpPath must not be empty" (not (String.IsNullOrWhiteSpace cfg.Omp.OmpPath))
+
+                do!
+                    Result.requireTrue
+                        "Omp:WorkspaceRoot must not be empty"
+                        (not (String.IsNullOrWhiteSpace cfg.Omp.WorkspaceRoot))
+
+                do! Result.requireTrue "Omp:IdleTimeoutMinutes must be >= 1" (cfg.Omp.IdleTimeoutMinutes >= 1)
+                do! Result.requireTrue "Omp:MaxQueuePerUser must be >= 1" (cfg.Omp.MaxQueuePerUser >= 1)
+                do! Result.requireTrue "Omp:ReadyTimeoutSeconds must be >= 1" (cfg.Omp.ReadyTimeoutSeconds >= 1)
+
             if cfg.Stt.Enabled then
                 do!
                     Result.requireTrue
@@ -140,7 +173,7 @@ module Config =
     /// vars) yields an `Error` describing the missing file.
     let bind (configuration: IConfiguration) : Result<AppConfig, string> =
         let sections =
-            [ "Telegram"; "Storage"; "Whitelist"; "Stt" ]
+            [ "Telegram"; "Storage"; "Whitelist"; "Stt"; "Omp" ]
             |> List.forall (fun name -> configuration.GetSection(name).Exists())
 
         if not sections then
@@ -179,6 +212,35 @@ module Config =
           BusyTimeout = TimeSpan.FromSeconds(float cfg.Storage.BusyTimeoutSeconds)
           ReadPoolSize = cfg.Storage.ReadPoolSize
           CheckpointEvery = cfg.Storage.CheckpointEvery }
+
+    /// Expands a leading `~` to the user's home directory (POSIX convention).
+    let expandHome (path: string) : string =
+        if path = "~" then
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)
+        elif path.StartsWith "~/" then
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), path.Substring 2)
+        else
+            path
+
+    /// Builds the base OMP spawn options. `WorkspaceDir` is left empty — it is
+    /// per-user and set by `SessionManager` at spawn time.
+    let toOmpProcessOptions (cfg: AppConfig) : OmpProcessOptions =
+        { OmpPath = cfg.Omp.OmpPath
+          Profile = cfg.Omp.Profile
+          WorkspaceDir = ""
+          SessionResume = None
+          Tools = cfg.Omp.Tools
+          ApprovalMode = cfg.Omp.ApprovalMode
+          MaxTime = cfg.Omp.MaxTime
+          ExtraFlags = []
+          ReadyTimeoutSeconds = cfg.Omp.ReadyTimeoutSeconds }
+
+    /// Builds the per-user session-manager options from the config.
+    let toSessionManagerOptions (cfg: AppConfig) : SessionManagerOptions =
+        { Profile = cfg.Omp.Profile
+          SourceProfile = cfg.Omp.SourceProfile
+          IdleTimeout = TimeSpan.FromMinutes(float cfg.Omp.IdleTimeoutMinutes)
+          MaxQueuePerUser = cfg.Omp.MaxQueuePerUser }
 
     /// Builds STT options from the config. An empty `WhisperDir` disables the
     /// Whisper fallback engine.

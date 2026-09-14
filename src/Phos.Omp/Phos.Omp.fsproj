@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="RpcTypes.fs" />
+    <Compile Include="RpcClient.fs" />
+    <Compile Include="Workspace.fs" />
+    <Compile Include="OmpProcess.fs" />
+    <Compile Include="Profile.fs" />
+    <Compile Include="HostTools.fs" />
+    <Compile Include="HostUris.fs" />
+    <Compile Include="EventFormatter.fs" />
+    <Compile Include="SessionManager.fs" />
+    <Compile Include="OmpWorker.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Only the SDK's in-box JSON (System.Text.Json) is used; FSharp.Core is
+         the sole language dependency. Microsoft.Extensions.Logging.Abstractions
+         is a pre-existing central package (already a transitive dependency of
+         Phos.Telegram) used only for the ILogger boundary — no new package is
+         added to Directory.Packages.props. -->
+    <PackageReference Include="FSharp.Core" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
+    <PackageReference Include="Microsoft.Extensions.Hosting" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../src/Phos.Core/Phos.Core.fsproj" />
+    <ProjectReference Include="../../src/Phos.Storage/Phos.Storage.fsproj" />
+    <ProjectReference Include="../../src/Phos.Telegram/Phos.Telegram.fsproj" />
+  </ItemGroup>
+
+</Project>

@@ -7,12 +7,8 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <Compile Include="Tests.fs" />
-    <Compile Include="CoreTests.fs" />
-    <Compile Include="StorageTests.fs" />
-    <Compile Include="TelegramTests.fs" />
-    <Compile Include="SpeechTests.fs" />
-    <Compile Include="OmpTests.fs" />
+    <Compile Include="FakeLlmServer.fs" />
+    <Compile Include="IntegrationTests.fs" />
   </ItemGroup>
 
   <ItemGroup>
@@ -29,7 +25,6 @@
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
     </PackageReference>
     <PackageReference Include="FsUnit.Xunit" />
-    <PackageReference Include="FsCheck.Xunit" />
   </ItemGroup>
 
   <ItemGroup>

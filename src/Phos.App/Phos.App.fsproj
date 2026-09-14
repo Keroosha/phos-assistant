@@ -24,6 +24,7 @@
     <ProjectReference Include="../../src/Phos.Storage/Phos.Storage.fsproj" />
     <ProjectReference Include="../../src/Phos.Telegram/Phos.Telegram.fsproj" />
     <ProjectReference Include="../../src/Phos.Speech/Phos.Speech.fsproj" />
+    <ProjectReference Include="../../src/Phos.Omp/Phos.Omp.fsproj" />
   </ItemGroup>
 
 </Project>

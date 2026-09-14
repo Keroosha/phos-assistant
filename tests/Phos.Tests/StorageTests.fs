@@ -838,7 +838,7 @@ let ``heartbeat updates lease heartbeat`` () =
                 let! id = inbox.Insert(mkEnvelope "hb-1")
                 let! claimed = inbox.ClaimNextForChat (ChatId 1L) (lease ())
                 claimed |> should not' (be None)
-                do! inbox.Heartbeat id (DateTimeOffset.UtcNow)
+                do! inbox.Heartbeat id (DateTimeOffset.UtcNow) (DateTimeOffset.UtcNow.AddSeconds 60.0)
                 let! pending = inbox.CountPending()
                 pending |> should equal 0
             })
@@ -1061,5 +1061,69 @@ let ``durable command survives executor disposed without clean shutdown and reop
             finally
                 dispose exec2
         }
+    finally
+        deleteDir dir
+
+// ---------------------------------------------------------------------------
+// Phase 5 — ListPendingChatIds
+// ---------------------------------------------------------------------------
+
+let private mkEnvFor (chatId: int64) (key: string) : CommandEnvelope =
+    { Origin = Telegram
+      ExternalKey = Some key
+      UserId = UserId 1L
+      ChatId = ChatId chatId
+      Payload = "payload"
+      Priority = 0 }
+
+[<Fact>]
+let ``list pending chat ids returns distinct chats with pending work`` () =
+    let dir = makeTempDir ()
+    let dbPath = Path.Combine(dir, "phos.db")
+
+    try
+        withExecutor dbPath (fun exec ->
+            task {
+                let inbox = Repositories.commandInbox exec
+                let! _ = inbox.Insert(mkEnvFor 1L "lpc-1")
+                let! _ = inbox.Insert(mkEnvFor 2L "lpc-2")
+                let! _ = inbox.Insert(mkEnvFor 1L "lpc-3")
+                let! ids = inbox.ListPendingChatIds()
+                ids |> List.sort |> should equal [ ChatId 1L; ChatId 2L ]
+            })
+    finally
+        deleteDir dir
+
+[<Fact>]
+let ``list pending chat ids includes failed and needs_review, excludes completed`` () =
+    let dir = makeTempDir ()
+    let dbPath = Path.Combine(dir, "phos.db")
+
+    try
+        withExecutor dbPath (fun exec ->
+            task {
+                let inbox = Repositories.commandInbox exec
+                let l = lease ()
+
+                // chat 1: fail (attempts < max) → 'failed'
+                let! id1 = inbox.Insert(mkEnvFor 1L "lpc-fail")
+                let! _ = inbox.ClaimById id1 l
+                do! inbox.MarkStarted id1
+                do! inbox.MarkFailed id1
+
+                // chat 2: needs_review
+                let! id2 = inbox.Insert(mkEnvFor 2L "lpc-review")
+                let! _ = inbox.ClaimById id2 l
+                do! inbox.MarkNeedsReview id2
+
+                // chat 3: completed → excluded
+                let! id3 = inbox.Insert(mkEnvFor 3L "lpc-done")
+                let! _ = inbox.ClaimById id3 l
+                do! inbox.MarkStarted id3
+                do! inbox.MarkCompleted id3
+
+                let! ids = inbox.ListPendingChatIds()
+                ids |> List.sort |> should equal [ ChatId 1L; ChatId 2L ]
+            })
     finally
         deleteDir dir

@@ -43,10 +43,11 @@ type ICommandInbox =
     abstract Retry: int64 -> Task<unit>
     abstract MarkNeedsReview: int64 -> Task<unit>
     abstract ReviewRetry: int64 -> Task<unit>
-    abstract Heartbeat: int64 -> DateTimeOffset -> Task<unit>
+    abstract Heartbeat: int64 -> DateTimeOffset -> DateTimeOffset -> Task<unit>
     abstract ExpireLeases: DateTimeOffset -> Task<int>
     abstract CountPending: unit -> Task<int>
     abstract CountDeadLetter: unit -> Task<int>
+    abstract ListPendingChatIds: unit -> Task<ChatId list>
 
 type CommandInbox(exec: StorageExecutor) =
     let originToString (o: Origin) : string =
@@ -350,14 +351,18 @@ type CommandInbox(exec: StorageExecutor) =
                 cmd.ExecuteNonQuery() |> ignore
                 ())
 
-        member _.Heartbeat (id: int64) (at: DateTimeOffset) =
+        member _.Heartbeat (id: int64) (at: DateTimeOffset) (leaseUntil: DateTimeOffset) =
             exec.WriteAsync(fun conn ->
                 use cmd = conn.CreateCommand()
 
+                // Rolling lease: every heartbeat extends `lease_until`, so a
+                // long-running turn never loses its lease (a lost lease would
+                // re-claim the command and duplicate execution).
                 cmd.CommandText <-
-                    "UPDATE command_inbox SET heartbeat_at = $heartbeatAt, updated_at = $now WHERE id = $id;"
+                    "UPDATE command_inbox SET heartbeat_at = $heartbeatAt, lease_until = $leaseUntil, updated_at = $now WHERE id = $id AND status = 'running';"
 
                 cmd.Parameters.AddWithValue("$heartbeatAt", toUnix at) |> ignore
+                cmd.Parameters.AddWithValue("$leaseUntil", toUnix leaseUntil) |> ignore
                 cmd.Parameters.AddWithValue("$id", id) |> ignore
 
                 cmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToUnixTimeSeconds())
@@ -391,3 +396,18 @@ type CommandInbox(exec: StorageExecutor) =
                 use cmd = conn.CreateCommand()
                 cmd.CommandText <- "SELECT COUNT(*) FROM command_inbox WHERE status = 'dead_letter';"
                 cmd.ExecuteScalar() :?> int64 |> int)
+
+        member _.ListPendingChatIds() =
+            exec.ReadAsync(fun conn ->
+                use cmd = conn.CreateCommand()
+
+                cmd.CommandText <-
+                    "SELECT DISTINCT chat_id FROM command_inbox WHERE status IN ('pending', 'failed', 'needs_review');"
+
+                use reader = cmd.ExecuteReader()
+                let ids = ResizeArray<ChatId>()
+
+                while reader.Read() do
+                    ids.Add(ChatId(reader.GetInt64 0))
+
+                List.ofSeq ids)

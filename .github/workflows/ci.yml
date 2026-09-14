@@ -12,6 +12,14 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           global-json-file: global.json
+      - name: Install omp (pinned)
+        run: |
+          curl -fsSL https://bun.sh/install | bash
+          export PATH="$HOME/.bun/bin:$PATH"
+          # omp 18.1.19 ships as the npm package @oh-my-pi/pi-coding-agent.
+          # Verified: registry + `omp --version` (see docs/research-plan.md §2.2).
+          npm install -g @oh-my-pi/pi-coding-agent@18.1.19
+          omp --version
       - name: Provision STT models
         run: bash scripts/provision-stt.sh
       - name: Run gates

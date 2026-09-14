@@ -3,7 +3,7 @@ obj/
 .artifacts/
 TestResults/
 .venv/
-spikes/**/data/
+spikes/**/data
 spikes/**/models/
 *.user
 spikes/**/onnx_model/

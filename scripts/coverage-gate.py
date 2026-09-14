@@ -11,7 +11,12 @@ Only source files under `src/` are counted; test projects are ignored.
 If no `src/` lines are measured yet (Phase 0 state), the gate reports a
 note and passes: there is nothing to cover.
 
-Usage: coverage-gate.py <cobertura.xml|directory> [--src-root src] [--strict]
+Multiple Cobertura XMLs (one per test project) are merged per source file by
+taking the best (maximum) line/branch rate observed, so a line covered by any
+test project counts as covered; this avoids double-counting the same file's
+lines when more than one test project runs in the same gate invocation.
+
+Usage: coverage-gate.py <cobertura.xml|directory>... [--src-root src] [--strict]
 """
 from __future__ import annotations
 
@@ -25,6 +30,24 @@ LINE_TOTAL = 0.90
 BRANCH_TOTAL = 0.85
 BRANCH_PER_PROJECT = 0.90
 BRANCH_REQUIRED_PROJECTS = ("Core", "Storage", "Scheduler")
+
+
+class ClassCoverage:
+    """Per source-file coverage merged across Cobertura XMLs."""
+
+    def __init__(self) -> None:
+        self.lines = 0
+        self.line_rate = 0.0
+        self.branches = 0
+        self.branch_rate = 0.0
+
+    def merge(self, lines: int, line_rate: float, branches: int, branch_rate: float) -> None:
+        # The same source file reports the same line/branch count across all
+        # test-project XMLs; keep the highest rate (union approximation).
+        self.lines = max(self.lines, lines)
+        self.line_rate = max(self.line_rate, line_rate)
+        self.branches = max(self.branches, branches)
+        self.branch_rate = max(self.branch_rate, branch_rate)
 
 
 class Project:
@@ -68,11 +91,12 @@ def resolve_class_path(sources: list[str], filename: str, src_root: str) -> str:
     return os.path.join(sources[0], filename) if sources else filename
 
 
-def collect(xml_path: str, src_root: str) -> dict[str, Project]:
+def parse(xml_path: str, src_root: str) -> dict[str, ClassCoverage]:
+    """Parse one Cobertura XML into per-source-file coverage."""
     tree = ET.parse(xml_path)
     root = tree.getroot()
     sources = [s.text or "" for s in root.iter("source")]
-    projects: dict[str, Project] = {}
+    classes: dict[str, ClassCoverage] = {}
     for package in root.iter("package"):
         for cls in package.iter("class"):
             # F# `task`/`async` computation expressions compile into
@@ -84,10 +108,9 @@ def collect(xml_path: str, src_root: str) -> dict[str, Project]:
             if (cls.get("name") or "").startswith("<StartupCode$"):
                 continue
             filename = cls.get("filename", "")
-            proj_dir = src_dir_of(resolve_class_path(sources, filename, src_root), src_root)
-            if proj_dir is None:
+            key = resolve_class_path(sources, filename, src_root)
+            if src_dir_of(key, src_root) is None:
                 continue
-            proj = projects.setdefault(proj_dir, Project(proj_dir))
             line_count = 0
             line_rate = float(cls.get("line-rate", "0"))
             branch_count = 0
@@ -98,33 +121,45 @@ def collect(xml_path: str, src_root: str) -> dict[str, Project]:
                 # the Cobertura spec uses lowercase.
                 if (line.get("branch") or "false").lower() == "true":
                     branch_count += 1
-            proj.lines += line_count
-            proj.lines_covered += line_rate * line_count
-            proj.branches += branch_count
-            proj.branches_covered += branch_rate * branch_count
-    return projects
+            cc = classes.setdefault(key, ClassCoverage())
+            cc.merge(line_count, line_rate, branch_count, branch_rate)
+    return classes
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("target", help="Cobertura XML file or directory of XML files")
+    ap.add_argument("targets", nargs="+", help="Cobertura XML file(s) or directory/directories of XML files")
     ap.add_argument("--src-root", default="src", help="source root directory name")
     args = ap.parse_args()
 
-    if os.path.isdir(args.target):
-        xmls = sorted(glob.glob(os.path.join(args.target, "**", "*.xml"), recursive=True))
-    else:
-        xmls = [args.target]
+    xmls: list[str] = []
+    for target in args.targets:
+        if os.path.isdir(target):
+            xmls.extend(sorted(glob.glob(os.path.join(target, "**", "*.xml"), recursive=True)))
+        elif os.path.isfile(target):
+            xmls.append(target)
+        # Non-existent paths (e.g. a shell glob artifact for a test project
+        # with no TestResults) are silently skipped.
 
-    projects: dict[str, Project] = {}
+    # Merge coverage per source file across all XMLs.
+    classes: dict[str, ClassCoverage] = {}
     for xml in xmls:
-        for name, proj in collect(xml, args.src_root).items():
-            if name not in projects:
-                projects[name] = Project(name)
-            projects[name].lines += proj.lines
-            projects[name].lines_covered += proj.lines_covered
-            projects[name].branches += proj.branches
-            projects[name].branches_covered += proj.branches_covered
+        for key, cc in parse(xml, args.src_root).items():
+            if key not in classes:
+                classes[key] = ClassCoverage()
+            classes[key].merge(cc.lines, cc.line_rate, cc.branches, cc.branch_rate)
+
+    # Aggregate into per-project totals.
+    projects: dict[str, Project] = {}
+    for key, cc in classes.items():
+        proj_dir = src_dir_of(key, args.src_root)
+        if proj_dir is None:
+            continue
+        proj = projects.setdefault(proj_dir, Project(proj_dir))
+        proj.lines += cc.lines
+        proj.lines_covered += cc.line_rate * cc.lines
+        proj.branches += cc.branches
+        proj.branches_covered += cc.branch_rate * cc.branches
 
     total_lines = sum(p.lines for p in projects.values())
     total_lines_covered = sum(p.lines_covered for p in projects.values())

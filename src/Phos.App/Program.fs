@@ -1,7 +1,9 @@
 module Phos.App.Program
 
 open System
+open System.Collections.Concurrent
 open System.IO
+open System.Threading
 open System.Threading.Tasks
 open Microsoft.Extensions.Configuration
 open Microsoft.Extensions.DependencyInjection
@@ -11,6 +13,7 @@ open Phos.Core.Whitelist
 open Phos.Storage
 open Phos.Speech
 open Phos.Telegram
+open Phos.Omp
 open Phos.App
 
 /// Entry point. Binds and validates config (appsettings.json + `PHOS_` env vars
@@ -94,16 +97,111 @@ let main (argv: string[]) : int =
                 :> IVoiceProcessor)
             |> ignore
 
+            // --- OMP session manager wiring (Phase 5) -------------------------
+            builder.Services.AddSingleton<WakeChannel>(fun _ -> WakeChannel()) |> ignore
+
+            builder.Services.AddSingleton<ConcurrentDictionary<int64, CancellationTokenSource>>(fun _ ->
+                ConcurrentDictionary<int64, CancellationTokenSource>())
+            |> ignore
+
+            let ompRoot = Config.expandHome "~/.omp"
+
+            builder.Services.AddSingleton<ProfileManager>(fun _ -> ProfileManager ompRoot)
+            |> ignore
+
+            builder.Services.AddSingleton<WorkspaceManager>(fun _ ->
+                let persona =
+                    if String.IsNullOrWhiteSpace cfg.Omp.PersonaFile then
+                        None
+                    else
+                        Some(Config.expandHome cfg.Omp.PersonaFile)
+
+                WorkspaceManager(Config.expandHome cfg.Omp.WorkspaceRoot, ?personaFile = persona))
+            |> ignore
+
+            builder.Services.AddSingleton<OmpProcessOptions>(fun _ -> Config.toOmpProcessOptions cfg)
+            |> ignore
+
+            builder.Services.AddSingleton<HostToolExecutor>(fun sp ->
+                HostToolExecutor(
+                    sp.GetRequiredService<ITelegramTransport>(),
+                    sp.GetRequiredService<IVoiceProcessor>(),
+                    sp.GetRequiredService<ILogger<HostToolExecutor>>()
+                ))
+            |> ignore
+
+            builder.Services.AddSingleton<HostUriResolver>(fun sp ->
+                HostUriResolver(
+                    sp.GetRequiredService<ITelegramTransport>(),
+                    sp.GetRequiredService<ILogger<HostUriResolver>>()
+                ))
+            |> ignore
+
+            builder.Services.AddSingleton<SessionManager>(fun sp ->
+                let inbox = sp.GetRequiredService<ICommandInbox>()
+
+                let heartbeats =
+                    sp.GetRequiredService<ConcurrentDictionary<int64, CancellationTokenSource>>()
+
+                let turnEnded (cmdId: int64) : Task<unit> =
+                    task {
+                        do! inbox.MarkCompleted cmdId
+
+                        match heartbeats.TryRemove cmdId with
+                        | true, cts -> cts.Cancel()
+                        | _ -> ()
+                    }
+
+                let enqueueOutbox (env: OutboxEnvelope) : Task<unit> =
+                    task {
+                        let! _ =
+                            sp.GetRequiredService<IMessageOutbox>().Insert
+                                env.CommandId
+                                env.ChunkIndex
+                                env.ChatId
+                                env.RandomId
+                                env.Payload
+
+                        return ()
+                    }
+
+                SessionManager(
+                    Config.toSessionManagerOptions cfg,
+                    sp.GetRequiredService<ProfileManager>(),
+                    sp.GetRequiredService<WorkspaceManager>(),
+                    sp.GetRequiredService<OmpProcessOptions>(),
+                    sp.GetRequiredService<HostToolExecutor>(),
+                    sp.GetRequiredService<HostUriResolver>(),
+                    enqueueOutbox,
+                    turnEnded,
+                    sp.GetRequiredService<ILogger<SessionManager>>()
+                ))
+            |> ignore
+
+            if cfg.Omp.Enabled then
+                builder.Services.AddHostedService<OmpWorker>(fun sp ->
+                    new OmpWorker(
+                        sp.GetRequiredService<ICommandInbox>(),
+                        sp.GetRequiredService<IMessageOutbox>(),
+                        sp.GetRequiredService<SessionManager>() :> IOmpSessionManager,
+                        sp.GetRequiredService<WakeChannel>(),
+                        sp.GetRequiredService<ConcurrentDictionary<int64, CancellationTokenSource>>(),
+                        sp.GetRequiredService<ILogger<OmpWorker>>()
+                    ))
+                |> ignore
+
             builder.Services.AddSingleton<UpdateHandler>(fun sp ->
                 let inbox = sp.GetRequiredService<ICommandInbox>()
                 let users = sp.GetRequiredService<IUserRepository>()
                 let logger = sp.GetRequiredService<ILogger<UpdateHandler>>()
                 let dedupe = sp.GetRequiredService<UpdateDedupe>()
+                let wake = sp.GetRequiredService<WakeChannel>()
 
                 let admit (env: CommandEnvelope) : Task<AdmitOutcome> =
                     task {
                         try
                             let! id = inbox.Insert env
+                            wake.Wake()
                             return Admitted id
                         with ex ->
                             logger.LogError(ex, "admit failed")
