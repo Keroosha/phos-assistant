@@ -186,6 +186,7 @@ let main (argv: string[]) : int =
                         sp.GetRequiredService<SessionManager>() :> IOmpSessionManager,
                         sp.GetRequiredService<WakeChannel>(),
                         sp.GetRequiredService<ConcurrentDictionary<int64, CancellationTokenSource>>(),
+                        sp.GetRequiredService<ITelegramTransport>(),
                         sp.GetRequiredService<ILogger<OmpWorker>>()
                     ))
                 |> ignore

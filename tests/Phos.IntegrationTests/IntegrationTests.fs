@@ -144,6 +144,8 @@ type FakeTransport(?voiceBytes: byte[]) =
         member _.DownloadVoice(_: VoiceRef) =
             task { return defaultArg voiceBytes [||] }
 
+        member _.SetReaction (_: ChatId) (_: int64) (_: string) = Task.FromResult(())
+
 type FakeVoiceProcessor(result: Result<string, string>) =
     interface IVoiceProcessor with
         member _.ProcessAsync(_: VoiceRef) = task { return result }

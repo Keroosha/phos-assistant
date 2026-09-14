@@ -217,3 +217,4 @@ type ITelegramTransport =
     abstract SendMessage: SendTarget -> TaskResult<SendResult, SendError>
     abstract EditMessage: ChatId -> int64 -> string -> TelegramEntity list -> Task<unit>
     abstract DownloadVoice: VoiceRef -> Task<byte[]>
+    abstract SetReaction: ChatId -> int64 -> string -> Task<unit>

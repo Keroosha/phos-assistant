@@ -6,25 +6,18 @@ open Phos.Core.DomainTypes
 open Phos.Telegram
 
 /// Per-session stream state for the pure event formatter.
-type StreamState =
-    { Accumulated: string
-      Chunked: string list
-      Started: bool }
+type StreamState = { Accumulated: string }
 
 /// Context needed to build outbox envelopes from a session event.
 type FormatterContext = { CommandId: int64; ChatId: ChatId }
 
-/// Pure, I/O-free mapping from OMP session events to outbox envelopes. A single
-/// `…` typing status is emitted on the first text delta; the final assistant
-/// text is chunked (4096 UTF-16 units, fence-aware) on a terminal `agent_end`.
+/// Pure, I/O-free mapping from OMP session events to outbox envelopes. Text
+/// deltas are accumulated silently; the final assistant text is chunked
+/// (4096 UTF-16 units, fence-aware) on a terminal `agent_end`. Acknowledging
+/// the command is the caller's job (reaction), not a streamed message.
 module EventFormatter =
 
-    let initialState: StreamState =
-        { Accumulated = ""
-          Chunked = []
-          Started = false }
-
-    let private typingStatus = "…"
+    let initialState: StreamState = { Accumulated = "" }
 
     let private envelope (ctx: FormatterContext) (index: int) (text: string) : OutboxEnvelope =
         { CommandId = ctx.CommandId
@@ -49,23 +42,9 @@ module EventFormatter =
                     let delta = Json.getString "delta" ev |> Option.defaultValue ""
 
                     if delta <> "" then
-                        if not st.Started then
-                            let acc = st.Accumulated + delta
-
-                            st <-
-                                { st with
-                                    Accumulated = acc
-                                    Started = true }
-
-                            if acc.Length >= 1 then
-                                // ChunkIndex -1: the typing status must not
-                                // collide with final chunks (0..n) under
-                                // UNIQUE(command_id, chunk_index).
-                                envelopes <- [ envelope ctx -1 typingStatus ]
-                        else
-                            st <-
-                                { st with
-                                    Accumulated = st.Accumulated + delta }
+                        st <-
+                            { st with
+                                Accumulated = st.Accumulated + delta }
                 | _ -> ()
             | None -> ()
         | Some "agent_end" ->

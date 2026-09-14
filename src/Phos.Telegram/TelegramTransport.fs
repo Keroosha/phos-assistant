@@ -86,6 +86,20 @@ type TelegramTransport(config: TelegramConfig) =
             | None -> return Array.empty
         }
 
+    let setReactionCore (chat: ChatId) (messageId: int64) (emoji: string) : Task<unit> =
+        task {
+            let peer = Transport.resolvePeer peers chat
+            let req = TL.Methods.Messages_SendReaction()
+            req.peer <- peer
+            req.msg_id <- int messageId
+
+            let reaction = TL.ReactionEmoji()
+            reaction.emoticon <- emoji
+            req.reaction <- [| reaction :> TL.Reaction |]
+            let! _ = client.Invoke(req)
+            return ()
+        }
+
     member _.OnUpdate(handler: TL.UpdatesBase -> Task<unit>) : unit =
         client.add_OnUpdates (fun (updates: TL.UpdatesBase) ->
             task {
@@ -101,3 +115,5 @@ type TelegramTransport(config: TelegramConfig) =
             editMessageCore chat messageId text entities
 
         member _.DownloadVoice(voice) = downloadVoiceCore voice
+
+        member _.SetReaction (chat) (messageId) (emoji) = setReactionCore chat messageId emoji

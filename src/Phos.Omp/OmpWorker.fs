@@ -47,6 +47,7 @@ type OmpWorker
         sessions: IOmpSessionManager,
         wake: WakeChannel,
         heartbeats: ConcurrentDictionary<int64, CancellationTokenSource>,
+        transport: ITelegramTransport,
         logger: ILogger<OmpWorker>
     ) =
     inherit BackgroundService()
@@ -62,6 +63,32 @@ type OmpWorker
             for i, chunk in List.indexed chunks do
                 let! _ = outbox.Insert cmd.Id i cmd.Envelope.ChatId (Random.Shared.NextInt64()) chunk.Text
                 ()
+        }
+
+    /// Recovers the original Telegram message id from the admission key
+    /// `tg:<updateId>` (see `UpdateModel.mkUpdateId`: updateId XORs the 32-bit
+    /// message id with the chat id; XOR is its own inverse).
+    let messageIdOf (cmd: Command) : int64 option =
+        match cmd.Envelope.ExternalKey with
+        | Some key when key.StartsWith "tg:" ->
+            match Int64.TryParse(key.Substring 3) with
+            | true, updateId ->
+                let (ChatId cid) = cmd.Envelope.ChatId
+                Some(updateId ^^^ (cid <<< 32))
+            | _ -> None
+        | _ -> None
+
+    /// Acknowledges an accepted command with a 👀 reaction on the user's
+    /// message (the owner's chosen ack signal instead of a streamed "…").
+    let acknowledge (cmd: Command) : Task<unit> =
+        task {
+            match messageIdOf cmd with
+            | Some messageId ->
+                try
+                    do! transport.SetReaction cmd.Envelope.ChatId messageId "👀"
+                with ex ->
+                    logger.LogWarning(ex, "set reaction failed for command {Id}", cmd.Id)
+            | None -> ()
         }
 
     /// Keeps the lease alive while the command runs. Stops when the command is
@@ -99,6 +126,7 @@ type OmpWorker
             let user = cmd.Envelope.UserId
 
             if isStop cmd.Envelope.Payload then
+                do! acknowledge cmd
                 do! sessions.Abort user
                 do! inbox.MarkStarted cmd.Id
                 do! inbox.MarkCompleted cmd.Id
@@ -107,6 +135,7 @@ type OmpWorker
 
                 match! sessions.Prompt(user, cmd) with
                 | Ok() ->
+                    do! acknowledge cmd
                     do! inbox.MarkStarted cmd.Id
                     startHeartbeat cmd.Id user
                 | Error msg when msg = "queue full" ->

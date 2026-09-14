@@ -121,6 +121,8 @@ type FakeTransport() =
         member _.EditMessage _ _ _ _ = Task.FromResult(())
         member _.DownloadVoice _ = task { return voiceBytes }
 
+        member _.SetReaction _ _ _ = Task.FromResult(())
+
 /// Fake voice processor returning a configurable result, so the update handler
 /// voice path can be tested without a real STT service.
 type FakeVoiceProcessor() =

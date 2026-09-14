@@ -169,9 +169,11 @@ Notes:
   2. `ICommandInbox.Heartbeat` now extends `lease_until` (rolling lease) —
      otherwise a >60s turn lost its lease and could be re-claimed → duplicate
      execution;
-  3. EventFormatter typing status uses `ChunkIndex = -1` — `0` collided with the
-     first final chunk under `UNIQUE(command_id, chunk_index)` and was silently
-     dropped (`ON CONFLICT DO NOTHING`).
+  3. The streamed `…` typing status was removed per owner feedback: text deltas
+     accumulate silently, the final reply is chunked on terminal `agent_end`,
+     and command acceptance is acknowledged with a 👀 reaction on the user's
+     message (`messages.sendReaction`, message id recovered from the admission
+     key `tg:<updateId>` by inverting `mkUpdateId`).
 - `scripts/coverage-gate.py` extended to merge multiple Cobertura XMLs (one per
   test project) per source file (max rate, conservative); thresholds unchanged.
 

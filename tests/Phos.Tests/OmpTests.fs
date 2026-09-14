@@ -120,8 +120,10 @@ let private mkCommand (id: int64) (chatId: int64) (payload: string) : Command =
 type FakeTransport(?voiceBytes: byte[]) =
     let mutable sendCount = 0
     let mutable editCount = 0
+    let reactions = ResizeArray<int64 * string>()
     member _.SendCount = sendCount
     member _.EditCount = editCount
+    member _.Reactions = reactions
 
     interface ITelegramTransport with
         member _.Login() =
@@ -141,6 +143,10 @@ type FakeTransport(?voiceBytes: byte[]) =
 
         member _.DownloadVoice(_: VoiceRef) =
             task { return defaultArg voiceBytes [||] }
+
+        member _.SetReaction (_: ChatId) (messageId: int64) (emoji: string) =
+            reactions.Add(messageId, emoji)
+            Task.FromResult(())
 
 type FakeVoiceProcessor(result: Result<string, string>) =
     interface IVoiceProcessor with
@@ -713,7 +719,7 @@ let ``uri resolver reads voice as base64 and rejects write`` () =
 // ---------------------------------------------------------------------------
 
 [<Fact>]
-let ``first text delta emits typing status once`` () =
+let ``text deltas accumulate silently without status messages`` () =
     let ctx = { CommandId = 1L; ChatId = ChatId 5L }
     let frame = JsonObject()
     frame["type"] <- "message_update"
@@ -722,10 +728,7 @@ let ``first text delta emits typing status once`` () =
     ev["delta"] <- "Hello"
     frame["assistantMessageEvent"] <- (ev :> JsonNode)
     let st, envelopes = EventFormatter.onEvent ctx EventFormatter.initialState frame
-    envelopes.Length |> should equal 1
-    envelopes.[0].Payload |> should equal "…"
-    envelopes.[0].ChunkIndex |> should equal -1
-    st.Started |> should be True
+    envelopes |> should be Empty
     st.Accumulated |> should equal "Hello"
 
     let frame2 = JsonObject()
@@ -734,18 +737,16 @@ let ``first text delta emits typing status once`` () =
     ev2["type"] <- "text_delta"
     ev2["delta"] <- " world"
     frame2["assistantMessageEvent"] <- (ev2 :> JsonNode)
-    let _, env2 = EventFormatter.onEvent ctx st frame2
+    let st2, env2 = EventFormatter.onEvent ctx st frame2
     env2 |> should be Empty
+    st2.Accumulated |> should equal "Hello world"
 
 [<Fact>]
 let ``terminal agent_end chunks accumulated text`` () =
     let ctx = { CommandId = 1L; ChatId = ChatId 5L }
     let text = String.replicate 5000 "a"
 
-    let st =
-        { Accumulated = text
-          Chunked = []
-          Started = true }
+    let st = { Accumulated = text }
 
     let frame = JsonObject()
     frame["type"] <- "agent_end"
@@ -761,10 +762,7 @@ let ``terminal agent_end chunks accumulated text`` () =
 let ``non terminal agent_end emits nothing`` () =
     let ctx = { CommandId = 1L; ChatId = ChatId 5L }
 
-    let st =
-        { Accumulated = "partial"
-          Chunked = []
-          Started = true }
+    let st = { Accumulated = "partial" }
 
     let frame = JsonObject()
     frame["type"] <- "agent_end"
@@ -776,10 +774,7 @@ let ``non terminal agent_end emits nothing`` () =
 let ``terminal agent_end with empty text emits nothing`` () =
     let ctx = { CommandId = 1L; ChatId = ChatId 5L }
 
-    let st =
-        { Accumulated = ""
-          Chunked = []
-          Started = false }
+    let st = { Accumulated = "" }
 
     let frame = JsonObject()
     frame["type"] <- "agent_end"
@@ -1771,7 +1766,11 @@ type FakeSessions() =
         member _.IdleTimeoutCheck(_: DateTimeOffset) = ()
         member _.Shutdown() = ()
 
-let private mkWorker (inbox: ICommandInbox) (sessions: FakeSessions) : OmpWorker =
+let private mkWorkerWithTransport
+    (inbox: ICommandInbox)
+    (sessions: FakeSessions)
+    (transport: FakeTransport)
+    : OmpWorker =
     let outbox = FakeOutbox()
     let wake = WakeChannel()
     let heartbeats = ConcurrentDictionary<int64, CancellationTokenSource>()
@@ -1779,9 +1778,41 @@ let private mkWorker (inbox: ICommandInbox) (sessions: FakeSessions) : OmpWorker
     // rule would flag it, so suppress that rule for this line.
     // fsharplint:disable redundantNewKeyword
 
-    new OmpWorker(inbox, outbox, sessions, wake, heartbeats, NullLogger<OmpWorker>.Instance)
+    new OmpWorker(inbox, outbox, sessions, wake, heartbeats, transport, NullLogger<OmpWorker>.Instance)
 
 // fsharplint:enable redundantNewKeyword
+
+let private mkWorker (inbox: ICommandInbox) (sessions: FakeSessions) : OmpWorker =
+    mkWorkerWithTransport inbox sessions (FakeTransport())
+
+[<Fact>]
+let ``worker acknowledges accepted command with eyes reaction`` () =
+    task {
+        let inbox = FakeInbox()
+        let sessions = FakeSessions()
+        let transport = FakeTransport()
+        let worker = mkWorkerWithTransport inbox sessions transport
+        let chatId = 42L
+        let messageId = 1234567L
+
+        // updateId = messageId XOR (chatId <<< 32) — mirrors UpdateModel.mkUpdateId
+        let updateId = messageId ^^^ (chatId <<< 32)
+
+        let cmd =
+            inbox.InsertCommand
+                { Origin = Telegram
+                  ExternalKey = Some(sprintf "tg:%d" updateId)
+                  UserId = UserId 1L
+                  ChatId = ChatId chatId
+                  Payload = "привет"
+                  Priority = 0 }
+
+        do! worker.ProcessCommandForTest cmd
+        transport.Reactions |> should haveCount 1
+        let mid, emoji = transport.Reactions.[0]
+        mid |> should equal messageId
+        emoji |> should equal "👀"
+    }
 
 [<Fact>]
 let ``worker stop aborts and completes command`` () =
@@ -2294,7 +2325,9 @@ let ``uri resolver returns error on download failure`` () =
                 member _.EditMessage (_: ChatId) (_: int64) (_: string) (_: TelegramEntity list) = Task.FromResult(())
 
                 member _.DownloadVoice(_: VoiceRef) =
-                    task { return failwith "download exploded" } }
+                    task { return failwith "download exploded" }
+
+                member _.SetReaction (_: ChatId) (_: int64) (_: string) = Task.FromResult(()) }
 
         let resolver = HostUriResolver(transport, NullLogger<HostUriResolver>.Instance)
         let frame = JsonObject()
@@ -2322,7 +2355,6 @@ let ``formatter ignores message_update without assistant event`` () =
 
     let st, envs = EventFormatter.onEvent ctx EventFormatter.initialState frame
     envs |> should be Empty
-    st.Started |> should be False
 
 [<Fact>]
 let ``formatter ignores non text_delta assistant event`` () =
@@ -2335,7 +2367,6 @@ let ``formatter ignores non text_delta assistant event`` () =
 
     let st, envs = EventFormatter.onEvent ctx EventFormatter.initialState frame
     envs |> should be Empty
-    st.Started |> should be False
 
 [<Fact>]
 let ``formatter ignores empty delta and keeps state`` () =
@@ -2349,7 +2380,6 @@ let ``formatter ignores empty delta and keeps state`` () =
 
     let st, envs = EventFormatter.onEvent ctx EventFormatter.initialState frame
     envs |> should be Empty
-    st.Started |> should be False
 
 [<Fact>]
 let ``formatter appends subsequent deltas without a typing status`` () =
@@ -2367,8 +2397,7 @@ let ``formatter appends subsequent deltas without a typing status`` () =
     let st1, envs1 =
         EventFormatter.onEvent ctx EventFormatter.initialState (mkDelta "hi")
 
-    envs1 |> should haveLength 1
-    st1.Started |> should be True
+    envs1 |> should be Empty
 
     let st2, envs2 = EventFormatter.onEvent ctx st1 (mkDelta " there")
     envs2 |> should be Empty
@@ -2392,7 +2421,6 @@ let ``formatter defaults missing isTerminal to terminal`` () =
 
     let st2, envs = EventFormatter.onEvent ctx st1 endFrame
     envs |> should not' (be Empty)
-    st2.Started |> should be False
 
 // ---------------------------------------------------------------------------
 // SessionManager: get_state non-object + host tool no-match
@@ -2542,7 +2570,9 @@ let ``executor maps flood wait to an error`` () =
 
                 member _.SendMessage(_: SendTarget) = task { return Error(FloodWait 5) }
                 member _.EditMessage (_: ChatId) (_: int64) (_: string) (_: TelegramEntity list) = Task.FromResult(())
-                member _.DownloadVoice(_: VoiceRef) = task { return [||] } }
+                member _.DownloadVoice(_: VoiceRef) = task { return [||] }
+
+                member _.SetReaction (_: ChatId) (_: int64) (_: string) = Task.FromResult(()) }
 
         let executor =
             HostToolExecutor(transport, FakeVoiceProcessor(Ok "hi"), NullLogger<HostToolExecutor>.Instance)
@@ -2576,7 +2606,9 @@ let ``executor maps slowmode wait to an error`` () =
 
                 member _.SendMessage(_: SendTarget) = task { return Error(SlowModeWait 7) }
                 member _.EditMessage (_: ChatId) (_: int64) (_: string) (_: TelegramEntity list) = Task.FromResult(())
-                member _.DownloadVoice(_: VoiceRef) = task { return [||] } }
+                member _.DownloadVoice(_: VoiceRef) = task { return [||] }
+
+                member _.SetReaction (_: ChatId) (_: int64) (_: string) = Task.FromResult(()) }
 
         let executor =
             HostToolExecutor(transport, FakeVoiceProcessor(Ok "hi"), NullLogger<HostToolExecutor>.Instance)
