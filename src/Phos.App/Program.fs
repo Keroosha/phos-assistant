@@ -71,7 +71,13 @@ let main (argv: string[]) : int =
 
             builder.Services.AddSingleton<UpdateDedupe>(UpdateDedupe 1000) |> ignore
 
-            builder.Services.AddSingleton<TelegramTransport>(fun _ ->
+            builder.Services.AddSingleton<TelegramTransport>(fun sp ->
+                // Route WTelegramClient's Console logs into our pipeline under the
+                // "WTelegramClient" category so `Logging:LogLevel:WTelegramClient`
+                // can set its threshold.
+                WtLog.wire (sp.GetRequiredService<ILoggerFactory>().CreateLogger("WTelegramClient"))
+                |> ignore
+
                 TelegramTransport
                     { ApiId = cfg.Telegram.ApiId
                       ApiHash = cfg.Telegram.ApiHash

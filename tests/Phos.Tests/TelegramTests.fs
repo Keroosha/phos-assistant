@@ -2974,3 +2974,32 @@ let ``dedupe evicts the least recently used id beyond capacity`` () =
     dedupe.TryAdd 3L |> should be True
     dedupe.TryAdd 1L |> should be True
     dedupe.Count |> should equal 2
+
+// ---------------------------------------------------------------------------
+// WTelegramClient log routing (WtLog)
+// ---------------------------------------------------------------------------
+
+[<Fact>]
+let ``WtLog levelOf maps library levels to LogLevel`` () =
+    WtLog.levelOf 1 |> should equal LogLevel.Debug
+    WtLog.levelOf 2 |> should equal LogLevel.Information
+    WtLog.levelOf 3 |> should equal LogLevel.Warning
+    WtLog.levelOf 5 |> should equal LogLevel.Critical
+    WtLog.levelOf 0 |> should equal LogLevel.Trace
+    WtLog.levelOf 6 |> should equal LogLevel.None
+    WtLog.levelOf 99 |> should equal LogLevel.Information
+    WtLog.levelOf -1 |> should equal LogLevel.Information
+
+[<Fact>]
+let ``WtLog wire routes library logs into our logger with mapped level`` () =
+    let previous = WTelegram.Helpers.Log
+
+    try
+        let cap = CapturingLogger()
+        WtLog.wire cap |> ignore
+        WTelegram.Helpers.Log.Invoke(2, "hello from wt")
+
+        cap.Entries
+        |> should equal [ (LogLevel.Information, EventId 0, "hello from wt") ]
+    finally
+        WTelegram.Helpers.Log <- previous
