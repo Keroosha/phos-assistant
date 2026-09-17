@@ -11,6 +11,7 @@
     <Compile Include="CommandInbox.fs" />
     <Compile Include="ScheduleJobs.fs" />
     <Compile Include="MessageOutbox.fs" />
+    <Compile Include="BackupLog.fs" />
     <Compile Include="Repositories.fs" />
   </ItemGroup>
 

@@ -15,6 +15,7 @@ open Phos.Speech
 open Phos.Telegram
 open Phos.Omp
 open Phos.Scheduler
+open Phos.Backup
 open Phos.App
 
 /// Entry point. Binds and validates config (appsettings.json + `PHOS_` env vars
@@ -36,6 +37,7 @@ let main (argv: string[]) : int =
             1
         | Ok whitelist ->
             let options = Config.toStorageOptions cfg
+            let backupOptions = Config.toBackupOptions cfg
 
             Transport.ensureSessionDir cfg.Telegram.SessionPath
 
@@ -67,6 +69,10 @@ let main (argv: string[]) : int =
 
             builder.Services.AddSingleton<IScheduleJobRepository>(fun sp ->
                 Repositories.scheduleJobRepository (sp.GetRequiredService<StorageExecutor>()))
+            |> ignore
+
+            builder.Services.AddSingleton<IBackupLogRepository>(fun sp ->
+                Repositories.backupLog (sp.GetRequiredService<StorageExecutor>()))
             |> ignore
 
             builder.Services.AddSingleton<UpdateDedupe>(UpdateDedupe 1000) |> ignore
@@ -207,6 +213,27 @@ let main (argv: string[]) : int =
                         sp.GetRequiredService<WakeChannel>().Wake,
                         Config.toSchedulerOptions cfg,
                         sp.GetRequiredService<ILogger<SchedulerService>>()
+                    ))
+                |> ignore
+
+            // --- Backup wiring (Phase 7) --------------------------------------
+            if cfg.Backup.Enabled then
+                Directory.CreateDirectory backupOptions.Directory |> ignore
+
+                builder.Services.AddSingleton<IBackupService>(fun sp ->
+                    BackupService(
+                        backupOptions,
+                        sp.GetRequiredService<IBackupLogRepository>(),
+                        sp.GetRequiredService<ILogger<BackupService>>()
+                    )
+                    :> IBackupService)
+                |> ignore
+
+                builder.Services.AddHostedService<BackupHostedService>(fun sp ->
+                    new BackupHostedService(
+                        sp.GetRequiredService<IBackupService>(),
+                        backupOptions,
+                        sp.GetRequiredService<ILogger<BackupHostedService>>()
                     ))
                 |> ignore
 

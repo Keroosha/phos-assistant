@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="BackupOptions.fs" />
+    <Compile Include="Manifest.fs" />
+    <Compile Include="Snapshot.fs" />
+    <Compile Include="Archive.fs" />
+    <Compile Include="Retention.fs" />
+    <Compile Include="BackupService.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="FSharp.Core" />
+    <PackageReference Include="FsToolkit.ErrorHandling" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
+    <PackageReference Include="Microsoft.Extensions.Hosting" />
+    <PackageReference Include="Microsoft.Data.Sqlite" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../src/Phos.Storage/Phos.Storage.fsproj" />
+  </ItemGroup>
+
+</Project>
