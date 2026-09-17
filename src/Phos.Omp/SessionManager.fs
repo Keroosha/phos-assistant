@@ -32,22 +32,24 @@ type IOmpSessionManager =
 /// Mutable per-user runtime state. One RPC process + one in-memory command queue
 /// per user; the durable `command_inbox` remains the source of truth.
 type UserRuntime =
-    { UserId: UserId
-      Workspace: string
-      mutable Process: IOmpProcess option
-      mutable Client: IOmpRpcClient option
-      mutable SessionId: string option
-      mutable SessionFile: string option
-      mutable LastActivity: DateTimeOffset
-      mutable Busy: bool
-      mutable Queue: ResizeArray<Command>
-      mutable CurrentCommand: Command option
-      /// RPC request id of the prompt currently in flight, so a legal late
-      /// same-id failure response (immediate acceptance, later scheduling
-      /// error) can be attributed to this turn.
-      mutable PendingPromptId: string option
-      mutable StreamState: StreamState
-      mutable EventLock: SemaphoreSlim }
+    {
+        UserId: UserId
+        Workspace: string
+        mutable Process: IOmpProcess option
+        mutable Client: IOmpRpcClient option
+        mutable SessionId: string option
+        mutable SessionFile: string option
+        mutable LastActivity: DateTimeOffset
+        mutable Busy: bool
+        mutable Queue: ResizeArray<Command>
+        mutable CurrentCommand: Command option
+        /// RPC request id of the prompt currently in flight, so a legal late
+        /// same-id failure response (immediate acceptance, later scheduling
+        /// error) can be attributed to this turn.
+        mutable PendingPromptId: string option
+        mutable StreamState: StreamState
+        mutable EventLock: SemaphoreSlim
+    }
 
 /// Owns the per-user OMP runtime: spawn/respawn with `--resume`, per-user
 /// command queueing with a cap, event dispatch (host tools, host URIs, streamed
@@ -186,6 +188,7 @@ type SessionManager
         match orphaned with
         | Some cmd ->
             let finalize = turnEnded cmd.Id TurnOutcome.NeedsReview
+
             finalize.ContinueWith(
                 (fun (t: Task) ->
                     if t.IsFaulted then
@@ -252,40 +255,41 @@ type SessionManager
                         | None -> ()
                     | None -> ()
                 | _ ->
-                    let ctx =
-                        match rt.CurrentCommand with
-                        | Some cmd ->
+                    match rt.CurrentCommand with
+                    | None ->
+                        // Keep the existing busy signal for an agent that
+                        // started before the host associated a command, but
+                        // never flush orphaned deltas into command 0/chat 0.
+                        match Json.getString "type" frame with
+                        | Some "agent_start" -> rt.Busy <- true
+                        | Some "agent_end" -> rt.Busy <- false
+                        | _ -> ()
+
+                        rt.StreamState <- EventFormatter.initialState
+                    | Some cmd ->
+                        let ctx =
                             { CommandId = cmd.Id
                               ChatId = cmd.Envelope.ChatId }
-                        | None -> { CommandId = 0L; ChatId = ChatId 0L }
 
-                    let st, envelopes, outcome = EventFormatter.onEvent ctx rt.StreamState frame
-                    rt.StreamState <- st
+                        let st, envelopes, outcome = EventFormatter.onEvent ctx rt.StreamState frame
+                        rt.StreamState <- st
 
-                    for e in envelopes do
-                        do! enqueueOutbox e
+                        for e in envelopes do
+                            do! enqueueOutbox e
 
-                    match Json.getString "type" frame with
-                    | Some "agent_start" -> rt.Busy <- true
-                    | Some "agent_end" ->
-                        // `outcome` is `Some` only for a terminal `agent_end`.
-                        // A non-terminal `agent_end` means the session will
-                        // resume (maintenance/async delivery — including
-                        // OMP's auto-retry cycle): the turn is NOT over, the
-                        // runtime stays busy and nothing is finalized or
-                        // notified.
-                        match outcome with
-                        | Some turnOutcome ->
-                            let finished = rt.CurrentCommand
-
-                            match finished with
-                            | Some cmd -> do! finalizeTurn rt cmd turnOutcome
-                            | None ->
-                                rt.Busy <- false
-                                rt.PendingPromptId <- None
-                                rt.StreamState <- EventFormatter.initialState
-                        | None -> ()
-                    | _ -> ()
+                        match Json.getString "type" frame with
+                        | Some "agent_start" -> rt.Busy <- true
+                        | Some "agent_end" ->
+                            // `outcome` is `Some` only for a terminal
+                            // `agent_end`. A non-terminal `agent_end` means
+                            // the session will resume (maintenance/async
+                            // delivery — including OMP's auto-retry cycle):
+                            // the turn is NOT over, the runtime stays busy
+                            // and nothing is finalized or notified.
+                            match outcome with
+                            | Some turnOutcome -> do! finalizeTurn rt cmd turnOutcome
+                            | None -> ()
+                        | _ -> ()
             finally
                 rt.EventLock.Release() |> ignore
         }
@@ -477,17 +481,18 @@ type SessionManager
                 match orphaned with
                 | Some cmd ->
                     let finalize = turnEnded cmd.Id TurnOutcome.NeedsReview
+
                     finalize.ContinueWith(
-                            (fun (t: Task) ->
-                                if t.IsFaulted then
-                                    logger.LogError(
-                                        t.Exception,
-                                        "needs_review finalization failed for command {Id}",
-                                        cmd.Id
-                                    )),
-                            TaskContinuationOptions.OnlyOnFaulted
-                        )
-                        |> ignore
+                        (fun (t: Task) ->
+                            if t.IsFaulted then
+                                logger.LogError(
+                                    t.Exception,
+                                    "needs_review finalization failed for command {Id}",
+                                    cmd.Id
+                                )),
+                        TaskContinuationOptions.OnlyOnFaulted
+                    )
+                    |> ignore
                 | None -> ()
 
     /// Tears down every runtime (abort busy turns and kill processes).

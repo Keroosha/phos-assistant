@@ -8,19 +8,21 @@ open Microsoft.Extensions.Logging
 
 /// Arguments used to spawn an `omp --mode rpc` child proc.
 type OmpProcessOptions =
-    { OmpPath: string
-      Profile: string
-      WorkspaceDir: string
-      SessionResume: string option
-      Tools: string
-      ApprovalMode: string
-      /// OMP-side operational wall-clock ceiling passed as `--max-time`. This
-      /// is an explicit operator ceiling only — never a Phos turn-failure
-      /// mechanism. Empty/whitespace omits the flag so a healthy long turn
-      /// always runs to its terminal `agent_end`.
-      MaxTime: string
-      ExtraFlags: string list
-      ReadyTimeoutSeconds: int }
+    {
+        OmpPath: string
+        Profile: string
+        WorkspaceDir: string
+        SessionResume: string option
+        Tools: string
+        ApprovalMode: string
+        /// OMP-side operational wall-clock ceiling passed as `--max-time`. This
+        /// is an explicit operator ceiling only — never a Phos turn-failure
+        /// mechanism. Empty/whitespace omits the flag so a healthy long turn
+        /// always runs to its terminal `agent_end`.
+        MaxTime: string
+        ExtraFlags: string list
+        ReadyTimeoutSeconds: int
+    }
 
 module private OmpProcessUtil =
     let killQuiet (p: Process) : unit =

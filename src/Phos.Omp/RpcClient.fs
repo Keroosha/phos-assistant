@@ -34,7 +34,8 @@ type IOmpRpcClient =
     abstract SendRawAsync: frame: JsonObject -> Task<unit>
 
     abstract PromptAsync:
-        message: string * ?streamingBehavior: string * ?images: string list * ?id: string -> Task<Result<JsonNode, RpcError>>
+        message: string * ?streamingBehavior: string * ?images: string list * ?id: string ->
+            Task<Result<JsonNode, RpcError>>
 
     abstract AbortAsync: unit -> Task<Result<JsonNode, RpcError>>
     abstract AbortAndPromptAsync: message: string -> Task<Result<JsonNode, RpcError>>

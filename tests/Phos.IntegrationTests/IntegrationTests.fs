@@ -396,8 +396,7 @@ type TestHooks() =
 
     member _.Enqueue(e: OutboxEnvelope) : Task<unit> = task { envelopes.Add e }
 
-    member _.TurnEndedF(id: int64) (outcome: TurnOutcome) : Task<unit> =
-        task { turnEnded.Add(id, outcome) }
+    member _.TurnEndedF (id: int64) (outcome: TurnOutcome) : Task<unit> = task { turnEnded.Add(id, outcome) }
 
 type FakeOmpContext =
     { Server: FakeLlmServer
@@ -707,6 +706,18 @@ let ``agent_end terminal gating completes exactly once`` () =
                         // process) must not complete again.
                         do! sm.HandleEvent(user, terminal)
                         ctx.Hooks.TurnEnded.Count |> should equal 1
+
+                        // Late frames after finalization must not be routed to
+                        // the synthetic command 0/chat 0 context.
+                        let lateDelta = JsonObject()
+                        lateDelta["type"] <- "message_update"
+                        let lateEvent = JsonObject()
+                        lateEvent["type"] <- "text_delta"
+                        lateEvent["delta"] <- "orphaned"
+                        lateDelta["assistantMessageEvent"] <- lateEvent
+                        do! sm.HandleEvent(user, lateDelta)
+                        do! sm.HandleEvent(user, terminal)
+                        ctx.Hooks.Envelopes |> should be Empty
                     }))
     }
 
@@ -747,7 +758,8 @@ let ``abort stops a running turn and the next prompt works`` () =
 
                         // omp v18.1.19 emits a terminal `agent_end` on abort, so
                         // the aborted command (id 1) is finalized.
-                        let! aborted = waitFor 5000 (fun () -> ctx.Hooks.TurnEnded |> Seq.exists (fun (i, _) -> i = 1L))
+                        let! aborted =
+                            waitFor 5000 (fun () -> ctx.Hooks.TurnEnded |> Seq.exists (fun (i, _) -> i = 1L))
 
                         aborted |> should be True
 
@@ -864,7 +876,8 @@ let ``queue overflow does not lose commands`` () =
                     Schema.run storageOpts
                     let inbox = Repositories.commandInbox exec
 
-                    let turnEndedFn (cmdId: int64) (_: TurnOutcome) : Task<unit> = task { do! inbox.MarkCompleted cmdId }
+                    let turnEndedFn (cmdId: int64) (_: TurnOutcome) : Task<unit> =
+                        task { do! inbox.MarkCompleted cmdId }
 
                     let runScenario (sm: SessionManager) : Task<unit> =
                         task {

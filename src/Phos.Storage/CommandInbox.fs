@@ -325,7 +325,7 @@ type CommandInbox(exec: StorageExecutor) =
                     SET attempts = attempts + 1,
                         status = CASE WHEN attempts + 1 >= max_attempts THEN 'dead_letter' ELSE 'failed' END,
                         updated_at = $now
-                    WHERE id = $id;
+                    WHERE id = $id AND status IN ('claimed', 'running');
                 """
 
                 cmd.Parameters.AddWithValue("$id", id) |> ignore

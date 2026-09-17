@@ -1254,9 +1254,12 @@ let ``failed command without retry stays failed and is not claimable`` () =
                 let! _ = inbox.ClaimById id l
                 do! inbox.MarkStarted id
                 do! inbox.MarkFailed id
+                // A duplicate finalization must not increment attempts again.
+                do! inbox.MarkFailed id
 
                 let! c = inbox.GetById id
                 c.Value.Status |> should equal In.Status.Failed
+                c.Value.Attempts |> should equal 1
 
                 // The worker scan cannot claim it and lease expiry does not
                 // revive it: no silent requeue after an exhausted failure.

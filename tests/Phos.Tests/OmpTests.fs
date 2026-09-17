@@ -2101,23 +2101,29 @@ type FakeOutbox() =
             (entities: Entity list)
             =
             task {
-                let e =
-                    { Id = int64 entries.Count
-                      CommandId = commandId
-                      ChunkIndex = chunkIndex
-                      ChatId = chatId
-                      RandomId = randomId
-                      Payload = payload
-                      Entities = entities
-                      Status = Outbox.Status.Pending
-                      Attempts = 0
-                      MaxAttempts = 5
-                      RemoteMessageId = None
-                      CreatedAt = DateTimeOffset.UtcNow
-                      UpdatedAt = DateTimeOffset.UtcNow }
+                match
+                    entries
+                    |> Seq.tryFind (fun e -> e.CommandId = commandId && e.ChunkIndex = chunkIndex)
+                with
+                | Some existing -> return existing.Id
+                | None ->
+                    let e =
+                        { Id = int64 entries.Count
+                          CommandId = commandId
+                          ChunkIndex = chunkIndex
+                          ChatId = chatId
+                          RandomId = randomId
+                          Payload = payload
+                          Entities = entities
+                          Status = Outbox.Status.Pending
+                          Attempts = 0
+                          MaxAttempts = 5
+                          RemoteMessageId = None
+                          CreatedAt = DateTimeOffset.UtcNow
+                          UpdatedAt = DateTimeOffset.UtcNow }
 
-                entries.Add e
-                return e.Id
+                    entries.Add e
+                    return e.Id
             }
 
         member _.NextPending() = task { return None }
@@ -2355,6 +2361,37 @@ let ``omp process start captures ready frame and can be killed`` () =
             | Ok p ->
                 p.ReadyFrame |> RpcProtocol.classify |> should equal FrameKind.Ready
                 p.IsDead |> should equal false
+                p.Kill()
+        finally
+            Directory.Delete(dir, true)
+    }
+
+[<Fact>]
+let ``omp process omits optional max-time ceiling`` () =
+    task {
+        let dir =
+            Path.Combine(Path.GetTempPath(), "phos-omp-" + Guid.NewGuid().ToString("N"))
+
+        Directory.CreateDirectory(dir) |> ignore
+
+        try
+            let argsPath = Path.Combine(dir, "args")
+
+            let script =
+                writeExecutableScript
+                    dir
+                    (sprintf
+                        "#!/usr/bin/env bash\nprintf '%%s\\n' \"$@\" > '%s'\necho '%s'\ncat > /dev/null\n"
+                        argsPath
+                        readyLine)
+
+            let options = { ompOpts script 5 with MaxTime = "" }
+
+            match OmpProcess.Start(options, NullLogger<OmpProcess>.Instance) with
+            | Error e -> failwith ("expected Ok, got " + e)
+            | Ok p ->
+                let args = File.ReadAllLines argsPath |> Array.toList
+                args |> List.contains "--max-time" |> should be False
                 p.Kill()
         finally
             Directory.Delete(dir, true)
@@ -3732,9 +3769,14 @@ let ``terminal provider error with no text emits nothing and classifies failure`
     task {
         let ctx = { CommandId = 1L; ChatId = ChatId 5L }
         let frame = mkErrorAgentEnd true None
-        let _, envelopes, outcome = EventFormatter.onEvent ctx EventFormatter.initialState frame
+
+        let _, envelopes, outcome =
+            EventFormatter.onEvent ctx EventFormatter.initialState frame
+
         envelopes |> should be Empty
-        outcome |> should equal (Some(TurnOutcome.ProviderFailure "unknown provider error"))
+
+        outcome
+        |> should equal (Some(TurnOutcome.ProviderFailure "unknown provider error"))
     }
 
 [<Fact>]
@@ -3795,8 +3837,7 @@ let ``terminal provider error finalizes with failure, no re-prompt, runtime pres
         let client = ScriptedRpcClient()
         let outcomes = ResizeArray<int64 * TurnOutcome>()
 
-        let turnEnded (cmdId: int64) (o: TurnOutcome) : Task<unit> =
-            task { outcomes.Add(cmdId, o) }
+        let turnEnded (cmdId: int64) (o: TurnOutcome) : Task<unit> = task { outcomes.Add(cmdId, o) }
 
         let spawn (_: OmpProcessOptions) : Result<IOmpProcess, string> = Ok(fakeProc :> IOmpProcess)
         let sm = scriptedSm spawn client turnEnded
@@ -3807,7 +3848,9 @@ let ``terminal provider error finalizes with failure, no re-prompt, runtime pres
 
         outcomes.Count |> should equal 1
         fst outcomes.[0] |> should equal 1L
-        snd outcomes.[0] |> should equal (TurnOutcome.ProviderFailure "provider exploded")
+
+        snd outcomes.[0]
+        |> should equal (TurnOutcome.ProviderFailure "provider exploded")
 
         // No Phos-side retry: the failed command is not re-prompted...
         client.PromptCount |> should equal 1
@@ -3833,8 +3876,7 @@ let ``terminal provider error drains the next queued command without requeueing 
         let client = ScriptedRpcClient()
         let outcomes = ResizeArray<int64 * TurnOutcome>()
 
-        let turnEnded (cmdId: int64) (o: TurnOutcome) : Task<unit> =
-            task { outcomes.Add(cmdId, o) }
+        let turnEnded (cmdId: int64) (o: TurnOutcome) : Task<unit> = task { outcomes.Add(cmdId, o) }
 
         let spawn (_: OmpProcessOptions) : Result<IOmpProcess, string> = Ok(fakeProc :> IOmpProcess)
         let sm = scriptedSm spawn client turnEnded
@@ -3861,8 +3903,7 @@ let ``auto retry events and non terminal agent_end never finalize or notify`` ()
         let client = ScriptedRpcClient()
         let outcomes = ResizeArray<int64 * TurnOutcome>()
 
-        let turnEnded (cmdId: int64) (o: TurnOutcome) : Task<unit> =
-            task { outcomes.Add(cmdId, o) }
+        let turnEnded (cmdId: int64) (o: TurnOutcome) : Task<unit> = task { outcomes.Add(cmdId, o) }
 
         let spawn (_: OmpProcessOptions) : Result<IOmpProcess, string> = Ok(fakeProc :> IOmpProcess)
         let sm = scriptedSm spawn client turnEnded
@@ -3892,7 +3933,9 @@ let ``auto retry events and non terminal agent_end never finalize or notify`` ()
         do! sm.HandleEvent(user, mkErrorAgentEnd true (Some "retries exhausted"))
 
         outcomes.Count |> should equal 1
-        snd outcomes.[0] |> should equal (TurnOutcome.ProviderFailure "retries exhausted")
+
+        snd outcomes.[0]
+        |> should equal (TurnOutcome.ProviderFailure "retries exhausted")
     }
 
 [<Fact>]
@@ -3902,8 +3945,7 @@ let ``late same-id rpc failure finalizes the turn without a duplicate prompt`` (
         let client = ScriptedRpcClient()
         let outcomes = ResizeArray<int64 * TurnOutcome>()
 
-        let turnEnded (cmdId: int64) (o: TurnOutcome) : Task<unit> =
-            task { outcomes.Add(cmdId, o) }
+        let turnEnded (cmdId: int64) (o: TurnOutcome) : Task<unit> = task { outcomes.Add(cmdId, o) }
 
         let spawn (_: OmpProcessOptions) : Result<IOmpProcess, string> = Ok(fakeProc :> IOmpProcess)
         let sm = scriptedSm spawn client turnEnded
@@ -3937,8 +3979,7 @@ let ``late rpc failure for a foreign id is ignored`` () =
         let client = ScriptedRpcClient()
         let outcomes = ResizeArray<int64 * TurnOutcome>()
 
-        let turnEnded (cmdId: int64) (o: TurnOutcome) : Task<unit> =
-            task { outcomes.Add(cmdId, o) }
+        let turnEnded (cmdId: int64) (o: TurnOutcome) : Task<unit> = task { outcomes.Add(cmdId, o) }
 
         let spawn (_: OmpProcessOptions) : Result<IOmpProcess, string> = Ok(fakeProc :> IOmpProcess)
         let sm = scriptedSm spawn client turnEnded
@@ -3974,8 +4015,7 @@ let ``process exit mid turn parks the command for review without replay`` () =
         let client = ScriptedRpcClient()
         let outcomes = ResizeArray<int64 * TurnOutcome>()
 
-        let turnEnded (cmdId: int64) (o: TurnOutcome) : Task<unit> =
-            task { outcomes.Add(cmdId, o) }
+        let turnEnded (cmdId: int64) (o: TurnOutcome) : Task<unit> = task { outcomes.Add(cmdId, o) }
 
         let spawn (_: OmpProcessOptions) : Result<IOmpProcess, string> = Ok(fakeProc :> IOmpProcess)
         let sm = scriptedSm spawn client turnEnded
@@ -3998,8 +4038,7 @@ let ``idle timeout on an in-flight turn parks the command for review`` () =
         let client = ScriptedRpcClient()
         let outcomes = ResizeArray<int64 * TurnOutcome>()
 
-        let turnEnded (cmdId: int64) (o: TurnOutcome) : Task<unit> =
-            task { outcomes.Add(cmdId, o) }
+        let turnEnded (cmdId: int64) (o: TurnOutcome) : Task<unit> = task { outcomes.Add(cmdId, o) }
 
         let spawn (_: OmpProcessOptions) : Result<IOmpProcess, string> = Ok(fakeProc :> IOmpProcess)
         let createClient (_: Process) (_: JsonObject) : IOmpRpcClient = client :> IOmpRpcClient
@@ -4021,7 +4060,7 @@ let ``idle timeout on an in-flight turn parks the command for review`` () =
     }
 
 // ---------------------------------------------------------------------------
-// Durable command finalization (Phos.App.TurnFinalization)
+// Durable command finalization (TurnFinalization)
 // ---------------------------------------------------------------------------
 
 let private runningCommand () : Task<FakeInbox * FakeOutbox * int64> =
@@ -4040,7 +4079,11 @@ let private runningCommand () : Task<FakeInbox * FakeOutbox * int64> =
 
         let ib = inbox :> ICommandInbox
         let! id = ib.Insert env
-        let lease = { Until = DateTimeOffset.UtcNow.AddSeconds 60.0; HeartbeatAt = DateTimeOffset.UtcNow }
+
+        let lease =
+            { Until = DateTimeOffset.UtcNow.AddSeconds 60.0
+              HeartbeatAt = DateTimeOffset.UtcNow }
+
         let! _ = ib.ClaimNextForChat (ChatId 9L) lease
         do! ib.MarkStarted id
         return (inbox, outbox, id)
@@ -4052,7 +4095,13 @@ let ``finalization of a provider failure is durable, single-notice and not reque
         let! inbox, outbox, id = runningCommand ()
         let logger = NullLogger.Instance
 
-        do! Phos.App.TurnFinalization.apply (inbox :> ICommandInbox) (outbox :> IMessageOutbox) logger id (TurnOutcome.ProviderFailure "boom")
+        do!
+            TurnFinalization.apply
+                (inbox :> ICommandInbox)
+                (outbox :> IMessageOutbox)
+                logger
+                id
+                (TurnOutcome.ProviderFailure "boom")
 
         // Durable failed terminal state (attempts incremented), NOT pending.
         let! c = inbox.GetById id
@@ -4062,16 +4111,64 @@ let ``finalization of a provider failure is durable, single-notice and not reque
         outbox.Entries.Count |> should equal 1
         outbox.Entries.[0].ChatId |> should equal (ChatId 9L)
         outbox.Entries.[0].CommandId |> should equal id
-        outbox.Entries.[0].Payload |> should equal Phos.App.TurnFinalization.ProviderFailureNotice
+
+        outbox.Entries.[0].Payload
+        |> should equal TurnFinalization.ProviderFailureNotice
 
         // The worker scan must not requeue it: nothing claimable, and lease
         // expiry does not revive a failed command.
-        let l = { Until = DateTimeOffset.UtcNow.AddSeconds 60.0; HeartbeatAt = DateTimeOffset.UtcNow }
+        let l =
+            { Until = DateTimeOffset.UtcNow.AddSeconds 60.0
+              HeartbeatAt = DateTimeOffset.UtcNow }
+
         let! claimed = (inbox :> ICommandInbox).ClaimNextForChat (ChatId 9L) l
         claimed |> should equal None
         let! _ = (inbox :> ICommandInbox).ExpireLeases(DateTimeOffset.UtcNow.AddHours 1.0)
         let! c2 = inbox.GetById id
         c2.Value.Status |> should equal Inbox.Status.Failed
+    }
+
+[<Fact>]
+let ``provider failure finalization is idempotent and cannot revert completion`` () =
+    task {
+        let! inbox, outbox, id = runningCommand ()
+        let logger = NullLogger.Instance
+
+        do!
+            TurnFinalization.apply
+                (inbox :> ICommandInbox)
+                (outbox :> IMessageOutbox)
+                logger
+                id
+                (TurnOutcome.ProviderFailure "first")
+
+        do!
+            TurnFinalization.apply
+                (inbox :> ICommandInbox)
+                (outbox :> IMessageOutbox)
+                logger
+                id
+                (TurnOutcome.ProviderFailure "duplicate")
+
+        let! failed = inbox.GetById id
+        failed.Value.Status |> should equal Inbox.Status.Failed
+        failed.Value.Attempts |> should equal 1
+        outbox.Entries.Count |> should equal 1
+
+        let! inbox2, outbox2, id2 = runningCommand ()
+        do! (inbox2 :> ICommandInbox).MarkCompleted id2
+
+        do!
+            TurnFinalization.apply
+                (inbox2 :> ICommandInbox)
+                (outbox2 :> IMessageOutbox)
+                logger
+                id2
+                (TurnOutcome.ProviderFailure "late")
+
+        let! completed = inbox2.GetById id2
+        completed.Value.Status |> should equal Inbox.Status.Completed
+        outbox2.Entries.Count |> should equal 0
     }
 
 [<Fact>]
@@ -4081,7 +4178,7 @@ let ``finalization of normal and abort outcomes completes without outbox error``
             let! inbox, outbox, id = runningCommand ()
             let logger = NullLogger.Instance
 
-            do! Phos.App.TurnFinalization.apply (inbox :> ICommandInbox) (outbox :> IMessageOutbox) logger id outcome
+            do! TurnFinalization.apply (inbox :> ICommandInbox) (outbox :> IMessageOutbox) logger id outcome
 
             let! c = inbox.GetById id
             c.Value.Status |> should equal Inbox.Status.Completed
@@ -4094,9 +4191,11 @@ let ``finalization of an uncertain outcome parks the command for review`` () =
         let! inbox, outbox, id = runningCommand ()
         let logger = NullLogger.Instance
 
-        do! Phos.App.TurnFinalization.apply (inbox :> ICommandInbox) (outbox :> IMessageOutbox) logger id TurnOutcome.NeedsReview
+        do! TurnFinalization.apply (inbox :> ICommandInbox) (outbox :> IMessageOutbox) logger id TurnOutcome.NeedsReview
 
         let! c = inbox.GetById id
         c.Value.Status |> should equal Inbox.Status.NeedsReview
-        outbox.Entries.Count |> should equal 0
+        outbox.Entries.Count |> should equal 1
+
+        outbox.Entries.[0].Payload |> should equal TurnFinalization.NeedsReviewNotice
     }
