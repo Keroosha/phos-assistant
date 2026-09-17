@@ -19,6 +19,12 @@ type IOmpRpcClient =
     /// Fired for malformed frames, oversized physical frames and reassembly
     /// failures. Never thrown.
     abstract ParseError: IEvent<string>
+    /// Fired for a failure `response` whose id no longer matches a pending
+    /// request: `prompt`/`abort_and_prompt` are acknowledged immediately and
+    /// may emit a later error response with the SAME id when async prompt
+    /// scheduling fails. The late error is surfaced here instead of being
+    /// silently ignored.
+    abstract LateFailure: IEvent<string * RpcError>
     /// True once the child proc has exited or its stdout closed.
     abstract IsDead: bool
     /// Sends a command frame and awaits the correlated response.
@@ -28,7 +34,8 @@ type IOmpRpcClient =
     abstract SendRawAsync: frame: JsonObject -> Task<unit>
 
     abstract PromptAsync:
-        message: string * ?streamingBehavior: string * ?images: string list -> Task<Result<JsonNode, RpcError>>
+        message: string * ?streamingBehavior: string * ?images: string list * ?id: string ->
+            Task<Result<JsonNode, RpcError>>
 
     abstract AbortAsync: unit -> Task<Result<JsonNode, RpcError>>
     abstract AbortAndPromptAsync: message: string -> Task<Result<JsonNode, RpcError>>
@@ -46,6 +53,7 @@ type OmpRpcClient(proc: Process, logger: ILogger, ?readyFrame: JsonObject) =
     let stdout = proc.StandardOutput
     let eventReceived = Event<JsonObject>()
     let parseError = Event<string>()
+    let lateFailure = Event<string * RpcError>()
 
     let pending =
         ConcurrentDictionary<string, TaskCompletionSource<Result<JsonNode, RpcError>>>()
@@ -99,20 +107,25 @@ type OmpRpcClient(proc: Process, logger: ILogger, ?readyFrame: JsonObject) =
     let handleResponse (frame: JsonObject) : unit =
         match Json.getString "id" frame with
         | Some id ->
+            let errorOf () : RpcError =
+                { Command = defaultArg (Json.getString "command" frame) ""
+                  Code = Json.getString "code" frame
+                  Message = defaultArg (Json.getString "error" frame) "" }
+
             match pending.TryRemove id with
             | true, tcs ->
                 match Json.getBool "success" frame with
                 | Some true ->
                     let data = defaultArg (Json.tryGet "data" frame) (JsonObject())
                     tcs.TrySetResult(Ok data) |> ignore
-                | _ ->
-                    let err =
-                        { Command = defaultArg (Json.getString "command" frame) ""
-                          Code = Json.getString "code" frame
-                          Message = defaultArg (Json.getString "error" frame) "" }
-
-                    tcs.TrySetResult(Error err) |> ignore
-            | false, _ -> ()
+                | _ -> tcs.TrySetResult(Error(errorOf ())) |> ignore
+            | false, _ ->
+                // Late response for an already-resolved request. `prompt` and
+                // `abort_and_prompt` are acknowledged immediately and may emit
+                // a later error response with the same id when async prompt
+                // scheduling fails; surface it instead of dropping it.
+                if Json.getBool "success" frame = Some false then
+                    lateFailure.Trigger(id, errorOf ())
         | None -> parseError.Trigger "response frame without id"
 
     let dispatchFrame (frame: JsonObject) : unit =
@@ -217,6 +230,7 @@ type OmpRpcClient(proc: Process, logger: ILogger, ?readyFrame: JsonObject) =
     interface IOmpRpcClient with
         member _.EventReceived = eventReceived.Publish
         member _.ParseError = parseError.Publish
+        member _.LateFailure = lateFailure.Publish
         member _.IsDead = dead
 
         member _.SendAsync(command: string, payload: JsonNode, ?id: string) : Task<Result<JsonNode, RpcError>> =
@@ -225,7 +239,7 @@ type OmpRpcClient(proc: Process, logger: ILogger, ?readyFrame: JsonObject) =
         member _.SendRawAsync(frame: JsonObject) : Task<unit> = task { writeFrame frame |> ignore }
 
         member _.PromptAsync
-            (message: string, ?streamingBehavior: string, ?images: string list)
+            (message: string, ?streamingBehavior: string, ?images: string list, ?id: string)
             : Task<Result<JsonNode, RpcError>> =
             let payload = JsonObject()
             payload["message"] <- message
@@ -245,7 +259,7 @@ type OmpRpcClient(proc: Process, logger: ILogger, ?readyFrame: JsonObject) =
 
                     payload["images"] <- (arr :> JsonNode))
 
-            send "prompt" payload None
+            send "prompt" payload id
 
         member _.AbortAsync() : Task<Result<JsonNode, RpcError>> = send "abort" (JsonObject()) None
 

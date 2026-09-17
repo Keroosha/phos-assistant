@@ -8,15 +8,21 @@ open Microsoft.Extensions.Logging
 
 /// Arguments used to spawn an `omp --mode rpc` child proc.
 type OmpProcessOptions =
-    { OmpPath: string
-      Profile: string
-      WorkspaceDir: string
-      SessionResume: string option
-      Tools: string
-      ApprovalMode: string
-      MaxTime: string
-      ExtraFlags: string list
-      ReadyTimeoutSeconds: int }
+    {
+        OmpPath: string
+        Profile: string
+        WorkspaceDir: string
+        SessionResume: string option
+        Tools: string
+        ApprovalMode: string
+        /// OMP-side operational wall-clock ceiling passed as `--max-time`. This
+        /// is an explicit operator ceiling only — never a Phos turn-failure
+        /// mechanism. Empty/whitespace omits the flag so a healthy long turn
+        /// always runs to its terminal `agent_end`.
+        MaxTime: string
+        ExtraFlags: string list
+        ReadyTimeoutSeconds: int
+    }
 
 module private OmpProcessUtil =
     let killQuiet (p: Process) : unit =
@@ -125,6 +131,16 @@ type OmpProcess private (proc: Process, readyFrame: JsonObject, logger: ILogger)
             psi.RedirectStandardError <- true
             psi.UseShellExecute <- false
 
+            // `--max-time` is an OMP-side operational wall-clock ceiling only —
+            // it is NOT part of Phos's failure/retry logic, which relies on the
+            // terminal `agent_end`. An empty `MaxTime` omits the flag entirely
+            // so a healthy, genuinely long turn is never killed prematurely.
+            let timedArgs =
+                if String.IsNullOrWhiteSpace options.MaxTime then
+                    []
+                else
+                    [ "--max-time"; options.MaxTime ]
+
             let args =
                 [ "--mode"
                   "rpc"
@@ -135,11 +151,9 @@ type OmpProcess private (proc: Process, readyFrame: JsonObject, logger: ILogger)
                   "--tools"
                   options.Tools
                   "--approval-mode"
-                  options.ApprovalMode
-                  "--max-time"
-                  options.MaxTime
-                  "--no-lsp"
-                  "--no-pty" ]
+                  options.ApprovalMode ]
+                @ timedArgs
+                @ [ "--no-lsp"; "--no-pty" ]
 
             for a in args do
                 psi.ArgumentList.Add(a) |> ignore

@@ -258,6 +258,7 @@ type FakeScheduleRepo() =
 type FakeRpcClient(sessionId: string) =
     let eventReceived = Event<JsonObject>()
     let parseError = Event<string>()
+    let lateFailure = Event<string * RpcError>()
     let mutable abortCount = 0
     let mutable promptCount = 0
     let mutable disposed = false
@@ -280,6 +281,7 @@ type FakeRpcClient(sessionId: string) =
     interface IOmpRpcClient with
         member _.EventReceived = eventReceived.Publish
         member _.ParseError = parseError.Publish
+        member _.LateFailure = lateFailure.Publish
         member _.IsDead = false
 
         member _.SendAsync(command: string, payload: JsonNode, ?id: string) : Task<Result<JsonNode, RpcError>> =
@@ -292,7 +294,7 @@ type FakeRpcClient(sessionId: string) =
         member _.SendRawAsync(_: JsonObject) : Task<unit> = Task.FromResult(())
 
         member _.PromptAsync
-            (message: string, ?streamingBehavior: string, ?images: string list)
+            (message: string, ?streamingBehavior: string, ?images: string list, ?id: string)
             : Task<Result<JsonNode, RpcError>> =
             prompts.Add(message)
             promptCount <- promptCount + 1
@@ -330,14 +332,17 @@ type FakeRpcClient(sessionId: string) =
 type RecordingRpcClient(inner: IOmpRpcClient, states: ResizeArray<JsonObject>) =
     let eventReceived = Event<JsonObject>()
     let parseError = Event<string>()
+    let lateFailure = Event<string * RpcError>()
 
     do
         inner.EventReceived.Add(eventReceived.Trigger)
         inner.ParseError.Add(parseError.Trigger)
+        inner.LateFailure.Add(lateFailure.Trigger)
 
     interface IOmpRpcClient with
         member _.EventReceived = eventReceived.Publish
         member _.ParseError = parseError.Publish
+        member _.LateFailure = lateFailure.Publish
         member _.IsDead = inner.IsDead
 
         member _.SendAsync(command: string, payload: JsonNode, ?id: string) : Task<Result<JsonNode, RpcError>> =
@@ -346,9 +351,9 @@ type RecordingRpcClient(inner: IOmpRpcClient, states: ResizeArray<JsonObject>) =
         member _.SendRawAsync(frame: JsonObject) : Task<unit> = inner.SendRawAsync frame
 
         member _.PromptAsync
-            (message: string, ?streamingBehavior: string, ?images: string list)
+            (message: string, ?streamingBehavior: string, ?images: string list, ?id: string)
             : Task<Result<JsonNode, RpcError>> =
-            inner.PromptAsync(message, ?streamingBehavior = streamingBehavior, ?images = images)
+            inner.PromptAsync(message, ?streamingBehavior = streamingBehavior, ?images = images, ?id = id)
 
         member _.AbortAsync() : Task<Result<JsonNode, RpcError>> = inner.AbortAsync()
 
@@ -385,13 +390,13 @@ type RecordingRpcClient(inner: IOmpRpcClient, states: ResizeArray<JsonObject>) =
 
 type TestHooks() =
     let envelopes = ResizeArray<OutboxEnvelope>()
-    let turnEnded = ResizeArray<int64>()
+    let turnEnded = ResizeArray<int64 * TurnOutcome>()
     member _.Envelopes = envelopes
     member _.TurnEnded = turnEnded
 
     member _.Enqueue(e: OutboxEnvelope) : Task<unit> = task { envelopes.Add e }
 
-    member _.TurnEndedF(id: int64) : Task<unit> = task { turnEnded.Add id }
+    member _.TurnEndedF (id: int64) (outcome: TurnOutcome) : Task<unit> = task { turnEnded.Add(id, outcome) }
 
 type FakeOmpContext =
     { Server: FakeLlmServer
@@ -450,7 +455,7 @@ let private makeSessionManager
     (maxQueue: int)
     (spawnProcess: (OmpProcessOptions -> Result<IOmpProcess, string>) option)
     (createClient: (Process -> JsonObject -> IOmpRpcClient) option)
-    (turnEnded: (int64 -> Task<unit>) option)
+    (turnEnded: (int64 -> TurnOutcome -> Task<unit>) option)
     : SessionManager =
     let options =
         { Profile = ctx.ProfileName
@@ -541,7 +546,7 @@ let private withSessionManager
     (maxQueue: int)
     (spawnProcess: (OmpProcessOptions -> Result<IOmpProcess, string>) option)
     (createClient: (Process -> JsonObject -> IOmpRpcClient) option)
-    (turnEnded: (int64 -> Task<unit>) option)
+    (turnEnded: (int64 -> TurnOutcome -> Task<unit>) option)
     (f: SessionManager -> Task<'T>)
     : Task<'T> =
     task {
@@ -695,12 +700,24 @@ let ``agent_end terminal gating completes exactly once`` () =
                         terminal["isTerminal"] <- true
                         do! sm.HandleEvent(user, terminal)
                         ctx.Hooks.TurnEnded.Count |> should equal 1
-                        ctx.Hooks.TurnEnded.[0] |> should equal 7L
+                        fst ctx.Hooks.TurnEnded.[0] |> should equal 7L
 
                         // A second terminal agent_end (e.g. from the real
                         // process) must not complete again.
                         do! sm.HandleEvent(user, terminal)
                         ctx.Hooks.TurnEnded.Count |> should equal 1
+
+                        // Late frames after finalization must not be routed to
+                        // the synthetic command 0/chat 0 context.
+                        let lateDelta = JsonObject()
+                        lateDelta["type"] <- "message_update"
+                        let lateEvent = JsonObject()
+                        lateEvent["type"] <- "text_delta"
+                        lateEvent["delta"] <- "orphaned"
+                        lateDelta["assistantMessageEvent"] <- lateEvent
+                        do! sm.HandleEvent(user, lateDelta)
+                        do! sm.HandleEvent(user, terminal)
+                        ctx.Hooks.Envelopes |> should be Empty
                     }))
     }
 
@@ -741,7 +758,8 @@ let ``abort stops a running turn and the next prompt works`` () =
 
                         // omp v18.1.19 emits a terminal `agent_end` on abort, so
                         // the aborted command (id 1) is finalized.
-                        let! aborted = waitFor 5000 (fun () -> ctx.Hooks.TurnEnded |> Seq.contains 1L)
+                        let! aborted =
+                            waitFor 5000 (fun () -> ctx.Hooks.TurnEnded |> Seq.exists (fun (i, _) -> i = 1L))
 
                         aborted |> should be True
 
@@ -757,7 +775,7 @@ let ``abort stops a running turn and the next prompt works`` () =
                         let! served = waitFor 15000 (fun () -> ctx.Server.RequestCount > 1)
 
                         served |> should be True
-                        ctx.Hooks.TurnEnded |> should contain 1L
+                        ctx.Hooks.TurnEnded |> List.ofSeq |> List.map fst |> should contain 1L
                     }))
     }
 
@@ -858,7 +876,8 @@ let ``queue overflow does not lose commands`` () =
                     Schema.run storageOpts
                     let inbox = Repositories.commandInbox exec
 
-                    let turnEndedFn (cmdId: int64) : Task<unit> = task { do! inbox.MarkCompleted cmdId }
+                    let turnEndedFn (cmdId: int64) (_: TurnOutcome) : Task<unit> =
+                        task { do! inbox.MarkCompleted cmdId }
 
                     let runScenario (sm: SessionManager) : Task<unit> =
                         task {

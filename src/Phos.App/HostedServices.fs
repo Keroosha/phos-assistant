@@ -6,6 +6,7 @@ open System.Threading.Tasks
 open Microsoft.Extensions.Hosting
 open Microsoft.Extensions.Logging
 open Phos.Speech
+open Phos.Storage
 open Phos.Telegram
 
 /// Hosted service that wires the Telegram update handler and performs the bot

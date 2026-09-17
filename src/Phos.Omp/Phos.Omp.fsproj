@@ -13,6 +13,7 @@
     <Compile Include="HostTools.fs" />
     <Compile Include="HostUris.fs" />
     <Compile Include="EventFormatter.fs" />
+    <Compile Include="TurnFinalization.fs" />
     <Compile Include="SessionManager.fs" />
     <Compile Include="OmpWorker.fs" />
   </ItemGroup>

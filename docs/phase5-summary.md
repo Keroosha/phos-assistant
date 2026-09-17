@@ -124,9 +124,19 @@ Compile order:
 - **Wake channel**: bounded `Channel<unit>` (capacity 1) — coalescing; a burst of
   inbound commands collapses to one scan; durable DB is the source of truth.
 - **Worker retry semantics**: `MarkFailed` increments attempts and sets
-  `failed` (or `dead_letter` at max); the worker then calls `Retry` to put a
-  `failed` command back to `pending` so the next scan re-claims it. `dead_letter`
-  commands are skipped. `ListPendingChatIds` covers `pending`/`failed`/`needs_review`.
+  `failed` (or `dead_letter` at max). The worker calls `Retry` only for an
+  immediate prompt rejection; a terminal OMP/provider failure is finalized
+  without `Retry`, so it stays durably failed for manual/new-prompt recovery.
+  `dead_letter` commands are skipped. `ListPendingChatIds` covers
+  `pending`/`failed`/`needs_review`.
+- **Terminal OMP/provider failures**: the host treats `agent_end` with
+  `isTerminal !== false` as the only turn boundary. Intermediate
+  `auto_retry_*`/non-terminal events do not notify or requeue. A terminal
+  `stopReason:error` suppresses partial text, enqueues one generic Telegram error
+  through the outbox, and preserves a healthy OMP runtime. Process loss or the
+  generous idle emergency path becomes `needs_review` rather than auto-replay.
+  `--max-time` is optional and remains an operator ceiling, not the Phos turn
+  failure detector.
 - **npm package for omp**: `@oh-my-pi/pi-coding-agent@18.1.19` (verified against
   registry + local `omp --version`).
 - **Lint/compiler conflicts (resolved)**: F# `TreatWarningsAsErrors` (FS0760 for
