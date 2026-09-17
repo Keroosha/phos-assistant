@@ -81,6 +81,17 @@ type SchedulerSettings =
       TickSeconds: int
       PendingTtlHours: int }
 
+/// Backup settings, bound from the `Backup` config section. `AgeRecipient`
+/// points to a public age key file held outside the archive; it is only
+/// required when `Enabled` is true.
+[<CLIMutable>]
+type BackupSettings =
+    { Enabled: bool
+      Directory: string
+      Interval: TimeSpan
+      AgeRecipient: string
+      RetainCount: int }
+
 /// App-wide configuration bound from `IConfiguration` (appsettings.json +
 /// `PHOS_` environment variables + command line).
 [<CLIMutable>]
@@ -90,7 +101,8 @@ type AppConfig =
       Whitelist: WhitelistSettings
       Stt: SttSettings
       Omp: OmpSettings
-      Scheduler: SchedulerSettings }
+      Scheduler: SchedulerSettings
+      Backup: BackupSettings }
 
 /// Binds and validates the app configuration.
 module Config =
@@ -163,6 +175,26 @@ module Config =
             do! Result.requireTrue "Scheduler:TickSeconds must be >= 1" (cfg.Scheduler.TickSeconds >= 1)
             do! Result.requireTrue "Scheduler:PendingTtlHours must be >= 1" (cfg.Scheduler.PendingTtlHours >= 1)
 
+            if cfg.Backup.Enabled then
+                do!
+                    Result.requireTrue
+                        "Backup:Directory must not be empty"
+                        (not (String.IsNullOrWhiteSpace cfg.Backup.Directory))
+
+                do!
+                    Result.requireTrue
+                        "Backup:AgeRecipient must not be empty"
+                        (not (String.IsNullOrWhiteSpace cfg.Backup.AgeRecipient))
+
+                do! Result.requireTrue "Backup:Interval must be > 0" (cfg.Backup.Interval > TimeSpan.Zero)
+
+                do!
+                    Result.requireTrue
+                        "Backup:Interval must be <= 30 days"
+                        (cfg.Backup.Interval <= TimeSpan.FromDays 30.0)
+
+                do! Result.requireTrue "Backup:RetainCount must be >= 1" (cfg.Backup.RetainCount >= 1)
+
             if cfg.Stt.Enabled then
                 do!
                     Result.requireTrue
@@ -193,7 +225,7 @@ module Config =
     /// vars) yields an `Error` describing the missing file.
     let bind (configuration: IConfiguration) : Result<AppConfig, string> =
         let sections =
-            [ "Telegram"; "Storage"; "Whitelist"; "Stt"; "Omp"; "Scheduler" ]
+            [ "Telegram"; "Storage"; "Whitelist"; "Stt"; "Omp"; "Scheduler"; "Backup" ]
             |> List.forall (fun name -> configuration.GetSection(name).Exists())
 
         if not sections then
@@ -293,3 +325,16 @@ module Config =
         { TickSeconds = cfg.Scheduler.TickSeconds
           PendingTtlHours = cfg.Scheduler.PendingTtlHours
           MaxFailedTicks = cfg.Scheduler.MaxFailedTicks }
+
+    /// Builds backup options from the config. The `AgeRecipient` file existence
+    /// is checked at backup time (not at host startup) so a config typo does not
+    /// prevent the host from booting.
+    let toBackupOptions (cfg: AppConfig) : Phos.Backup.BackupOptions =
+        { Directory = expandHome cfg.Backup.Directory
+          Interval = cfg.Backup.Interval
+          AgeRecipient = expandHome cfg.Backup.AgeRecipient
+          RetainCount = cfg.Backup.RetainCount
+          DatabasePath = cfg.Storage.DatabasePath
+          ProfileDir = Path.Combine(expandHome "~/.omp", "profiles", cfg.Omp.Profile, "agent")
+          WorkspaceRoot = expandHome cfg.Omp.WorkspaceRoot
+          OmpPath = cfg.Omp.OmpPath }

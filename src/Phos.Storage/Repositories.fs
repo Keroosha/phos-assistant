@@ -12,3 +12,6 @@ module Repositories =
 
     let scheduleJobRepository (exec: StorageExecutor) : IScheduleJobRepository =
         ScheduleJobRepository(exec) :> IScheduleJobRepository
+
+    let backupLog (exec: StorageExecutor) : IBackupLogRepository =
+        BackupLogRepository(exec) :> IBackupLogRepository

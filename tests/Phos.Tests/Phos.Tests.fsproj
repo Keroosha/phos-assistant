@@ -11,6 +11,7 @@
     <Compile Include="CoreTests.fs" />
     <Compile Include="StorageTests.fs" />
     <Compile Include="SchedulerTests.fs" />
+    <Compile Include="BackupTests.fs" />
     <Compile Include="TelegramTests.fs" />
     <Compile Include="SpeechTests.fs" />
     <Compile Include="OmpTests.fs" />
@@ -41,6 +42,7 @@
     <ProjectReference Include="../../src/Phos.Speech/Phos.Speech.fsproj" />
     <ProjectReference Include="../../src/Phos.Omp/Phos.Omp.fsproj" />
     <ProjectReference Include="../../src/Phos.Scheduler/Phos.Scheduler.fsproj" />
+    <ProjectReference Include="../../src/Phos.Backup/Phos.Backup.fsproj" />
   </ItemGroup>
 
 </Project>

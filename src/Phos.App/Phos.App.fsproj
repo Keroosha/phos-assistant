@@ -26,6 +26,7 @@
     <ProjectReference Include="../../src/Phos.Speech/Phos.Speech.fsproj" />
     <ProjectReference Include="../../src/Phos.Omp/Phos.Omp.fsproj" />
     <ProjectReference Include="../../src/Phos.Scheduler/Phos.Scheduler.fsproj" />
+    <ProjectReference Include="../../src/Phos.Backup/Phos.Backup.fsproj" />
   </ItemGroup>
 
 </Project>
