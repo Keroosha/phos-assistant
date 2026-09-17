@@ -149,24 +149,44 @@ module Config =
 
             do!
                 Result.requireTrue
+                    "Telegram:ApiHash must be a valid hex string (get it from my.telegram.org)"
+                    (try
+                        Convert.FromHexString(cfg.Telegram.ApiHash) |> ignore
+                        true
+                     with _ ->
+                         false)
+
+            do!
+                Result.requireTrue
                     "Telegram:BotToken must not be empty (set PHOS_TELEGRAM__BOTTOKEN)"
                     (not (String.IsNullOrWhiteSpace cfg.Telegram.BotToken))
 
+            do!
+                Result.requireTrue
+                    "Whitelist:Users is missing or not an array"
+                    (not (obj.ReferenceEquals(cfg.Whitelist.Users, null)))
+
+            do!
+                Result.requireTrue
+                    "Whitelist:AllowedChats is missing or not an array"
+                    (not (obj.ReferenceEquals(cfg.Whitelist.AllowedChats, null)))
+
             do! validateRoles cfg.Whitelist.Users
 
-            if cfg.Omp.Enabled then
-                do! Result.requireTrue "Omp:Profile must not be empty" (not (String.IsNullOrWhiteSpace cfg.Omp.Profile))
+            // `toBackupOptions` (profile dir) runs at startup even when
+            // `Omp:Enabled` is false, so these fields are required always.
+            do! Result.requireTrue "Omp:Profile must not be empty" (not (String.IsNullOrWhiteSpace cfg.Omp.Profile))
 
-                do! Result.requireTrue "Omp:OmpPath must not be empty" (not (String.IsNullOrWhiteSpace cfg.Omp.OmpPath))
+            do! Result.requireTrue "Omp:OmpPath must not be empty" (not (String.IsNullOrWhiteSpace cfg.Omp.OmpPath))
 
-                do!
-                    Result.requireTrue
-                        "Omp:WorkspaceRoot must not be empty"
-                        (not (String.IsNullOrWhiteSpace cfg.Omp.WorkspaceRoot))
+            do!
+                Result.requireTrue
+                    "Omp:WorkspaceRoot must not be empty"
+                    (not (String.IsNullOrWhiteSpace cfg.Omp.WorkspaceRoot))
 
-                do! Result.requireTrue "Omp:IdleTimeoutMinutes must be >= 1" (cfg.Omp.IdleTimeoutMinutes >= 1)
-                do! Result.requireTrue "Omp:MaxQueuePerUser must be >= 1" (cfg.Omp.MaxQueuePerUser >= 1)
-                do! Result.requireTrue "Omp:ReadyTimeoutSeconds must be >= 1" (cfg.Omp.ReadyTimeoutSeconds >= 1)
+            do! Result.requireTrue "Omp:IdleTimeoutMinutes must be >= 1" (cfg.Omp.IdleTimeoutMinutes >= 1)
+            do! Result.requireTrue "Omp:MaxQueuePerUser must be >= 1" (cfg.Omp.MaxQueuePerUser >= 1)
+            do! Result.requireTrue "Omp:ReadyTimeoutSeconds must be >= 1" (cfg.Omp.ReadyTimeoutSeconds >= 1)
 
             do! Result.requireTrue "Scheduler:MaxJobsPerUser must be >= 1" (cfg.Scheduler.MaxJobsPerUser >= 1)
             do! Result.requireTrue "Scheduler:MinIntervalSeconds must be >= 1" (cfg.Scheduler.MinIntervalSeconds >= 1)
@@ -175,25 +195,23 @@ module Config =
             do! Result.requireTrue "Scheduler:TickSeconds must be >= 1" (cfg.Scheduler.TickSeconds >= 1)
             do! Result.requireTrue "Scheduler:PendingTtlHours must be >= 1" (cfg.Scheduler.PendingTtlHours >= 1)
 
-            if cfg.Backup.Enabled then
-                do!
-                    Result.requireTrue
-                        "Backup:Directory must not be empty"
-                        (not (String.IsNullOrWhiteSpace cfg.Backup.Directory))
+            // `toBackupOptions` runs at startup even when `Backup:Enabled` is
+            // false, so these fields are required always.
+            do!
+                Result.requireTrue
+                    "Backup:Directory must not be empty"
+                    (not (String.IsNullOrWhiteSpace cfg.Backup.Directory))
 
-                do!
-                    Result.requireTrue
-                        "Backup:AgeRecipient must not be empty"
-                        (not (String.IsNullOrWhiteSpace cfg.Backup.AgeRecipient))
+            do!
+                Result.requireTrue
+                    "Backup:AgeRecipient must not be empty"
+                    (not (String.IsNullOrWhiteSpace cfg.Backup.AgeRecipient))
 
-                do! Result.requireTrue "Backup:Interval must be > 0" (cfg.Backup.Interval > TimeSpan.Zero)
+            do! Result.requireTrue "Backup:Interval must be > 0" (cfg.Backup.Interval > TimeSpan.Zero)
 
-                do!
-                    Result.requireTrue
-                        "Backup:Interval must be <= 30 days"
-                        (cfg.Backup.Interval <= TimeSpan.FromDays 30.0)
+            do! Result.requireTrue "Backup:Interval must be <= 30 days" (cfg.Backup.Interval <= TimeSpan.FromDays 30.0)
 
-                do! Result.requireTrue "Backup:RetainCount must be >= 1" (cfg.Backup.RetainCount >= 1)
+            do! Result.requireTrue "Backup:RetainCount must be >= 1" (cfg.Backup.RetainCount >= 1)
 
             if cfg.Stt.Enabled then
                 do!
@@ -224,16 +242,32 @@ module Config =
     /// with no matching sections (e.g. no `appsettings.json` and no `PHOS_` env
     /// vars) yields an `Error` describing the missing file.
     let bind (configuration: IConfiguration) : Result<AppConfig, string> =
-        let sections =
+        let required =
             [ "Telegram"; "Storage"; "Whitelist"; "Stt"; "Omp"; "Scheduler"; "Backup" ]
-            |> List.forall (fun name -> configuration.GetSection(name).Exists())
 
-        if not sections then
-            Error "configuration is empty (appsettings.json not found)"
+        let missing =
+            required
+            |> List.filter (fun name -> not (configuration.GetSection(name).Exists()))
+
+        if not missing.IsEmpty then
+            if missing.Length = required.Length then
+                Error "configuration is empty: appsettings.json not found or all required sections are missing"
+            else
+                Error(sprintf "configuration is missing required section(s): %s" (String.concat ", " missing))
         else
-            match configuration.Get<AppConfig>() with
-            | null -> Error "configuration is empty (appsettings.json not found)"
-            | cfg -> validate cfg
+            let bound =
+                try
+                    match configuration.Get<AppConfig>() with
+                    | null -> Error "configuration is empty: appsettings.json not found"
+                    | cfg -> Ok cfg
+                with ex ->
+                    // Binder conversion failures (wrong types, malformed values)
+                    // surface as exceptions; report them as config errors.
+                    Error(sprintf "invalid configuration value: %s" ex.Message)
+
+            match bound with
+            | Error e -> Error e
+            | Ok cfg -> validate cfg
 
     /// Builds a `Whitelist` from the bound config users and allowed chats. An
     /// unknown role yields an `Error` naming the offending user id.
