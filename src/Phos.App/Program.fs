@@ -153,18 +153,26 @@ let main (argv: string[]) : int =
             |> ignore
 
             builder.Services.AddSingleton<SessionManager>(fun sp ->
-                let inbox = sp.GetRequiredService<ICommandInbox>()
+                let logger = sp.GetRequiredService<ILogger<SessionManager>>()
 
                 let heartbeats =
                     sp.GetRequiredService<ConcurrentDictionary<int64, CancellationTokenSource>>()
 
-                let turnEnded (cmdId: int64) : Task<unit> =
+                let turnEnded (cmdId: int64) (outcome: TurnOutcome) : Task<unit> =
                     task {
-                        do! inbox.MarkCompleted cmdId
-
+                        // Stop the typing/lease heartbeat first so it cannot
+                        // observe the status change mid-flight.
                         match heartbeats.TryRemove cmdId with
                         | true, cts -> cts.Cancel()
                         | _ -> ()
+
+                        do!
+                            TurnFinalization.apply
+                                (sp.GetRequiredService<ICommandInbox>())
+                                (sp.GetRequiredService<IMessageOutbox>())
+                                (logger :> ILogger)
+                                cmdId
+                                outcome
                     }
 
                 let enqueueOutbox (env: OutboxEnvelope) : Task<unit> =

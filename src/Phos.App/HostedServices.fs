@@ -5,8 +5,57 @@ open System.Threading
 open System.Threading.Tasks
 open Microsoft.Extensions.Hosting
 open Microsoft.Extensions.Logging
+open Phos.Omp
 open Phos.Speech
+open Phos.Storage
 open Phos.Telegram
+
+/// Durable finalization of a finished OMP turn. Success/abort complete the
+/// command; a provider/model failure is finalized as `failed` (or
+/// `dead_letter` at max attempts) WITHOUT the prompt-error auto-retry — the
+/// command stays durably failed for manual/new-prompt recovery — and exactly
+/// one generic, redacted Telegram error notice goes through the outbox.
+module TurnFinalization =
+
+    /// Generic user-facing text for an exhausted provider failure. Contains no
+    /// provider details (HTML/messages/keys stay out of Telegram).
+    let [<Literal>] ProviderFailureNotice =
+        "⚠️ Модель не смогла завершить ответ. Попробуйте повторить запрос позже."
+
+    /// Applies the turn outcome to the durable inbox and outbox. Idempotent:
+    /// `MarkCompleted`/`MarkFailed`/`MarkNeedsReview` are status-guarded
+    /// updates, so a repeated finalization of the same command is a no-op.
+    let apply
+        (inbox: ICommandInbox)
+        (outbox: IMessageOutbox)
+        (logger: ILogger)
+        (cmdId: int64)
+        (outcome: TurnOutcome)
+        : Task<unit> =
+        task {
+            match outcome with
+            | TurnOutcome.ProviderFailure reason ->
+                logger.LogWarning("command {Id} failed with provider error: {Reason}", cmdId, reason)
+                // MarkFailed without Retry: the command is NOT requeued.
+                do! inbox.MarkFailed cmdId
+
+                let! cmd = inbox.GetById cmdId
+
+                match cmd with
+                | Some c ->
+                    let! _ =
+                        outbox.Insert c.Id 0 c.Envelope.ChatId (Random.Shared.NextInt64()) ProviderFailureNotice []
+
+                    ()
+                | None -> ()
+            | TurnOutcome.NeedsReview ->
+                // Uncertain outcome (dead/wedged OMP, possibly after host-tool
+                // activity): park durably for manual review, never auto-replay.
+                logger.LogWarning("command {Id} parked for review: OMP runtime lost mid-turn", cmdId)
+                do! inbox.MarkNeedsReview cmdId
+            | TurnOutcome.Completed
+            | TurnOutcome.Aborted -> do! inbox.MarkCompleted cmdId
+        }
 
 /// Hosted service that wires the Telegram update handler and performs the bot
 /// login. Login NEVER fails host startup: a transient failure (e.g. 420

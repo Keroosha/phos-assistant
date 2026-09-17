@@ -378,10 +378,12 @@ type FakeOmpProcess() =
 type FakeRpcClient(sessionId: string) =
     let eventReceived = Event<JsonObject>()
     let parseError = Event<string>()
+    let lateFailure = Event<string * RpcError>()
     let mutable abortCount = 0
     let mutable promptCount = 0
     let mutable disposed = false
     let prompts = ResizeArray<string>()
+    let promptIds = ResizeArray<string option>()
     let imagePrompts = ResizeArray<string list>()
 
     let stateObj () : JsonObject =
@@ -395,13 +397,16 @@ type FakeRpcClient(sessionId: string) =
     member _.AbortCount = abortCount
     member _.PromptCount = promptCount
     member _.Prompts = prompts
+    member _.PromptIds = List.ofSeq promptIds
     member _.ImagePrompts = List.ofSeq imagePrompts
     member _.IsDisposed = disposed
     member _.RaiseEvent(frame: JsonObject) = eventReceived.Trigger frame
+    member _.RaiseLateFailure(id: string, err: RpcError) = lateFailure.Trigger(id, err)
 
     interface IOmpRpcClient with
         member _.EventReceived = eventReceived.Publish
         member _.ParseError = parseError.Publish
+        member _.LateFailure = lateFailure.Publish
         member _.IsDead = false
 
         member _.SendAsync(command: string, payload: JsonNode, ?id: string) : Task<Result<JsonNode, RpcError>> =
@@ -414,9 +419,10 @@ type FakeRpcClient(sessionId: string) =
         member _.SendRawAsync(_: JsonObject) : Task<unit> = Task.FromResult(())
 
         member _.PromptAsync
-            (message: string, ?streamingBehavior: string, ?images: string list)
+            (message: string, ?streamingBehavior: string, ?images: string list, ?id: string)
             : Task<Result<JsonNode, RpcError>> =
             prompts.Add(message)
+            promptIds.Add id
             imagePrompts.Add(defaultArg images [])
             promptCount <- promptCount + 1
             Task.FromResult(Ok(JsonObject() :> JsonNode))
@@ -454,11 +460,13 @@ type FakeRpcClient(sessionId: string) =
 type ScriptedRpcClient() =
     let eventReceived = Event<JsonObject>()
     let parseError = Event<string>()
+    let lateFailure = Event<string * RpcError>()
     let mutable getStateResult: Result<JsonNode, RpcError> = Ok(JsonObject())
     let mutable setToolsResult: Result<JsonNode, RpcError> = Ok(JsonObject())
     let mutable setUrisResult: Result<JsonNode, RpcError> = Ok(JsonObject())
     let mutable promptResult: Result<JsonNode, RpcError> = Ok(JsonObject())
     let mutable promptCount = 0
+    let mutable promptIds: string option list = []
     let mutable abortCount = 0
     let mutable disposed = false
 
@@ -484,13 +492,16 @@ type ScriptedRpcClient() =
         and set v = promptResult <- v
 
     member _.PromptCount = promptCount
+    member _.PromptIds = List.rev promptIds
     member _.AbortCount = abortCount
     member _.IsDisposed = disposed
     member _.RaiseEvent(frame: JsonObject) = eventReceived.Trigger frame
+    member _.RaiseLateFailure(id: string, err: RpcError) = lateFailure.Trigger(id, err)
 
     interface IOmpRpcClient with
         member _.EventReceived = eventReceived.Publish
         member _.ParseError = parseError.Publish
+        member _.LateFailure = lateFailure.Publish
         member _.IsDead = false
 
         member _.SendAsync(command: string, _: JsonNode, ?id: string) : Task<Result<JsonNode, RpcError>> =
@@ -503,9 +514,10 @@ type ScriptedRpcClient() =
         member _.SendRawAsync(_: JsonObject) : Task<unit> = Task.FromResult(())
 
         member _.PromptAsync
-            (_: string, ?streamingBehavior: string, ?images: string list)
+            (_: string, ?streamingBehavior: string, ?images: string list, ?id: string)
             : Task<Result<JsonNode, RpcError>> =
             promptCount <- promptCount + 1
+            promptIds <- id :: promptIds
             Task.FromResult(promptResult)
 
         member _.AbortAsync() : Task<Result<JsonNode, RpcError>> =
@@ -1060,7 +1072,7 @@ let ``text deltas accumulate silently without status messages`` () =
     ev["type"] <- "text_delta"
     ev["delta"] <- "Hello"
     frame["assistantMessageEvent"] <- (ev :> JsonNode)
-    let st, envelopes = EventFormatter.onEvent ctx EventFormatter.initialState frame
+    let st, envelopes, _ = EventFormatter.onEvent ctx EventFormatter.initialState frame
     envelopes |> should be Empty
     st.Accumulated |> should equal "Hello"
 
@@ -1070,7 +1082,7 @@ let ``text deltas accumulate silently without status messages`` () =
     ev2["type"] <- "text_delta"
     ev2["delta"] <- " world"
     frame2["assistantMessageEvent"] <- (ev2 :> JsonNode)
-    let st2, env2 = EventFormatter.onEvent ctx st frame2
+    let st2, env2, _ = EventFormatter.onEvent ctx st frame2
     env2 |> should be Empty
     st2.Accumulated |> should equal "Hello world"
 
@@ -1084,8 +1096,9 @@ let ``terminal agent_end chunks accumulated text`` () =
     let frame = JsonObject()
     frame["type"] <- "agent_end"
     frame["isTerminal"] <- true
-    let st2, envelopes = EventFormatter.onEvent ctx st frame
+    let st2, envelopes, outcome = EventFormatter.onEvent ctx st frame
     envelopes.Length |> should be (greaterThan 1)
+    outcome |> should equal (Some TurnOutcome.Completed)
     envelopes |> List.forall (fun e -> e.Payload.Length <= 4096) |> should be True
     // Markdown-free text produces no entities on the chunks.
     envelopes |> List.forall (fun e -> e.Entities |> List.isEmpty) |> should be True
@@ -1102,7 +1115,7 @@ let ``non terminal agent_end emits nothing`` () =
     let frame = JsonObject()
     frame["type"] <- "agent_end"
     frame["isTerminal"] <- false
-    let _, envelopes = EventFormatter.onEvent ctx st frame
+    let _, envelopes, _ = EventFormatter.onEvent ctx st frame
     envelopes |> should be Empty
 
 [<Fact>]
@@ -1114,7 +1127,7 @@ let ``terminal agent_end with empty text emits nothing`` () =
     let frame = JsonObject()
     frame["type"] <- "agent_end"
     frame["isTerminal"] <- true
-    let _, envelopes = EventFormatter.onEvent ctx st frame
+    let _, envelopes, _ = EventFormatter.onEvent ctx st frame
     envelopes |> should be Empty
 
 // ---------------------------------------------------------------------------
@@ -1328,7 +1341,7 @@ let ``profile ensure keeps config with modelRoles unchanged`` () =
 let private createSessionManager
     (spawnProcess: OmpProcessOptions -> Result<IOmpProcess, string>)
     (createClient: Process -> JsonObject -> IOmpRpcClient)
-    (turnEnded: int64 -> Task<unit>)
+    (turnEnded: int64 -> TurnOutcome -> Task<unit>)
     (nowFn: unit -> DateTimeOffset)
     : SessionManager =
     let tmp = tempDir ()
@@ -1385,7 +1398,7 @@ let ``prompt enqueues when busy and rejects when queue full`` () =
         let createClient (_: Process) (_: JsonObject) : IOmpRpcClient = client :> IOmpRpcClient
         let mutable currentTime = DateTimeOffset.UtcNow
         let nowFn () = currentTime
-        let turnEnded (_: int64) : Task<unit> = Task.FromResult(())
+        let turnEnded (_: int64) (_: TurnOutcome) : Task<unit> = Task.FromResult(())
         let sm = createSessionManager spawn createClient turnEnded nowFn
         let user = UserId 1L
 
@@ -1438,7 +1451,7 @@ let ``prompt passes command images to the rpc client`` () =
         let spawn (_: OmpProcessOptions) : Result<IOmpProcess, string> = Ok(fakeProc :> IOmpProcess)
         let createClient (_: Process) (_: JsonObject) : IOmpRpcClient = client :> IOmpRpcClient
         let nowFn () = DateTimeOffset.UtcNow
-        let turnEnded (_: int64) : Task<unit> = Task.FromResult(())
+        let turnEnded (_: int64) (_: TurnOutcome) : Task<unit> = Task.FromResult(())
         let sm = createSessionManager spawn createClient turnEnded nowFn
         let user = UserId 1L
 
@@ -1468,7 +1481,7 @@ let ``respawns with resume after process exit`` () =
 
         let createClient (_: Process) (_: JsonObject) : IOmpRpcClient = client :> IOmpRpcClient
         let nowFn () = DateTimeOffset.UtcNow
-        let turnEnded (_: int64) : Task<unit> = Task.FromResult(())
+        let turnEnded (_: int64) (_: TurnOutcome) : Task<unit> = Task.FromResult(())
         let sm = createSessionManager spawn createClient turnEnded nowFn
         let user = UserId 1L
 
@@ -1492,7 +1505,7 @@ let ``idle timeout kills and clears runtime`` () =
         let createClient (_: Process) (_: JsonObject) : IOmpRpcClient = client :> IOmpRpcClient
         let mutable currentTime = DateTimeOffset.UtcNow
         let nowFn () = currentTime
-        let turnEnded (_: int64) : Task<unit> = Task.FromResult(())
+        let turnEnded (_: int64) (_: TurnOutcome) : Task<unit> = Task.FromResult(())
         let sm = createSessionManager spawn createClient turnEnded nowFn
         let user = UserId 1L
 
@@ -1512,7 +1525,7 @@ let ``abort calls client abort`` () =
         let spawn (_: OmpProcessOptions) : Result<IOmpProcess, string> = Ok(fakeProc :> IOmpProcess)
         let createClient (_: Process) (_: JsonObject) : IOmpRpcClient = client :> IOmpRpcClient
         let nowFn () = DateTimeOffset.UtcNow
-        let turnEnded (_: int64) : Task<unit> = Task.FromResult(())
+        let turnEnded (_: int64) (_: TurnOutcome) : Task<unit> = Task.FromResult(())
         let sm = createSessionManager spawn createClient turnEnded nowFn
         let user = UserId 1L
 
@@ -1531,7 +1544,7 @@ let ``terminal agent_end triggers turn ended`` () =
         let nowFn () = DateTimeOffset.UtcNow
         let turnEndedId = ref None
 
-        let turnEnded (cmdId: int64) : Task<unit> =
+        let turnEnded (cmdId: int64) (_: TurnOutcome) : Task<unit> =
             task { turnEndedId.Value <- Some cmdId }
 
         let sm = createSessionManager spawn createClient turnEnded nowFn
@@ -1555,7 +1568,7 @@ let ``non terminal agent_end does not trigger turn ended`` () =
         let nowFn () = DateTimeOffset.UtcNow
         let turnEndedId = ref None
 
-        let turnEnded (cmdId: int64) : Task<unit> =
+        let turnEnded (cmdId: int64) (_: TurnOutcome) : Task<unit> =
             task { turnEndedId.Value <- Some cmdId }
 
         let sm = createSessionManager spawn createClient turnEnded nowFn
@@ -1576,7 +1589,7 @@ let ``non terminal agent_end does not trigger turn ended`` () =
 let private scriptedSm
     (spawn: OmpProcessOptions -> Result<IOmpProcess, string>)
     (client: ScriptedRpcClient)
-    (turnEnded: int64 -> Task<unit>)
+    (turnEnded: int64 -> TurnOutcome -> Task<unit>)
     : SessionManager =
     let createClient (_: Process) (_: JsonObject) : IOmpRpcClient = client :> IOmpRpcClient
     let nowFn () = DateTimeOffset.UtcNow
@@ -1587,7 +1600,7 @@ let ``spawn failure makes ensure runtime report error`` () =
     task {
         let client = ScriptedRpcClient()
         let spawn (_: OmpProcessOptions) : Result<IOmpProcess, string> = Error "no omp binary"
-        let sm = scriptedSm spawn client (fun _ -> Task.FromResult(()))
+        let sm = scriptedSm spawn client (fun _ _ -> Task.FromResult(()))
         let user = UserId 1L
 
         let! r = sm.EnsureRuntime user
@@ -1610,7 +1623,7 @@ let ``get_state failure still spawns a live runtime`` () =
                   Message = "state boom" }
 
         let spawn (_: OmpProcessOptions) : Result<IOmpProcess, string> = Ok(fakeProc :> IOmpProcess)
-        let sm = scriptedSm spawn client (fun _ -> Task.FromResult(()))
+        let sm = scriptedSm spawn client (fun _ _ -> Task.FromResult(()))
 
         let! r = sm.EnsureRuntime(UserId 1L)
 
@@ -1634,7 +1647,7 @@ let ``set_host_tools failure still spawns a live runtime`` () =
                   Message = "tools boom" }
 
         let spawn (_: OmpProcessOptions) : Result<IOmpProcess, string> = Ok(fakeProc :> IOmpProcess)
-        let sm = scriptedSm spawn client (fun _ -> Task.FromResult(()))
+        let sm = scriptedSm spawn client (fun _ _ -> Task.FromResult(()))
 
         let! r = sm.EnsureRuntime(UserId 1L)
 
@@ -1658,7 +1671,7 @@ let ``set_host_uri_schemes failure still spawns a live runtime`` () =
                   Message = "uris boom" }
 
         let spawn (_: OmpProcessOptions) : Result<IOmpProcess, string> = Ok(fakeProc :> IOmpProcess)
-        let sm = scriptedSm spawn client (fun _ -> Task.FromResult(()))
+        let sm = scriptedSm spawn client (fun _ _ -> Task.FromResult(()))
 
         let! r = sm.EnsureRuntime(UserId 1L)
 
@@ -1682,15 +1695,27 @@ let ``prompt rpc failure is surfaced and no duplicate prompt follows`` () =
                   Message = "prompt boom" }
 
         let spawn (_: OmpProcessOptions) : Result<IOmpProcess, string> = Ok(fakeProc :> IOmpProcess)
-        let sm = scriptedSm spawn client (fun _ -> Task.FromResult(()))
+        let sm = scriptedSm spawn client (fun _ _ -> Task.FromResult(()))
 
         let! r = sm.Prompt(UserId 1L, mkCommand 1L 1L "hi")
 
+        // The synchronous rejection must reach the caller (the worker's
+        // prompt-error path), not be swallowed.
         match r with
-        | Ok() -> ()
-        | Error e -> failwith e
+        | Ok() -> failwith "prompt rejection must be surfaced"
+        | Error e -> e |> should equal "prompt boom"
 
+        // Exactly one prompt attempt; the runtime is idle again so a fresh
+        // command can be prompted (no wedged busy state).
         client.PromptCount |> should equal 1
+
+        let! r2 = sm.Prompt(UserId 1L, mkCommand 2L 1L "again")
+
+        match r2 with
+        | Ok() -> failwith "second rejection must be surfaced"
+        | Error _ -> ()
+
+        client.PromptCount |> should equal 2
     }
 
 [<Fact>]
@@ -1699,7 +1724,7 @@ let ``agent_start marks the runtime busy`` () =
         let fakeProc = FakeOmpProcess()
         let client = ScriptedRpcClient()
         let spawn (_: OmpProcessOptions) : Result<IOmpProcess, string> = Ok(fakeProc :> IOmpProcess)
-        let sm = scriptedSm spawn client (fun _ -> Task.FromResult(()))
+        let sm = scriptedSm spawn client (fun _ _ -> Task.FromResult(()))
         let user = UserId 1L
 
         let! _ = sm.EnsureRuntime user
@@ -1725,7 +1750,7 @@ let ``terminal agent_end with no current command does not call turn ended`` () =
         let spawn (_: OmpProcessOptions) : Result<IOmpProcess, string> = Ok(fakeProc :> IOmpProcess)
         let turnEndedId = ref None
 
-        let turnEnded (cmdId: int64) : Task<unit> =
+        let turnEnded (cmdId: int64) (_: TurnOutcome) : Task<unit> =
             task { turnEndedId.Value <- Some cmdId }
 
         let sm = scriptedSm spawn client turnEnded
@@ -1748,7 +1773,7 @@ let ``terminal agent_end drains the next queued command`` () =
         let spawn (_: OmpProcessOptions) : Result<IOmpProcess, string> = Ok(fakeProc :> IOmpProcess)
         let turnEndedId = ref None
 
-        let turnEnded (cmdId: int64) : Task<unit> =
+        let turnEnded (cmdId: int64) (_: TurnOutcome) : Task<unit> =
             task { turnEndedId.Value <- Some cmdId }
 
         let sm = scriptedSm spawn client turnEnded
@@ -1773,7 +1798,7 @@ let ``abort for unknown user is a no-op`` () =
         let fakeProc = FakeOmpProcess()
         let client = ScriptedRpcClient()
         let spawn (_: OmpProcessOptions) : Result<IOmpProcess, string> = Ok(fakeProc :> IOmpProcess)
-        let sm = scriptedSm spawn client (fun _ -> Task.FromResult(()))
+        let sm = scriptedSm spawn client (fun _ _ -> Task.FromResult(()))
         do! sm.Abort(UserId 99L)
         client.AbortCount |> should equal 0
     }
@@ -1784,7 +1809,7 @@ let ``handle_event for unknown user is a no-op`` () =
         let fakeProc = FakeOmpProcess()
         let client = ScriptedRpcClient()
         let spawn (_: OmpProcessOptions) : Result<IOmpProcess, string> = Ok(fakeProc :> IOmpProcess)
-        let sm = scriptedSm spawn client (fun _ -> Task.FromResult(()))
+        let sm = scriptedSm spawn client (fun _ _ -> Task.FromResult(()))
         let frame = JsonObject()
         frame["type"] <- "agent_end"
         do! sm.HandleEvent(UserId 99L, frame)
@@ -1797,7 +1822,7 @@ let ``is_runtime_alive false for unknown user`` () =
         let fakeProc = FakeOmpProcess()
         let client = ScriptedRpcClient()
         let spawn (_: OmpProcessOptions) : Result<IOmpProcess, string> = Ok(fakeProc :> IOmpProcess)
-        let sm = scriptedSm spawn client (fun _ -> Task.FromResult(()))
+        let sm = scriptedSm spawn client (fun _ _ -> Task.FromResult(()))
         sm.IsRuntimeAlive(UserId 99L) |> should be False
     }
 
@@ -1807,7 +1832,7 @@ let ``idle timeout on an exited runtime is a no-op`` () =
         let fakeProc = FakeOmpProcess()
         let client = ScriptedRpcClient()
         let spawn (_: OmpProcessOptions) : Result<IOmpProcess, string> = Ok(fakeProc :> IOmpProcess)
-        let sm = scriptedSm spawn client (fun _ -> Task.FromResult(()))
+        let sm = scriptedSm spawn client (fun _ _ -> Task.FromResult(()))
         let user = UserId 1L
 
         let! _ = sm.EnsureRuntime user
@@ -1822,7 +1847,7 @@ let ``shutdown disposes client and kills process`` () =
         let fakeProc = FakeOmpProcess()
         let client = ScriptedRpcClient()
         let spawn (_: OmpProcessOptions) : Result<IOmpProcess, string> = Ok(fakeProc :> IOmpProcess)
-        let sm = scriptedSm spawn client (fun _ -> Task.FromResult(()))
+        let sm = scriptedSm spawn client (fun _ _ -> Task.FromResult(()))
 
         let! _ = sm.EnsureRuntime(UserId 1L)
         sm.Shutdown()
@@ -2740,7 +2765,7 @@ let ``formatter ignores message_update without assistant event`` () =
     let frame = JsonObject()
     frame["type"] <- "message_update"
 
-    let st, envs = EventFormatter.onEvent ctx EventFormatter.initialState frame
+    let st, envs, _ = EventFormatter.onEvent ctx EventFormatter.initialState frame
     envs |> should be Empty
 
 [<Fact>]
@@ -2752,7 +2777,7 @@ let ``formatter ignores non text_delta assistant event`` () =
     ev["type"] <- "tool_use"
     frame["assistantMessageEvent"] <- (ev :> JsonNode)
 
-    let st, envs = EventFormatter.onEvent ctx EventFormatter.initialState frame
+    let st, envs, _ = EventFormatter.onEvent ctx EventFormatter.initialState frame
     envs |> should be Empty
 
 [<Fact>]
@@ -2765,7 +2790,7 @@ let ``formatter ignores empty delta and keeps state`` () =
     ev["delta"] <- ""
     frame["assistantMessageEvent"] <- (ev :> JsonNode)
 
-    let st, envs = EventFormatter.onEvent ctx EventFormatter.initialState frame
+    let st, envs, _ = EventFormatter.onEvent ctx EventFormatter.initialState frame
     envs |> should be Empty
 
 [<Fact>]
@@ -2781,12 +2806,12 @@ let ``formatter appends subsequent deltas without a typing status`` () =
         frame["assistantMessageEvent"] <- (ev :> JsonNode)
         frame
 
-    let st1, envs1 =
+    let st1, envs1, _ =
         EventFormatter.onEvent ctx EventFormatter.initialState (mkDelta "hi")
 
     envs1 |> should be Empty
 
-    let st2, envs2 = EventFormatter.onEvent ctx st1 (mkDelta " there")
+    let st2, envs2, _ = EventFormatter.onEvent ctx st1 (mkDelta " there")
     envs2 |> should be Empty
     st2.Accumulated |> should equal "hi there"
 
@@ -2800,13 +2825,13 @@ let ``formatter defaults missing isTerminal to terminal`` () =
     ev["type"] <- "text_delta"
     ev["delta"] <- "answer"
     delta["assistantMessageEvent"] <- (ev :> JsonNode)
-    let st1, _ = EventFormatter.onEvent ctx EventFormatter.initialState delta
+    let st1, _, _ = EventFormatter.onEvent ctx EventFormatter.initialState delta
 
     let endFrame = JsonObject()
     endFrame["type"] <- "agent_end"
     // No isTerminal key.
 
-    let st2, envs = EventFormatter.onEvent ctx st1 endFrame
+    let st2, envs, _ = EventFormatter.onEvent ctx st1 endFrame
     envs |> should not' (be Empty)
 
 // ---------------------------------------------------------------------------
@@ -2819,7 +2844,7 @@ let ``handle_event host tool call with unknown tool sends nothing`` () =
         let fakeProc = FakeOmpProcess()
         let client = ScriptedRpcClient()
         let spawn (_: OmpProcessOptions) : Result<IOmpProcess, string> = Ok(fakeProc :> IOmpProcess)
-        let sm = scriptedSm spawn client (fun _ -> Task.FromResult(()))
+        let sm = scriptedSm spawn client (fun _ _ -> Task.FromResult(()))
         let user = UserId 1L
         let! _ = sm.EnsureRuntime user
 
@@ -3480,7 +3505,7 @@ let ``session manager interface routes every operation`` () =
         let fakeProc = FakeOmpProcess()
         let client = ScriptedRpcClient()
         let spawn (_: OmpProcessOptions) : Result<IOmpProcess, string> = Ok(fakeProc :> IOmpProcess)
-        let sm = scriptedSm spawn client (fun _ -> Task.FromResult(()))
+        let sm = scriptedSm spawn client (fun _ _ -> Task.FromResult(()))
         let ism = sm :> IOmpSessionManager
         let user = UserId 1L
 
@@ -3503,7 +3528,7 @@ let ``prompt surfaces an ensure runtime error`` () =
     task {
         let client = ScriptedRpcClient()
         let spawn (_: OmpProcessOptions) : Result<IOmpProcess, string> = Error "no omp"
-        let sm = scriptedSm spawn client (fun _ -> Task.FromResult(()))
+        let sm = scriptedSm spawn client (fun _ _ -> Task.FromResult(()))
 
         let! r = sm.Prompt(UserId 1L, mkCommand 1L 1L "hi")
 
@@ -3518,7 +3543,7 @@ let ``abort with runtime but no client is a no-op`` () =
         let fakeProc = FakeOmpProcess()
         let client = ScriptedRpcClient()
         let spawn (_: OmpProcessOptions) : Result<IOmpProcess, string> = Ok(fakeProc :> IOmpProcess)
-        let sm = scriptedSm spawn client (fun _ -> Task.FromResult(()))
+        let sm = scriptedSm spawn client (fun _ _ -> Task.FromResult(()))
         let user = UserId 1L
 
         let! _ = sm.EnsureRuntime user
@@ -3534,7 +3559,7 @@ let ``get_state non-object is tolerated`` () =
         let client = ScriptedRpcClient()
         client.GetStateResult <- Ok(JsonValue.Create(5) :> JsonNode)
         let spawn (_: OmpProcessOptions) : Result<IOmpProcess, string> = Ok(fakeProc :> IOmpProcess)
-        let sm = scriptedSm spawn client (fun _ -> Task.FromResult(()))
+        let sm = scriptedSm spawn client (fun _ _ -> Task.FromResult(()))
 
         let! r = sm.EnsureRuntime(UserId 1L)
 
@@ -3551,7 +3576,7 @@ let ``ensure runtime is idempotent when already running`` () =
         let fakeProc = FakeOmpProcess()
         let client = ScriptedRpcClient()
         let spawn (_: OmpProcessOptions) : Result<IOmpProcess, string> = Ok(fakeProc :> IOmpProcess)
-        let sm = scriptedSm spawn client (fun _ -> Task.FromResult(()))
+        let sm = scriptedSm spawn client (fun _ _ -> Task.FromResult(()))
         let user = UserId 1L
 
         let! _ = sm.EnsureRuntime user
@@ -3568,7 +3593,7 @@ let ``shutdown with no client or process is a no-op`` () =
         let fakeProc = FakeOmpProcess()
         let client = ScriptedRpcClient()
         let spawn (_: OmpProcessOptions) : Result<IOmpProcess, string> = Ok(fakeProc :> IOmpProcess)
-        let sm = scriptedSm spawn client (fun _ -> Task.FromResult(()))
+        let sm = scriptedSm spawn client (fun _ _ -> Task.FromResult(()))
         let user = UserId 1L
 
         let! _ = sm.EnsureRuntime user
@@ -3681,4 +3706,397 @@ let ``wake channel wakes a waiter`` () =
         do! Task.Delay 50
         wake.Wake()
         do! wait
+    }
+
+// ---------------------------------------------------------------------------
+// Retry-aware provider failure (terminal agent_end classification)
+// ---------------------------------------------------------------------------
+
+let private mkErrorAgentEnd (isTerminal: bool) (errorMessage: string option) : JsonObject =
+    let frame = JsonObject()
+    frame["type"] <- "agent_end"
+    frame["isTerminal"] <- isTerminal
+
+    let m = JsonObject()
+    m["role"] <- "assistant"
+    m["stopReason"] <- "error"
+    errorMessage |> Option.iter (fun e -> m["errorMessage"] <- e)
+
+    let arr = JsonArray()
+    arr.Add m
+    frame["messages"] <- arr
+    frame
+
+[<Fact>]
+let ``terminal provider error with no text emits nothing and classifies failure`` () =
+    task {
+        let ctx = { CommandId = 1L; ChatId = ChatId 5L }
+        let frame = mkErrorAgentEnd true None
+        let _, envelopes, outcome = EventFormatter.onEvent ctx EventFormatter.initialState frame
+        envelopes |> should be Empty
+        outcome |> should equal (Some(TurnOutcome.ProviderFailure "unknown provider error"))
+    }
+
+[<Fact>]
+let ``terminal provider error suppresses the buffered partial text`` () =
+    task {
+        let ctx = { CommandId = 1L; ChatId = ChatId 5L }
+
+        let delta = JsonObject()
+        delta["type"] <- "message_update"
+
+        let ev = JsonObject()
+        ev["type"] <- "text_delta"
+        ev["delta"] <- "partial answer"
+        delta["assistantMessageEvent"] <- ev
+
+        let st1, _, _ = EventFormatter.onEvent ctx EventFormatter.initialState delta
+        st1.Accumulated |> should equal "partial answer"
+
+        let frame = mkErrorAgentEnd true (Some "provider exploded")
+        let st2, envelopes, outcome = EventFormatter.onEvent ctx st1 frame
+
+        // The failed turn's partial output is never delivered as a success.
+        envelopes |> should be Empty
+        st2.Accumulated |> should equal ""
+        outcome |> should equal (Some(TurnOutcome.ProviderFailure "provider exploded"))
+    }
+
+[<Fact>]
+let ``aborted terminal agent_end delivers partial text and classifies abort`` () =
+    task {
+        let ctx = { CommandId = 1L; ChatId = ChatId 5L }
+
+        let frame = JsonObject()
+        frame["type"] <- "agent_end"
+        frame["isTerminal"] <- true
+        frame["stopReason"] <- "aborted"
+
+        let m = JsonObject()
+        m["role"] <- "assistant"
+        m["stopReason"] <- "aborted"
+
+        let arr = JsonArray()
+        arr.Add m
+        frame["messages"] <- arr
+
+        let st = { Accumulated = "partial" }
+        let _, envelopes, outcome = EventFormatter.onEvent ctx st frame
+
+        // Existing /stop behavior: partial text still delivered.
+        envelopes |> should not' (be Empty)
+        outcome |> should equal (Some TurnOutcome.Aborted)
+    }
+
+[<Fact>]
+let ``terminal provider error finalizes with failure, no re-prompt, runtime preserved`` () =
+    task {
+        let fakeProc = FakeOmpProcess()
+        let client = ScriptedRpcClient()
+        let outcomes = ResizeArray<int64 * TurnOutcome>()
+
+        let turnEnded (cmdId: int64) (o: TurnOutcome) : Task<unit> =
+            task { outcomes.Add(cmdId, o) }
+
+        let spawn (_: OmpProcessOptions) : Result<IOmpProcess, string> = Ok(fakeProc :> IOmpProcess)
+        let sm = scriptedSm spawn client turnEnded
+        let user = UserId 1L
+
+        let! _ = sm.Prompt(user, mkCommand 1L 1L "hi")
+        do! sm.HandleEvent(user, mkErrorAgentEnd true (Some "provider exploded"))
+
+        outcomes.Count |> should equal 1
+        fst outcomes.[0] |> should equal 1L
+        snd outcomes.[0] |> should equal (TurnOutcome.ProviderFailure "provider exploded")
+
+        // No Phos-side retry: the failed command is not re-prompted...
+        client.PromptCount |> should equal 1
+
+        // ...and the healthy OMP process/session is preserved.
+        fakeProc.Killed |> should be False
+        sm.IsRuntimeAlive user |> should be True
+
+        // A new prompt still works on the same runtime.
+        let! r = sm.Prompt(user, mkCommand 2L 1L "again")
+
+        match r with
+        | Ok() -> ()
+        | Error e -> failwith e
+
+        client.PromptCount |> should equal 2
+    }
+
+[<Fact>]
+let ``terminal provider error drains the next queued command without requeueing the failed one`` () =
+    task {
+        let fakeProc = FakeOmpProcess()
+        let client = ScriptedRpcClient()
+        let outcomes = ResizeArray<int64 * TurnOutcome>()
+
+        let turnEnded (cmdId: int64) (o: TurnOutcome) : Task<unit> =
+            task { outcomes.Add(cmdId, o) }
+
+        let spawn (_: OmpProcessOptions) : Result<IOmpProcess, string> = Ok(fakeProc :> IOmpProcess)
+        let sm = scriptedSm spawn client turnEnded
+        let user = UserId 1L
+
+        let! _ = sm.Prompt(user, mkCommand 1L 1L "one")
+        let! _ = sm.Prompt(user, mkCommand 2L 1L "two")
+        client.PromptCount |> should equal 1
+
+        do! sm.HandleEvent(user, mkErrorAgentEnd true (Some "boom"))
+
+        // Failed command finalized exactly once as a provider failure...
+        outcomes.Count |> should equal 1
+        snd outcomes.[0] |> should equal (TurnOutcome.ProviderFailure "boom")
+
+        // ...and only the NEXT queued command was prompted (no retry of cmd 1).
+        client.PromptCount |> should equal 2
+    }
+
+[<Fact>]
+let ``auto retry events and non terminal agent_end never finalize or notify`` () =
+    task {
+        let fakeProc = FakeOmpProcess()
+        let client = ScriptedRpcClient()
+        let outcomes = ResizeArray<int64 * TurnOutcome>()
+
+        let turnEnded (cmdId: int64) (o: TurnOutcome) : Task<unit> =
+            task { outcomes.Add(cmdId, o) }
+
+        let spawn (_: OmpProcessOptions) : Result<IOmpProcess, string> = Ok(fakeProc :> IOmpProcess)
+        let sm = scriptedSm spawn client turnEnded
+        let user = UserId 1L
+
+        let! _ = sm.Prompt(user, mkCommand 1L 1L "hi")
+
+        // OMP's own retry cycle: intermediate boundaries must not finalize.
+        let retryStart = JsonObject()
+        retryStart["type"] <- "auto_retry_start"
+        do! sm.HandleEvent(user, retryStart)
+
+        let fallback = JsonObject()
+        fallback["type"] <- "retry_fallback_applied"
+        do! sm.HandleEvent(user, fallback)
+
+        // An intermediate error boundary is still non-terminal.
+        do! sm.HandleEvent(user, mkErrorAgentEnd false (Some "attempt 1 failed"))
+
+        let retryEnd = JsonObject()
+        retryEnd["type"] <- "auto_retry_end"
+        do! sm.HandleEvent(user, retryEnd)
+
+        outcomes.Count |> should equal 0
+
+        // Only the exhausted terminal agent_end finalizes.
+        do! sm.HandleEvent(user, mkErrorAgentEnd true (Some "retries exhausted"))
+
+        outcomes.Count |> should equal 1
+        snd outcomes.[0] |> should equal (TurnOutcome.ProviderFailure "retries exhausted")
+    }
+
+[<Fact>]
+let ``late same-id rpc failure finalizes the turn without a duplicate prompt`` () =
+    task {
+        let fakeProc = FakeOmpProcess()
+        let client = ScriptedRpcClient()
+        let outcomes = ResizeArray<int64 * TurnOutcome>()
+
+        let turnEnded (cmdId: int64) (o: TurnOutcome) : Task<unit> =
+            task { outcomes.Add(cmdId, o) }
+
+        let spawn (_: OmpProcessOptions) : Result<IOmpProcess, string> = Ok(fakeProc :> IOmpProcess)
+        let sm = scriptedSm spawn client turnEnded
+        let user = UserId 1L
+
+        let! _ = sm.Prompt(user, mkCommand 1L 1L "hi")
+
+        // The prompt id is remembered for late same-id correlation.
+        client.PromptIds |> should equal [ Some "prompt_1" ]
+        client.PromptCount |> should equal 1
+
+        client.RaiseLateFailure(
+            "prompt_1",
+            { Command = "prompt"
+              Code = Some "schedule"
+              Message = "late boom" }
+        )
+
+        outcomes.Count |> should equal 1
+        fst outcomes.[0] |> should equal 1L
+        snd outcomes.[0] |> should equal (TurnOutcome.ProviderFailure "late boom")
+
+        // No duplicate prompt was issued for the failed turn.
+        client.PromptCount |> should equal 1
+    }
+
+[<Fact>]
+let ``late rpc failure for a foreign id is ignored`` () =
+    task {
+        let fakeProc = FakeOmpProcess()
+        let client = ScriptedRpcClient()
+        let outcomes = ResizeArray<int64 * TurnOutcome>()
+
+        let turnEnded (cmdId: int64) (o: TurnOutcome) : Task<unit> =
+            task { outcomes.Add(cmdId, o) }
+
+        let spawn (_: OmpProcessOptions) : Result<IOmpProcess, string> = Ok(fakeProc :> IOmpProcess)
+        let sm = scriptedSm spawn client turnEnded
+        let user = UserId 1L
+
+        let! _ = sm.Prompt(user, mkCommand 1L 1L "hi")
+
+        client.RaiseLateFailure(
+            "prompt_999",
+            { Command = "prompt"
+              Code = None
+              Message = "not ours" }
+        )
+
+        outcomes.Count |> should equal 0
+
+        // The turn still finalizes normally afterwards.
+        do! sm.HandleEvent(user, mkErrorAgentEnd false (Some "ignored"))
+
+        let terminal = JsonObject()
+        terminal["type"] <- "agent_end"
+        terminal["isTerminal"] <- true
+        do! sm.HandleEvent(user, terminal)
+
+        outcomes.Count |> should equal 1
+        snd outcomes.[0] |> should equal TurnOutcome.Completed
+    }
+
+[<Fact>]
+let ``process exit mid turn parks the command for review without replay`` () =
+    task {
+        let fakeProc = FakeOmpProcess()
+        let client = ScriptedRpcClient()
+        let outcomes = ResizeArray<int64 * TurnOutcome>()
+
+        let turnEnded (cmdId: int64) (o: TurnOutcome) : Task<unit> =
+            task { outcomes.Add(cmdId, o) }
+
+        let spawn (_: OmpProcessOptions) : Result<IOmpProcess, string> = Ok(fakeProc :> IOmpProcess)
+        let sm = scriptedSm spawn client turnEnded
+        let user = UserId 1L
+
+        let! _ = sm.Prompt(user, mkCommand 1L 1L "hi")
+        fakeProc.RaiseExit()
+        do! Task.Delay 100
+
+        // Unknown outcome (host tools may have run): needs_review, not auto-retry.
+        outcomes.Count |> should equal 1
+        snd outcomes.[0] |> should equal TurnOutcome.NeedsReview
+        client.PromptCount |> should equal 1
+    }
+
+[<Fact>]
+let ``idle timeout on an in-flight turn parks the command for review`` () =
+    task {
+        let fakeProc = FakeOmpProcess()
+        let client = ScriptedRpcClient()
+        let outcomes = ResizeArray<int64 * TurnOutcome>()
+
+        let turnEnded (cmdId: int64) (o: TurnOutcome) : Task<unit> =
+            task { outcomes.Add(cmdId, o) }
+
+        let spawn (_: OmpProcessOptions) : Result<IOmpProcess, string> = Ok(fakeProc :> IOmpProcess)
+        let createClient (_: Process) (_: JsonObject) : IOmpRpcClient = client :> IOmpRpcClient
+        let mutable currentTime = DateTimeOffset.UtcNow
+        let sm = createSessionManager spawn createClient turnEnded (fun () -> currentTime)
+        let user = UserId 1L
+
+        let! _ = sm.Prompt(user, mkCommand 1L 1L "hi")
+
+        // No events for the whole idle window: the turn is wedged (generous
+        // grace exhausted) -> needs_review, never a premature kill of a
+        // healthy turn that is still streaming events.
+        currentTime <- currentTime.AddMinutes 45.0
+        sm.IdleTimeoutCheck currentTime
+        do! Task.Delay 100
+
+        outcomes.Count |> should equal 1
+        snd outcomes.[0] |> should equal TurnOutcome.NeedsReview
+    }
+
+// ---------------------------------------------------------------------------
+// Durable command finalization (Phos.App.TurnFinalization)
+// ---------------------------------------------------------------------------
+
+let private runningCommand () : Task<FakeInbox * FakeOutbox * int64> =
+    task {
+        let inbox = FakeInbox()
+        let outbox = FakeOutbox()
+
+        let env: CommandEnvelope =
+            { Origin = Telegram
+              ExternalKey = None
+              UserId = UserId 1L
+              ChatId = ChatId 9L
+              Payload = "hi"
+              Priority = 0
+              Images = [] }
+
+        let ib = inbox :> ICommandInbox
+        let! id = ib.Insert env
+        let lease = { Until = DateTimeOffset.UtcNow.AddSeconds 60.0; HeartbeatAt = DateTimeOffset.UtcNow }
+        let! _ = ib.ClaimNextForChat (ChatId 9L) lease
+        do! ib.MarkStarted id
+        return (inbox, outbox, id)
+    }
+
+[<Fact>]
+let ``finalization of a provider failure is durable, single-notice and not requeued`` () =
+    task {
+        let! inbox, outbox, id = runningCommand ()
+        let logger = NullLogger.Instance
+
+        do! Phos.App.TurnFinalization.apply (inbox :> ICommandInbox) (outbox :> IMessageOutbox) logger id (TurnOutcome.ProviderFailure "boom")
+
+        // Durable failed terminal state (attempts incremented), NOT pending.
+        let! c = inbox.GetById id
+        c.Value.Status |> should equal Inbox.Status.Failed
+
+        // Exactly one generic Telegram error through the outbox.
+        outbox.Entries.Count |> should equal 1
+        outbox.Entries.[0].ChatId |> should equal (ChatId 9L)
+        outbox.Entries.[0].CommandId |> should equal id
+        outbox.Entries.[0].Payload |> should equal Phos.App.TurnFinalization.ProviderFailureNotice
+
+        // The worker scan must not requeue it: nothing claimable, and lease
+        // expiry does not revive a failed command.
+        let l = { Until = DateTimeOffset.UtcNow.AddSeconds 60.0; HeartbeatAt = DateTimeOffset.UtcNow }
+        let! claimed = (inbox :> ICommandInbox).ClaimNextForChat (ChatId 9L) l
+        claimed |> should equal None
+        let! _ = (inbox :> ICommandInbox).ExpireLeases(DateTimeOffset.UtcNow.AddHours 1.0)
+        let! c2 = inbox.GetById id
+        c2.Value.Status |> should equal Inbox.Status.Failed
+    }
+
+[<Fact>]
+let ``finalization of normal and abort outcomes completes without outbox error`` () =
+    task {
+        for outcome in [ TurnOutcome.Completed; TurnOutcome.Aborted ] do
+            let! inbox, outbox, id = runningCommand ()
+            let logger = NullLogger.Instance
+
+            do! Phos.App.TurnFinalization.apply (inbox :> ICommandInbox) (outbox :> IMessageOutbox) logger id outcome
+
+            let! c = inbox.GetById id
+            c.Value.Status |> should equal Inbox.Status.Completed
+            outbox.Entries.Count |> should equal 0
+    }
+
+[<Fact>]
+let ``finalization of an uncertain outcome parks the command for review`` () =
+    task {
+        let! inbox, outbox, id = runningCommand ()
+        let logger = NullLogger.Instance
+
+        do! Phos.App.TurnFinalization.apply (inbox :> ICommandInbox) (outbox :> IMessageOutbox) logger id TurnOutcome.NeedsReview
+
+        let! c = inbox.GetById id
+        c.Value.Status |> should equal Inbox.Status.NeedsReview
+        outbox.Entries.Count |> should equal 0
     }

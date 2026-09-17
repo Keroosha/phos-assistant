@@ -1237,6 +1237,41 @@ let ``list pending chat ids includes failed and needs_review, excludes completed
 // Schedule jobs
 // ---------------------------------------------------------------------------
 
+[<Fact>]
+let ``failed command without retry stays failed and is not claimable`` () =
+    let dir = makeTempDir ()
+    let dbPath = Path.Combine(dir, "phos.db")
+
+    try
+        withExecutor dbPath (fun exec ->
+            task {
+                let inbox = Repositories.commandInbox exec
+                let l = lease ()
+
+                // Terminal provider failure: MarkFailed WITHOUT the prompt-error
+                // Retry call (the durable finalization path).
+                let! id = inbox.Insert(mkEnvFor 1L "no-retry")
+                let! _ = inbox.ClaimById id l
+                do! inbox.MarkStarted id
+                do! inbox.MarkFailed id
+
+                let! c = inbox.GetById id
+                c.Value.Status |> should equal In.Status.Failed
+
+                // The worker scan cannot claim it and lease expiry does not
+                // revive it: no silent requeue after an exhausted failure.
+                let! claimed = inbox.ClaimNextForChat (ChatId 1L) l
+                claimed |> should equal None
+
+                let! _ = inbox.ExpireLeases(DateTimeOffset.UtcNow.AddHours 1.0)
+                let! c2 = inbox.GetById id
+                c2.Value.Status |> should equal In.Status.Failed
+                let! claimed2 = inbox.ClaimNextForChat (ChatId 1L) l
+                claimed2 |> should equal None
+            })
+    finally
+        deleteDir dir
+
 let private tableColumns (exec: StorageExecutor) (table: string) : string list =
     exec.ReadAsync(fun conn ->
         use cmd = conn.CreateCommand()
