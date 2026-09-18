@@ -25,7 +25,8 @@ type OutboxEnvelope =
       ChatId: ChatId
       RandomId: int64
       Payload: string
-      Entities: Phos.Core.Chunker.Entity list }
+      Entities: Phos.Core.Chunker.Entity list
+      Media: MediaPayload option }
 
 /// Processes a single incoming update: dedupe, whitelist, then admit.
 ///
@@ -60,7 +61,8 @@ type UpdateHandler
                       ChatId = chat.Id
                       RandomId = Random.Shared.NextInt64()
                       Payload = chunk.Text
-                      Entities = chunk.Entities }
+                      Entities = chunk.Entities
+                      Media = None }
 
                 do! enqueueOutbox envelope
                 index <- index + 1

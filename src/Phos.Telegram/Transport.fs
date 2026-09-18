@@ -27,6 +27,14 @@ type SendTarget =
       Text: string
       Entities: TelegramEntity list }
 
+/// A media message to send, with a stable MTProto `random_id`.
+type MediaTarget =
+    { ChatId: ChatId
+      RandomId: int64
+      Caption: string
+      Entities: TelegramEntity list
+      Media: MediaPayload }
+
 /// Result of sending a message.
 type SendResult = { RemoteMessageId: int64 }
 
@@ -169,6 +177,106 @@ module Transport =
             req.flags <- req.flags ||| TL.Methods.Messages_SendMessage.Flags.has_entities
 
         req
+
+    /// Filename used for the upload (DocumentAttributeFilename / content
+    /// detection). The extension is derived from the MIME type; the stem from
+    /// the media kind.
+    let mediaFileName (media: MediaPayload) : string =
+        let ext =
+            match media.MimeType with
+            | "image/png" -> "png"
+            | "image/jpeg" -> "jpg"
+            | "image/bmp" -> "bmp"
+            | "image/webp" -> "webp"
+            | "video/mp4" -> "mp4"
+            | "video/quicktime" -> "mov"
+            | "video/x-matroska" -> "mkv"
+            | "video/webm" -> "webm"
+            | "application/x-tgsticker" -> "tgs"
+            | _ -> "bin"
+
+        let stem =
+            match media.Kind with
+            | MediaKind.Photo -> "photo"
+            | MediaKind.Video -> "video"
+            | MediaKind.Sticker -> "sticker"
+
+        sprintf "%s.%s" stem ext
+
+    /// Maps a media payload + uploaded file to the TL `InputMedia` for
+    /// photo/video/sticker.
+    let toInputMedia (media: MediaPayload) (uploaded: TL.InputFileBase) : TL.InputMedia =
+        match media.Kind with
+        | MediaKind.Photo ->
+            let input = TL.InputMediaUploadedPhoto()
+            input.file <- uploaded
+            input :> TL.InputMedia
+        | MediaKind.Video ->
+            let attr = TL.DocumentAttributeVideo()
+            attr.flags <- TL.DocumentAttributeVideo.Flags.supports_streaming
+
+            let input =
+                TL.InputMediaUploadedDocument(uploaded, media.MimeType, [| attr :> TL.DocumentAttribute |])
+
+            input :> TL.InputMedia
+        | MediaKind.Sticker ->
+            let attrs =
+                match media.MimeType with
+                // Animated .tgs sticker: the document is animated and carries
+                // the sticker attribute (stickerset/alt left null, which
+                // Telegram treats as `inputStickerSetEmpty`).
+                | "application/x-tgsticker" ->
+                    [| TL.DocumentAttributeAnimated() :> TL.DocumentAttribute
+                       TL.DocumentAttributeSticker() :> TL.DocumentAttribute |]
+                // Animated .webm sticker: round video + sticker attribute.
+                | "image/webm" ->
+                    let attr = TL.DocumentAttributeVideo()
+                    attr.flags <- TL.DocumentAttributeVideo.Flags.round_message
+
+                    [| attr :> TL.DocumentAttribute
+                       TL.DocumentAttributeSticker() :> TL.DocumentAttribute |]
+                | _ -> [| TL.DocumentAttributeSticker() :> TL.DocumentAttribute |]
+
+            let input = TL.InputMediaUploadedDocument(uploaded, media.MimeType, attrs)
+            input :> TL.InputMedia
+
+    /// Builds a `messages.sendMedia` request with an explicit random_id.
+    let buildSendMediaRequest
+        (peer: TL.InputPeer)
+        (target: MediaTarget)
+        (media: TL.InputMedia)
+        : TL.Methods.Messages_SendMedia =
+        let req = TL.Methods.Messages_SendMedia()
+        req.peer <- peer
+        req.media <- media
+        req.message <- target.Caption
+        req.random_id <- target.RandomId
+
+        if not (List.isEmpty target.Entities) then
+            req.entities <- target.Entities |> List.map toTLMessageEntity |> List.toArray
+            req.flags <- req.flags ||| TL.Methods.Messages_SendMedia.Flags.has_entities
+
+        req
+
+    /// Extracts the remote message id from a `messages.sendMedia` response,
+    /// matching `UpdateMessageID` by random_id, or `UpdateShortSentMessage.id`.
+    let extractMediaMessageId (result: TL.UpdatesBase) (randomId: int64) : int64 =
+        let matched =
+            if isNull result.UpdateList then
+                None
+            else
+                result.UpdateList
+                |> Array.tryPick (fun update ->
+                    match update with
+                    | :? TL.UpdateMessageID as um when um.random_id = randomId -> Some(int64 um.id)
+                    | _ -> None)
+
+        match matched with
+        | Some id -> id
+        | None ->
+            match result with
+            | :? TL.UpdateShortSentMessage as sent -> int64 sent.id
+            | _ -> 0L
 
     /// Builds a `messages.getHistory` request for paged history before `beforeId`.
     ///
@@ -374,8 +482,7 @@ module Transport =
         : unit =
         for kv in chats do
             match kv.Value with
-            | :? TL.Channel as ch ->
-                candidates.[ch.id] <- (TL.InputPeerChannel(ch.id, ch.access_hash) :> TL.InputPeer)
+            | :? TL.Channel as ch -> candidates.[ch.id] <- (TL.InputPeerChannel(ch.id, ch.access_hash) :> TL.InputPeer)
             | _ -> ()
 
     /// Builds the `users.getUsers` request with zero access hashes.
@@ -427,6 +534,7 @@ module Transport =
 type ITelegramTransport =
     abstract Login: unit -> Task<BotInfo>
     abstract SendMessage: SendTarget -> TaskResult<SendResult, SendError>
+    abstract SendMedia: MediaTarget -> TaskResult<SendResult, SendError>
     abstract EditMessage: ChatId -> int64 -> string -> TelegramEntity list -> Task<unit>
     abstract DownloadVoice: VoiceRef -> Task<byte[]>
     abstract DownloadPhoto: PhotoRef -> Task<byte[]>

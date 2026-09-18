@@ -46,7 +46,8 @@ type TelegramTransport(config: TelegramConfig, ?logger: ILogger) =
     /// Login-readiness gate. Completed only after `LoginBotIfNeeded` succeeds
     /// (see `loginCore`); peer hydration awaits it so no API call is attempted
     /// before the client is connected and authorized.
-    let loginReady = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+    let loginReady =
+        TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
 
     let loginCore () : Task<BotInfo> =
         task {
@@ -107,8 +108,7 @@ type TelegramTransport(config: TelegramConfig, ?logger: ILogger) =
                     let missing =
                         chatIds
                         |> List.filter (fun (ChatId cid) ->
-                            peers.Get (ChatId cid) |> Option.isNone
-                            && not (isCoolingDown cid))
+                            peers.Get(ChatId cid) |> Option.isNone && not (isCoolingDown cid))
 
                     let attempted = not (List.isEmpty missing)
 
@@ -122,14 +122,11 @@ type TelegramTransport(config: TelegramConfig, ?logger: ILogger) =
                         // single candidate is merged into the real PeerCache.
                         let ids = missing |> List.map (fun (ChatId cid) -> cid)
 
-                        let userCandidates =
-                            ConcurrentDictionary<int64, TL.InputPeer>()
+                        let userCandidates = ConcurrentDictionary<int64, TL.InputPeer>()
 
-                        let channelCandidates =
-                            ConcurrentDictionary<int64, TL.InputPeer>()
+                        let channelCandidates = ConcurrentDictionary<int64, TL.InputPeer>()
 
-                        let chatCandidates =
-                            ConcurrentDictionary<int64, TL.InputPeer>()
+                        let chatCandidates = ConcurrentDictionary<int64, TL.InputPeer>()
 
                         for batch in ids |> List.chunkBySize 100 do
                             // users.getUsers with zero access hashes — bots may
@@ -162,9 +159,12 @@ type TelegramTransport(config: TelegramConfig, ?logger: ILogger) =
 
                         for cid in ids do
                             let candidates =
-                                [ if userCandidates.ContainsKey cid then userCandidates.[cid]
-                                  if channelCandidates.ContainsKey cid then channelCandidates.[cid]
-                                  if chatCandidates.ContainsKey cid then chatCandidates.[cid] ]
+                                [ if userCandidates.ContainsKey cid then
+                                      userCandidates.[cid]
+                                  if channelCandidates.ContainsKey cid then
+                                      channelCandidates.[cid]
+                                  if chatCandidates.ContainsKey cid then
+                                      chatCandidates.[cid] ]
 
                             match candidates with
                             | [ peer ] -> peers.Cache(ChatId cid, peer)
@@ -176,6 +176,7 @@ type TelegramTransport(config: TelegramConfig, ?logger: ILogger) =
                     hydrationGate.Release() |> ignore
                     return raise ex
         }
+
     /// Runs `op` with the peer resolved from the cache. On a missing peer (the
     /// in-memory cache is empty after a restart while durable rows survive),
     /// hydrates the chat once and retries — the hydration gate coalesces
@@ -227,6 +228,27 @@ type TelegramTransport(config: TelegramConfig, ?logger: ILogger) =
                     let req = Transport.buildSendRequest peer target
                     let! result = client.Invoke(req)
                     return Ok { RemoteMessageId = Transport.extractRemoteMessageId result }
+                with ex ->
+                    return Error(Transport.mapRpcError ex)
+        }
+
+    let sendMediaCore (target: MediaTarget) : TaskResult<SendResult, SendError> =
+        task {
+            match! resolveSendPeer target.ChatId with
+            | Error reason -> return Error(MissingPeer(target.ChatId, reason))
+            | Ok peer ->
+                try
+                    let bytes = Convert.FromBase64String target.Media.DataBase64
+
+                    use stream = new MemoryStream(bytes)
+
+                    let! uploaded = client.UploadFileAsync(stream, Transport.mediaFileName target.Media, null)
+
+                    let media = Transport.toInputMedia target.Media uploaded
+                    let req = Transport.buildSendMediaRequest peer target media
+                    let! result = client.Invoke(req)
+
+                    return Ok { RemoteMessageId = Transport.extractMediaMessageId result target.RandomId }
                 with ex ->
                     return Error(Transport.mapRpcError ex)
         }
@@ -369,6 +391,7 @@ type TelegramTransport(config: TelegramConfig, ?logger: ILogger) =
     interface ITelegramTransport with
         member _.Login() = loginCore ()
         member _.SendMessage(target) = sendMessageCore target
+        member _.SendMedia(target) = sendMediaCore target
 
         member _.EditMessage (chat) (messageId) (text) (entities) =
             editMessageCore chat messageId text entities

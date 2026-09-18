@@ -472,6 +472,27 @@ type AddScheduleRunAt() =
     override this.Down() =
         this.Delete.Column("run_at").FromTable("schedule_jobs") |> ignore
 
+[<Migration(13L)>]
+type AddOutboxMedia() =
+    inherit Migration()
+
+    override this.Up() =
+        // Media payloads (agent-sent photos/videos/stickers) are stored as
+        // base64 text columns; NULL for text-only rows.
+        this.Alter.Table("message_outbox").AddColumn("media_kind").AsString().Nullable()
+        |> ignore
+
+        this.Alter.Table("message_outbox").AddColumn("media_mime").AsString().Nullable()
+        |> ignore
+
+        this.Alter.Table("message_outbox").AddColumn("media_data").AsString().Nullable()
+        |> ignore
+
+    override this.Down() =
+        this.Delete.Column("media_data").FromTable("message_outbox") |> ignore
+        this.Delete.Column("media_mime").FromTable("message_outbox") |> ignore
+        this.Delete.Column("media_kind").FromTable("message_outbox") |> ignore
+
 // ---------------------------------------------------------------------------
 // Runner
 // ---------------------------------------------------------------------------

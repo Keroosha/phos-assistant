@@ -24,8 +24,12 @@
   одноразовой календарной даты с точным временем. Таймзона per-job (IANA),
   по умолчанию — таймзона хоста; задания персистентны в SQLite и переживают
   рестарт; остановка — только промптом.
-- **Host tools агента**: `tg_send_message`, `tg_edit_message`, `stt_transcribe`,
-  `schedule_*`; чтение `tg://` URI (например, голосовые сообщения как контекст).
+- **Host tools агента**: `tg_send_message`, `tg_edit_message`,
+  `tg_send_photo`/`tg_send_video`/`tg_send_sticker` (файл по абсолютному или
+  workspace-относительному пути, опциональный `caption`), `stt_transcribe`,
+  `schedule_*`; изображения, сгенерированные моделью в ответе
+  (`image_end`-события OMP), автоматически отправляются как фото;
+  чтение `tg://` URI (например, голосовые сообщения как контекст).
 - **Общий OMP-профиль и per-user workspace**: профиль `Omp:Profile` создаётся
   из `Omp:SourceProfile` (`models.yml`, `.env` и `config.yml` с `modelRoles`),
   а workspace — `~/.phos/workspace/<uid>/.omp/APPEND_SYSTEM.md` с

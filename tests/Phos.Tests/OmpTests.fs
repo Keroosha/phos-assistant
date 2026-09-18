@@ -94,6 +94,9 @@ let private tempDir () : string =
     Directory.CreateDirectory(dir) |> ignore
     dir
 
+let private mkWorkspaces () : WorkspaceManager =
+    WorkspaceManager(Path.Combine(Path.GetTempPath(), "phos-ws-test-" + Guid.NewGuid().ToString("N")))
+
 let private deleteDir (dir: string) =
     try
         if Directory.Exists dir then
@@ -134,10 +137,16 @@ type FakeTransport
     let mutable history = defaultArg historyResult []
     let reactions = ResizeArray<int64 * string>()
     let historyCalls = ResizeArray<ChatId * int64 * int>()
+    let mediaCalls = ResizeArray<MediaTarget>()
+    let mutable failMedia = false
     member _.SendCount = sendCount
     member _.EditCount = editCount
     member _.TypingCount = typingCount
     member _.Reactions = reactions
+    member _.MediaCalls = List.ofSeq mediaCalls
+
+    member _.FailMedia
+        with set (v: bool) = failMedia <- v
 
     member _.Summary
         with set (v: MessageSummary option) = summary <- v
@@ -155,6 +164,16 @@ type FakeTransport
             task {
                 sendCount <- sendCount + 1
                 return Ok { RemoteMessageId = 1L }
+            }
+
+        member _.SendMedia(target: MediaTarget) =
+            task {
+                mediaCalls.Add target
+
+                if failMedia then
+                    return Error(Other "media send failed")
+                else
+                    return Ok { RemoteMessageId = 1L }
             }
 
         member _.EditMessage (_: ChatId) (_: int64) (_: string) (_: TelegramEntity list) =
@@ -845,7 +864,14 @@ let ``executor sends message once and caches idempotently`` () =
         let voice = FakeVoiceProcessor(Ok "hi")
 
         let executor =
-            HostToolExecutor(transport, voice, FakeScheduleRepo(), defaultQuota, NullLogger<HostToolExecutor>.Instance)
+            HostToolExecutor(
+                transport,
+                voice,
+                mkWorkspaces (),
+                FakeScheduleRepo(),
+                defaultQuota,
+                NullLogger<HostToolExecutor>.Instance
+            )
 
         let frame = JsonObject()
         frame["type"] <- "host_tool_call"
@@ -883,6 +909,7 @@ let ``executor reports isError for unknown tool`` () =
             HostToolExecutor(
                 FakeTransport(),
                 FakeVoiceProcessor(Ok "hi"),
+                mkWorkspaces (),
                 FakeScheduleRepo(),
                 defaultQuota,
                 NullLogger<HostToolExecutor>.Instance
@@ -909,6 +936,7 @@ let ``executor returns none for non tool frame`` () =
             HostToolExecutor(
                 FakeTransport(),
                 FakeVoiceProcessor(Ok "hi"),
+                mkWorkspaces (),
                 FakeScheduleRepo(),
                 defaultQuota,
                 NullLogger<HostToolExecutor>.Instance
@@ -918,6 +946,233 @@ let ``executor returns none for non tool frame`` () =
         frame["type"] <- "agent_start"
         let! result = executor.TryExecute(UserId 1L, Some(ChatId 1L), Some Telegram, frame)
         result |> should equal None
+    }
+
+let private hostToolResultText (frame: JsonObject) : string =
+    match Json.getObject "result" frame with
+    | Some resultObj ->
+        match Json.getArray "content" resultObj with
+        | Some arr ->
+            match arr |> Seq.tryHead with
+            | Some(:? JsonObject as item) -> Json.getString "text" item |> Option.defaultValue ""
+            | _ -> ""
+        | None -> ""
+    | None -> ""
+
+[<Fact>]
+let ``tg_send_photo sends a real workspace image as photo`` () =
+    task {
+        let transport = FakeTransport()
+        let ws = WorkspaceManager(tempDir ())
+        let wsDir = ws.PathFor(UserId 1L)
+        Directory.CreateDirectory wsDir |> ignore
+        let path = Path.Combine(wsDir, "x.png")
+        File.WriteAllBytes(path, [| 1uy; 2uy; 3uy |])
+
+        let executor =
+            HostToolExecutor(
+                transport,
+                FakeVoiceProcessor(Ok "hi"),
+                ws,
+                FakeScheduleRepo(),
+                defaultQuota,
+                NullLogger<HostToolExecutor>.Instance
+            )
+
+        let frame = JsonObject()
+        frame["type"] <- "host_tool_call"
+        frame["id"] <- "host_photo"
+        frame["toolCallId"] <- "toolu_photo"
+        frame["toolName"] <- "tg_send_photo"
+        let args = JsonObject()
+        args["chat_id"] <- 1L
+        args["path"] <- path
+        frame["arguments"] <- (args :> JsonNode)
+
+        let! result = executor.TryExecute(UserId 1L, Some(ChatId 1L), Some Telegram, frame)
+
+        match result with
+        | Some r ->
+            Json.getBool "isError" r |> should equal None
+            transport.MediaCalls |> List.length |> should equal 1
+            let call = transport.MediaCalls.Head
+            call.ChatId |> should equal (ChatId 1L)
+            call.Media.Kind |> should equal MediaKind.Photo
+            call.Media.MimeType |> should equal "image/png"
+
+            call.Media.DataBase64
+            |> should equal (Convert.ToBase64String [| 1uy; 2uy; 3uy |])
+        | None -> failwith "expected a result frame for tg_send_photo"
+    }
+
+[<Fact>]
+let ``tg_send_photo missing file returns error`` () =
+    task {
+        let transport = FakeTransport()
+        let ws = WorkspaceManager(tempDir ())
+
+        let executor =
+            HostToolExecutor(
+                transport,
+                FakeVoiceProcessor(Ok "hi"),
+                ws,
+                FakeScheduleRepo(),
+                defaultQuota,
+                NullLogger<HostToolExecutor>.Instance
+            )
+
+        let frame = JsonObject()
+        frame["type"] <- "host_tool_call"
+        frame["id"] <- "host_missing"
+        frame["toolCallId"] <- "toolu_missing"
+        frame["toolName"] <- "tg_send_photo"
+        let args = JsonObject()
+        args["chat_id"] <- 1L
+        args["path"] <- Path.Combine(ws.PathFor(UserId 1L), "nope.png")
+        frame["arguments"] <- (args :> JsonNode)
+
+        let! result = executor.TryExecute(UserId 1L, Some(ChatId 1L), Some Telegram, frame)
+
+        match result with
+        | Some r ->
+            Json.getBool "isError" r |> should equal (Some true)
+            Assert.Contains("файл не найден", hostToolResultText r)
+            transport.MediaCalls |> should be Empty
+        | None -> failwith "expected a result frame for missing file"
+    }
+
+[<Fact>]
+let ``tg_send_video and tg_send_sticker route kinds and mimes`` () =
+    task {
+        let transport = FakeTransport()
+        let ws = WorkspaceManager(tempDir ())
+        let wsDir = ws.PathFor(UserId 1L)
+        Directory.CreateDirectory wsDir |> ignore
+        File.WriteAllBytes(Path.Combine(wsDir, "v.mp4"), [| 1uy |])
+        File.WriteAllBytes(Path.Combine(wsDir, "s.webp"), [| 2uy |])
+
+        let executor =
+            HostToolExecutor(
+                transport,
+                FakeVoiceProcessor(Ok "hi"),
+                ws,
+                FakeScheduleRepo(),
+                defaultQuota,
+                NullLogger<HostToolExecutor>.Instance
+            )
+
+        let callTool (name: string) (path: string) (id: string) : Task<JsonObject option> =
+            let frame = JsonObject()
+            frame["type"] <- "host_tool_call"
+            frame["id"] <- id
+            frame["toolCallId"] <- id
+            frame["toolName"] <- name
+            let args = JsonObject()
+            args["chat_id"] <- 1L
+            args["path"] <- path
+            frame["arguments"] <- (args :> JsonNode)
+            executor.TryExecute(UserId 1L, Some(ChatId 1L), Some Telegram, frame)
+
+        let! r1 = callTool "tg_send_video" (Path.Combine(wsDir, "v.mp4")) "toolu_video"
+
+        match r1 with
+        | Some r -> Json.getBool "isError" r |> should equal None
+        | None -> failwith "expected a result frame for tg_send_video"
+
+        let! r2 = callTool "tg_send_sticker" (Path.Combine(wsDir, "s.webp")) "toolu_sticker"
+
+        match r2 with
+        | Some r -> Json.getBool "isError" r |> should equal None
+        | None -> failwith "expected a result frame for tg_send_sticker"
+
+        transport.MediaCalls |> List.length |> should equal 2
+        let videoCall = transport.MediaCalls.[0]
+        videoCall.Media.Kind |> should equal MediaKind.Video
+        videoCall.Media.MimeType |> should equal "video/mp4"
+        let stickerCall = transport.MediaCalls.[1]
+        stickerCall.Media.Kind |> should equal MediaKind.Sticker
+        stickerCall.Media.MimeType |> should equal "image/webp"
+    }
+
+[<Fact>]
+let ``tg_send_photo resolves relative path against the workspace`` () =
+    task {
+        let transport = FakeTransport()
+        let ws = WorkspaceManager(tempDir ())
+        let wsDir = ws.PathFor(UserId 1L)
+        Directory.CreateDirectory(Path.Combine(wsDir, "out")) |> ignore
+        File.WriteAllBytes(Path.Combine(wsDir, "out", "x.png"), [| 9uy |])
+
+        let executor =
+            HostToolExecutor(
+                transport,
+                FakeVoiceProcessor(Ok "hi"),
+                ws,
+                FakeScheduleRepo(),
+                defaultQuota,
+                NullLogger<HostToolExecutor>.Instance
+            )
+
+        let frame = JsonObject()
+        frame["type"] <- "host_tool_call"
+        frame["id"] <- "host_rel"
+        frame["toolCallId"] <- "toolu_rel"
+        frame["toolName"] <- "tg_send_photo"
+        let args = JsonObject()
+        args["chat_id"] <- 1L
+        args["path"] <- "out/x.png"
+        frame["arguments"] <- (args :> JsonNode)
+
+        let! result = executor.TryExecute(UserId 1L, Some(ChatId 1L), Some Telegram, frame)
+
+        match result with
+        | Some r ->
+            Json.getBool "isError" r |> should equal None
+            transport.MediaCalls |> List.length |> should equal 1
+
+            transport.MediaCalls.Head.Media.DataBase64
+            |> should equal (Convert.ToBase64String [| 9uy |])
+        | None -> failwith "expected a result frame for relative path"
+    }
+
+[<Fact>]
+let ``tg_send_photo maps transport send error`` () =
+    task {
+        let transport = FakeTransport()
+        transport.FailMedia <- true
+        let ws = WorkspaceManager(tempDir ())
+        let wsDir = ws.PathFor(UserId 1L)
+        Directory.CreateDirectory wsDir |> ignore
+        let path = Path.Combine(wsDir, "x.png")
+        File.WriteAllBytes(path, [| 1uy |])
+
+        let executor =
+            HostToolExecutor(
+                transport,
+                FakeVoiceProcessor(Ok "hi"),
+                ws,
+                FakeScheduleRepo(),
+                defaultQuota,
+                NullLogger<HostToolExecutor>.Instance
+            )
+
+        let frame = JsonObject()
+        frame["type"] <- "host_tool_call"
+        frame["id"] <- "host_sendfail"
+        frame["toolCallId"] <- "toolu_sendfail"
+        frame["toolName"] <- "tg_send_photo"
+        let args = JsonObject()
+        args["chat_id"] <- 1L
+        args["path"] <- path
+        frame["arguments"] <- (args :> JsonNode)
+
+        let! result = executor.TryExecute(UserId 1L, Some(ChatId 1L), Some Telegram, frame)
+
+        match result with
+        | Some r ->
+            Json.getBool "isError" r |> should equal (Some true)
+            Assert.Contains("media send failed", hostToolResultText r)
+        | None -> failwith "expected a result frame for media send failure"
     }
 
 [<Fact>]
@@ -1092,7 +1347,7 @@ let ``terminal agent_end chunks accumulated text`` () =
     let ctx = { CommandId = 1L; ChatId = ChatId 5L }
     let text = String.replicate 5000 "a"
 
-    let st = { Accumulated = text }
+    let st = { Accumulated = text; MediaCount = 0 }
 
     let frame = JsonObject()
     frame["type"] <- "agent_end"
@@ -1111,7 +1366,9 @@ let ``terminal agent_end chunks accumulated text`` () =
 let ``non terminal agent_end emits nothing`` () =
     let ctx = { CommandId = 1L; ChatId = ChatId 5L }
 
-    let st = { Accumulated = "partial" }
+    let st =
+        { Accumulated = "partial"
+          MediaCount = 0 }
 
     let frame = JsonObject()
     frame["type"] <- "agent_end"
@@ -1123,13 +1380,85 @@ let ``non terminal agent_end emits nothing`` () =
 let ``terminal agent_end with empty text emits nothing`` () =
     let ctx = { CommandId = 1L; ChatId = ChatId 5L }
 
-    let st = { Accumulated = "" }
+    let st = { Accumulated = ""; MediaCount = 0 }
 
     let frame = JsonObject()
     frame["type"] <- "agent_end"
     frame["isTerminal"] <- true
     let _, envelopes, _ = EventFormatter.onEvent ctx st frame
     envelopes |> should be Empty
+
+[<Fact>]
+let ``formatter image_end produces one photo media envelope`` () =
+    let ctx = { CommandId = 1L; ChatId = ChatId 5L }
+    let frame = JsonObject()
+    frame["type"] <- "message_update"
+    let ev = JsonObject()
+    ev["type"] <- "image_end"
+    let content = JsonObject()
+    content["type"] <- "image"
+    content["data"] <- "AQID"
+    content["mimeType"] <- "image/png"
+    ev["content"] <- (content :> JsonNode)
+    frame["assistantMessageEvent"] <- (ev :> JsonNode)
+
+    let st, envelopes, _ = EventFormatter.onEvent ctx EventFormatter.initialState frame
+    envelopes |> List.length |> should equal 1
+    let env = envelopes.Head
+    env.CommandId |> should equal 1L
+    env.ChatId |> should equal (ChatId 5L)
+    env.Payload |> should equal ""
+    env.Entities |> should be Empty
+    env.ChunkIndex |> should equal -1
+
+    match env.Media with
+    | Some media ->
+        media.Kind |> should equal MediaKind.Photo
+        media.MimeType |> should equal "image/png"
+        media.DataBase64 |> should equal "AQID"
+    | None -> failwith "expected a media envelope"
+
+    st.MediaCount |> should equal 1
+
+[<Fact>]
+let ``formatter image_end frames get distinct negative chunk indices`` () =
+    let ctx = { CommandId = 1L; ChatId = ChatId 5L }
+
+    let mkImageEnd (data: string) =
+        let frame = JsonObject()
+        frame["type"] <- "message_update"
+        let ev = JsonObject()
+        ev["type"] <- "image_end"
+        let content = JsonObject()
+        content["type"] <- "image"
+        content["data"] <- data
+        content["mimeType"] <- "image/png"
+        ev["content"] <- (content :> JsonNode)
+        frame["assistantMessageEvent"] <- (ev :> JsonNode)
+        frame
+
+    let st1, envs1, _ =
+        EventFormatter.onEvent ctx EventFormatter.initialState (mkImageEnd "AQID")
+
+    let st2, envs2, _ = EventFormatter.onEvent ctx st1 (mkImageEnd "BAUG")
+    let all = envs1 @ envs2
+    all |> List.length |> should equal 2
+    all |> List.map (fun e -> e.ChunkIndex) |> should equal [ -1; -2 ]
+    st2.MediaCount |> should equal 2
+
+[<Fact>]
+let ``formatter text_delta does not produce media`` () =
+    let ctx = { CommandId = 1L; ChatId = ChatId 5L }
+    let frame = JsonObject()
+    frame["type"] <- "message_update"
+    let ev = JsonObject()
+    ev["type"] <- "text_delta"
+    ev["delta"] <- "hello"
+    frame["assistantMessageEvent"] <- (ev :> JsonNode)
+
+    let st, envelopes, _ = EventFormatter.onEvent ctx EventFormatter.initialState frame
+    envelopes |> should be Empty
+    st.MediaCount |> should equal 0
 
 // ---------------------------------------------------------------------------
 // WorkspaceManager / ProfileManager
@@ -1408,7 +1737,14 @@ let private createSessionManager
     let voice = FakeVoiceProcessor(Ok "hi")
 
     let hostTools =
-        HostToolExecutor(transport, voice, FakeScheduleRepo(), defaultQuota, NullLogger<HostToolExecutor>.Instance)
+        HostToolExecutor(
+            transport,
+            voice,
+            workspaces,
+            FakeScheduleRepo(),
+            defaultQuota,
+            NullLogger<HostToolExecutor>.Instance
+        )
 
     let hostUris = HostUriResolver(transport, NullLogger<HostUriResolver>.Instance)
     let enqueueOutbox (_: OutboxEnvelope) : Task<unit> = Task.FromResult(())
@@ -2149,13 +2485,15 @@ type FakeOutbox() =
 
     interface IMessageOutbox with
         member _.Insert
-            (commandId: int64)
-            (chunkIndex: int)
-            (chatId: ChatId)
-            (randomId: int64)
-            (payload: string)
-            (entities: Entity list)
-            =
+            (
+                commandId: int64,
+                chunkIndex: int,
+                chatId: ChatId,
+                randomId: int64,
+                payload: string,
+                entities: Entity list,
+                ?media: MediaPayload
+            ) =
             task {
                 match
                     entries
@@ -2171,6 +2509,7 @@ type FakeOutbox() =
                           RandomId = randomId
                           Payload = payload
                           Entities = entities
+                          Media = media
                           Status = Outbox.Status.Pending
                           Attempts = 0
                           MaxAttempts = 5
@@ -2833,7 +3172,10 @@ let ``uri resolver returns error on download failure`` () =
 
                 member _.DownloadMessagePhoto _ _ = task { return None }
 
-                member _.GetHistory _ _ _ = task { return [] } }
+                member _.GetHistory _ _ _ = task { return [] }
+
+                member _.SendMedia(_: MediaTarget) =
+                    task { return Ok { RemoteMessageId = 1L } } }
 
         let resolver = HostUriResolver(transport, NullLogger<HostUriResolver>.Instance)
         let frame = JsonObject()
@@ -2974,8 +3316,13 @@ let ``client registers host tools and uri schemes with the server`` () =
                         let names =
                             Json.getArray "toolNames" (data :?> JsonObject)
                             |> Option.defaultWith (fun () -> JsonArray())
+                            |> Seq.map string
+                            |> Seq.toList
 
-                        names |> Seq.length |> should equal 11
+                        names |> List.length |> should equal 14
+                        Assert.Contains("tg_send_photo", names)
+                        Assert.Contains("tg_send_video", names)
+                        Assert.Contains("tg_send_sticker", names)
                     | Error e -> failwith e.Message
 
                     let! schemesRes =
@@ -3055,17 +3402,6 @@ let ``send resolves an error when writing to a closed pipe`` () =
 // HostToolExecutor: Telegram send-error mapping
 // ---------------------------------------------------------------------------
 
-let private hostToolResultText (frame: JsonObject) : string =
-    match Json.getObject "result" frame with
-    | Some resultObj ->
-        match Json.getArray "content" resultObj with
-        | Some arr ->
-            match arr |> Seq.tryHead with
-            | Some(:? JsonObject as item) -> Json.getString "text" item |> Option.defaultValue ""
-            | _ -> ""
-        | None -> ""
-    | None -> ""
-
 [<Fact>]
 let ``executor maps flood wait to an error`` () =
     task {
@@ -3088,12 +3424,16 @@ let ``executor maps flood wait to an error`` () =
 
                 member _.DownloadMessagePhoto _ _ = task { return None }
 
-                member _.GetHistory _ _ _ = task { return [] } }
+                member _.GetHistory _ _ _ = task { return [] }
+
+                member _.SendMedia(_: MediaTarget) =
+                    task { return Ok { RemoteMessageId = 1L } } }
 
         let executor =
             HostToolExecutor(
                 transport,
                 FakeVoiceProcessor(Ok "hi"),
+                mkWorkspaces (),
                 FakeScheduleRepo(),
                 defaultQuota,
                 NullLogger<HostToolExecutor>.Instance
@@ -3140,12 +3480,16 @@ let ``executor maps slowmode wait to an error`` () =
 
                 member _.DownloadMessagePhoto _ _ = task { return None }
 
-                member _.GetHistory _ _ _ = task { return [] } }
+                member _.GetHistory _ _ _ = task { return [] }
+
+                member _.SendMedia(_: MediaTarget) =
+                    task { return Ok { RemoteMessageId = 1L } } }
 
         let executor =
             HostToolExecutor(
                 transport,
                 FakeVoiceProcessor(Ok "hi"),
+                mkWorkspaces (),
                 FakeScheduleRepo(),
                 defaultQuota,
                 NullLogger<HostToolExecutor>.Instance
@@ -3179,6 +3523,7 @@ let ``schedule_add creates pending job and shows next occurrences`` () =
             HostToolExecutor(
                 FakeTransport(),
                 FakeVoiceProcessor(Ok "hi"),
+                mkWorkspaces (),
                 repo,
                 defaultQuota,
                 NullLogger<HostToolExecutor>.Instance
@@ -3218,6 +3563,7 @@ let ``schedule_add with after_seconds creates one-shot pending job`` () =
             HostToolExecutor(
                 FakeTransport(),
                 FakeVoiceProcessor(Ok "hi"),
+                mkWorkspaces (),
                 repo,
                 defaultQuota,
                 NullLogger<HostToolExecutor>.Instance
@@ -3258,6 +3604,7 @@ let ``schedule_add accepts future run_at and defaults timezone to host local`` (
             HostToolExecutor(
                 FakeTransport(),
                 FakeVoiceProcessor(Ok "hi"),
+                mkWorkspaces (),
                 repo,
                 defaultQuota,
                 NullLogger<HostToolExecutor>.Instance
@@ -3304,6 +3651,7 @@ let ``schedule_add rejects date-only past and mixed calendar modes`` () =
             HostToolExecutor(
                 FakeTransport(),
                 FakeVoiceProcessor(Ok "hi"),
+                mkWorkspaces (),
                 repo,
                 defaultQuota,
                 NullLogger<HostToolExecutor>.Instance
@@ -3349,6 +3697,7 @@ let ``throwing host tool returns isError result frame`` () =
             HostToolExecutor(
                 FakeTransport(),
                 FakeVoiceProcessor(Ok "hi"),
+                mkWorkspaces (),
                 repo,
                 defaultQuota,
                 NullLogger<HostToolExecutor>.Instance
@@ -3386,6 +3735,7 @@ let ``schedule_add rejects over quota`` () =
             HostToolExecutor(
                 FakeTransport(),
                 FakeVoiceProcessor(Ok "hi"),
+                mkWorkspaces (),
                 repo,
                 defaultQuota,
                 NullLogger<HostToolExecutor>.Instance
@@ -3434,6 +3784,7 @@ let ``schedule_confirm requires user origin`` () =
             HostToolExecutor(
                 FakeTransport(),
                 FakeVoiceProcessor(Ok "hi"),
+                mkWorkspaces (),
                 repo,
                 defaultQuota,
                 NullLogger<HostToolExecutor>.Instance
@@ -3514,6 +3865,7 @@ let ``schedule_list renders jobs`` () =
             HostToolExecutor(
                 FakeTransport(),
                 FakeVoiceProcessor(Ok "hi"),
+                mkWorkspaces (),
                 repo,
                 defaultQuota,
                 NullLogger<HostToolExecutor>.Instance
@@ -3559,6 +3911,7 @@ let ``schedule_list shows one-shot marker`` () =
             HostToolExecutor(
                 FakeTransport(),
                 FakeVoiceProcessor(Ok "hi"),
+                mkWorkspaces (),
                 repo,
                 defaultQuota,
                 NullLogger<HostToolExecutor>.Instance
@@ -3604,6 +3957,7 @@ let ``schedule_pause resume remove run_now transitions`` () =
             HostToolExecutor(
                 FakeTransport(),
                 FakeVoiceProcessor(Ok "hi"),
+                mkWorkspaces (),
                 repo,
                 defaultQuota,
                 NullLogger<HostToolExecutor>.Instance
@@ -3659,6 +4013,7 @@ let ``schedule_add idempotent via toolCallId`` () =
             HostToolExecutor(
                 FakeTransport(),
                 FakeVoiceProcessor(Ok "hi"),
+                mkWorkspaces (),
                 repo,
                 defaultQuota,
                 NullLogger<HostToolExecutor>.Instance
@@ -3975,7 +4330,10 @@ let ``aborted terminal agent_end delivers partial text and classifies abort`` ()
         arr.Add m
         frame["messages"] <- arr
 
-        let st = { Accumulated = "partial" }
+        let st =
+            { Accumulated = "partial"
+              MediaCount = 0 }
+
         let _, envelopes, outcome = EventFormatter.onEvent ctx st frame
 
         // Existing /stop behavior: partial text still delivered.

@@ -2,6 +2,7 @@ namespace Phos.Omp
 
 open System
 open System.Collections.Concurrent
+open System.IO
 open System.Threading.Tasks
 open System.Text.Json.Nodes
 open Microsoft.Extensions.Logging
@@ -47,6 +48,32 @@ module HostTools =
                   [ "chat_id", "integer", true
                     "message_id", "integer", true
                     "text", "string", true ] }
+          { Name = "tg_send_photo"
+            Label = "Send photo"
+            Description =
+              "Send an image file to a Telegram chat as a photo. Path may be absolute or workspace-relative."
+            Parameters =
+              jsonSchema
+                  [ "chat_id", "integer", true
+                    "path", "string", true
+                    "caption", "string", false ] }
+          { Name = "tg_send_video"
+            Label = "Send video"
+            Description = "Send a video file to a Telegram chat as a video. Path may be absolute or workspace-relative."
+            Parameters =
+              jsonSchema
+                  [ "chat_id", "integer", true
+                    "path", "string", true
+                    "caption", "string", false ] }
+          { Name = "tg_send_sticker"
+            Label = "Send sticker"
+            Description =
+              "Send a sticker file (.webp/.tgs/.webm) to a Telegram chat. Path may be absolute or workspace-relative."
+            Parameters =
+              jsonSchema
+                  [ "chat_id", "integer", true
+                    "path", "string", true
+                    "caption", "string", false ] }
           { Name = "stt_transcribe"
             Label = "Transcribe voice"
             Description = "Transcribe a Telegram voice message."
@@ -102,6 +129,7 @@ type HostToolExecutor
     (
         transport: ITelegramTransport,
         voice: IVoiceProcessor,
+        workspaces: WorkspaceManager,
         jobs: IScheduleJobRepository,
         quota: ScheduleQuota,
         logger: ILogger
@@ -160,6 +188,77 @@ type HostToolExecutor
                 do! transport.EditMessage (ChatId chatId) messageId text []
                 return Ok "edited"
             | _ -> return Error "tg_edit_message requires chat_id, message_id and text"
+        }
+
+    /// Maps a file extension to the Telegram MIME type for the given media
+    /// kind. Unsupported extensions produce a Russian error matching the
+    /// existing tool-error style.
+    let mimeFor (kind: MediaKind) (path: string) : Result<string, string> =
+        let ext =
+            match Path.GetExtension(path) with
+            | null -> ""
+            | e -> e.ToLowerInvariant()
+
+        match kind with
+        | MediaKind.Photo ->
+            match ext with
+            | ".png" -> Ok "image/png"
+            | ".jpg"
+            | ".jpeg" -> Ok "image/jpeg"
+            | ".webp" -> Ok "image/webp"
+            | ".bmp" -> Ok "image/bmp"
+            | _ -> Error(sprintf "неподдерживаемый формат файла: %s (для photo: png/jpg/jpeg/webp/bmp)" ext)
+        | MediaKind.Video ->
+            match ext with
+            | ".mp4" -> Ok "video/mp4"
+            | ".mov" -> Ok "video/quicktime"
+            | ".mkv" -> Ok "video/x-matroska"
+            | ".webm" -> Ok "video/webm"
+            | _ -> Error(sprintf "неподдерживаемый формат файла: %s (для video: mp4/mov/mkv/webm)" ext)
+        | MediaKind.Sticker ->
+            match ext with
+            | ".webp" -> Ok "image/webp"
+            | ".tgs" -> Ok "application/x-tgsticker"
+            | ".webm" -> Ok "image/webm"
+            | _ -> Error(sprintf "неподдерживаемый формат файла: %s (для sticker: webp/tgs/webm)" ext)
+
+    /// Sends a media file (photo/video/sticker) to a Telegram chat. Relative
+    /// paths are resolved against the user's workspace; the file must exist
+    /// and its extension must map to a supported MIME type.
+    let sendMedia (kind: MediaKind) (userId: UserId) (args: JsonObject) : Task<Result<string, string>> =
+        task {
+            match Json.getInt64 "chat_id" args, Json.getString "path" args with
+            | Some chatId, Some path ->
+                let resolved =
+                    if Path.IsPathRooted path then
+                        path
+                    else
+                        Path.Combine(workspaces.PathFor userId, path)
+
+                if not (File.Exists resolved) then
+                    return Error(sprintf "файл не найден: %s" path)
+                else
+                    match mimeFor kind resolved with
+                    | Error e -> return Error e
+                    | Ok mime ->
+                        let! bytes = File.ReadAllBytesAsync resolved
+
+                        let target =
+                            { ChatId = ChatId chatId
+                              RandomId = Random.Shared.NextInt64()
+                              Caption = defaultArg (Json.getString "caption" args) ""
+                              Entities = []
+                              Media =
+                                { Kind = kind
+                                  MimeType = mime
+                                  DataBase64 = Convert.ToBase64String bytes } }
+
+                        let! result = transport.SendMedia target
+
+                        match result with
+                        | Ok _ -> return Ok "sent"
+                        | Error err -> return Error(sendErrorToMessage err)
+            | _ -> return Error "требуются chat_id и path"
         }
 
     let transcribe (args: JsonObject) : Task<Result<string, string>> =
@@ -376,6 +475,9 @@ type HostToolExecutor
         match toolName with
         | "tg_send_message" -> sendMessage args
         | "tg_edit_message" -> editMessage args
+        | "tg_send_photo" -> sendMedia MediaKind.Photo userId args
+        | "tg_send_video" -> sendMedia MediaKind.Video userId args
+        | "tg_send_sticker" -> sendMedia MediaKind.Sticker userId args
         | "stt_transcribe" -> transcribe args
         | "schedule_add" -> scheduleAdd userId chatId toolCallId args
         | "schedule_confirm" -> scheduleConfirm origin args

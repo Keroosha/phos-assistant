@@ -57,6 +57,11 @@ let private testUser: User =
       Username = Some "tester"
       Role = User }
 
+let private testMedia: MediaPayload =
+    { Kind = MediaKind.Photo
+      MimeType = "image/png"
+      DataBase64 = Convert.ToBase64String [| 1uy; 2uy; 3uy |] }
+
 let private mkUpdateWith
     (id: int64)
     (chat: Chat)
@@ -96,6 +101,7 @@ type FakeTransport
         ?messagePhotoResult: byte[] option
     ) =
     let sendCalls = ResizeArray<SendTarget>()
+    let mediaCalls = ResizeArray<MediaTarget>()
     let reactions = ResizeArray<int64 * string>()
     let mutable remoteId = 1L
     let mutable voiceBytes = Array.empty
@@ -112,6 +118,10 @@ type FakeTransport
     let mutable history = defaultArg historyResult []
 
     member _.SendCalls = List.ofSeq sendCalls
+
+    member _.MediaCalls = List.ofSeq mediaCalls
+
+    member _.MediaCount = mediaCalls.Count
 
     member _.Reactions = reactions
 
@@ -171,6 +181,25 @@ type FakeTransport
                     return Error(SlowModeWait 0)
                 else
                     sendCalls.Add target
+                    return Ok { RemoteMessageId = remoteId }
+            }
+
+        member _.SendMedia(target: MediaTarget) =
+            task {
+                if missingPeerCount > 0 then
+                    missingPeerCount <- missingPeerCount - 1
+                    return Error(MissingPeer(target.ChatId, missingPeerReason))
+                elif failCount > 0 then
+                    failCount <- failCount - 1
+                    return Error(Other "boom")
+                elif floodCount > 0 then
+                    floodCount <- floodCount - 1
+                    return Error(FloodWait floodSeconds)
+                elif slowmodeCount > 0 then
+                    slowmodeCount <- slowmodeCount - 1
+                    return Error(SlowModeWait 0)
+                else
+                    mediaCalls.Add target
                     return Ok { RemoteMessageId = remoteId }
             }
 
@@ -828,7 +857,7 @@ let ``outbox retry after failure keeps the same random id`` () =
 
             try
                 let _, outbox = mkRepos exec
-                let! _ = outbox.Insert 1L 0 testChat.Id 777L "hello" []
+                let! _ = outbox.Insert(1L, 0, testChat.Id, 777L, "hello", [])
 
                 let transport = FakeTransport()
                 transport.FailNext 1
@@ -859,7 +888,7 @@ let ``flood wait retries later with the same random id`` () =
 
             try
                 let _, outbox = mkRepos exec
-                let! _ = outbox.Insert 1L 0 testChat.Id 888L "hello" []
+                let! _ = outbox.Insert(1L, 0, testChat.Id, 888L, "hello", [])
 
                 let transport = FakeTransport()
                 transport.FloodNext 1
@@ -890,7 +919,7 @@ let ``stale sending outbox rows are reclaimed after a crash`` () =
 
             try
                 let _, outbox = mkRepos exec
-                let! id = outbox.Insert 1L 0 testChat.Id 777L "hello" []
+                let! id = outbox.Insert(1L, 0, testChat.Id, 777L, "hello", [])
                 do! outbox.BeginSend id
 
                 // A live sender keeps a fresh `sending` row out of the queue.
@@ -939,7 +968,7 @@ let ``missing peer defers without consuming attempts and resumes when due`` () =
 
             try
                 let _, outbox = mkRepos exec
-                let! _ = outbox.Insert 1L 0 testChat.Id 999L "hello" []
+                let! _ = outbox.Insert(1L, 0, testChat.Id, 999L, "hello", [])
 
                 let transport = FakeTransport()
                 transport.MissingPeerNext 1
@@ -959,8 +988,10 @@ let ``missing peer defers without consuming attempts and resumes when due`` () =
                     exec.WriteAsync(fun conn ->
                         use cmd = conn.CreateCommand()
                         cmd.CommandText <- "UPDATE message_outbox SET updated_at = $t WHERE random_id = $randomId"
+
                         cmd.Parameters.AddWithValue("$t", DateTimeOffset.UtcNow.ToUnixTimeSeconds() - 1L)
                         |> ignore
+
                         cmd.Parameters.AddWithValue("$randomId", 999L) |> ignore
                         cmd.ExecuteNonQuery())
 
@@ -987,8 +1018,8 @@ let ``deferred missing peer does not starve later outbox rows`` () =
 
             try
                 let _, outbox = mkRepos exec
-                let! _ = outbox.Insert 1L 0 testChat.Id 999L "blocked" []
-                let! _ = outbox.Insert 2L 0 testChat.Id 1000L "later" []
+                let! _ = outbox.Insert(1L, 0, testChat.Id, 999L, "blocked", [])
+                let! _ = outbox.Insert(2L, 0, testChat.Id, 1000L, "later", [])
 
                 let transport = FakeTransport()
                 transport.MissingPeerNext 1
@@ -1020,14 +1051,14 @@ let ``failed peer probes consume a bounded retry budget`` () =
 
             try
                 let _, outbox = mkRepos exec
-                let! _ = outbox.Insert 1L 0 testChat.Id 1001L "unresolvable" []
+                let! _ = outbox.Insert(1L, 0, testChat.Id, 1001L, "unresolvable", [])
 
                 let transport = FakeTransport()
                 transport.SetMissingPeerReason MissingPeerReason.HydrationFailed
                 transport.MissingPeerNext 99
                 let delivery = OutboxDelivery(outbox, transport, NullLogger.Instance, TimeSpan.Zero)
 
-                for _ in 1 .. 6 do
+                for _ in 1..6 do
                     let! _ = delivery.DeliverOnceAsync(CancellationToken.None)
                     ()
 
@@ -1053,7 +1084,7 @@ let ``missing peer does not mask a genuine other failure`` () =
 
             try
                 let _, outbox = mkRepos exec
-                let! _ = outbox.Insert 1L 0 testChat.Id 987L "hello" []
+                let! _ = outbox.Insert(1L, 0, testChat.Id, 987L, "hello", [])
 
                 let transport = FakeTransport()
                 transport.FailNext 1
@@ -1083,7 +1114,7 @@ let ``flood wait logs a warning event 2 with the wait seconds`` () =
 
             try
                 let _, outbox = mkRepos exec
-                let! _ = outbox.Insert 1L 0 testChat.Id 888L "hello" []
+                let! _ = outbox.Insert(1L, 0, testChat.Id, 888L, "hello", [])
                 let! entry = outbox.NextPending()
                 let e = entry.Value
 
@@ -1119,7 +1150,7 @@ let ``slowmode wait also retries later with the same random id`` () =
 
             try
                 let _, outbox = mkRepos exec
-                let! _ = outbox.Insert 1L 0 testChat.Id 889L "hello" []
+                let! _ = outbox.Insert(1L, 0, testChat.Id, 889L, "hello", [])
 
                 let transport = FakeTransport()
                 transport.SlowmodeNext 1
@@ -1133,6 +1164,152 @@ let ``slowmode wait also retries later with the same random id`` () =
                 let! sent = outbox.GetByRandomId 889L
                 sent |> Option.isSome |> should be True
                 sent.Value.Status |> should equal Out.Sent
+            finally
+                dispose exec
+        }
+    finally
+        deleteDir dir
+
+[<Fact>]
+let ``media row is delivered via SendMedia with caption and kind and marked sent`` () =
+    let dir = makeTempDir ()
+    let dbPath = Path.Combine(dir, "phos.db")
+
+    try
+        task {
+            let exec = createExecutor dbPath
+
+            try
+                let _, outbox = mkRepos exec
+                let! _ = outbox.Insert(1L, 0, testChat.Id, 999L, "caption", [], ?media = Some testMedia)
+
+                let transport = FakeTransport()
+                let delivery = OutboxDelivery(outbox, transport, NullLogger.Instance)
+                let! processed = delivery.DeliverOnceAsync(CancellationToken.None)
+
+                processed |> should be True
+                transport.MediaCalls |> should haveLength 1
+                transport.MediaCalls.[0].Caption |> should equal "caption"
+                transport.MediaCalls.[0].RandomId |> should equal 999L
+                transport.MediaCalls.[0].Media.Kind |> should equal MediaKind.Photo
+                transport.MediaCalls.[0].Media.MimeType |> should equal "image/png"
+                transport.SendCalls |> should be Empty
+
+                let! sent = outbox.GetByRandomId 999L
+                sent.Value.Status |> should equal Out.Sent
+            finally
+                dispose exec
+        }
+    finally
+        deleteDir dir
+
+[<Fact>]
+let ``media flood wait retries later with the same random id`` () =
+    let dir = makeTempDir ()
+    let dbPath = Path.Combine(dir, "phos.db")
+
+    try
+        task {
+            let exec = createExecutor dbPath
+
+            try
+                let _, outbox = mkRepos exec
+                let! _ = outbox.Insert(1L, 0, testChat.Id, 888L, "caption", [], ?media = Some testMedia)
+
+                let transport = FakeTransport()
+                transport.FloodNext 1
+                let delivery = OutboxDelivery(outbox, transport, NullLogger.Instance)
+                let! _ = delivery.DeliverOnceAsync(CancellationToken.None)
+                let! _ = delivery.DeliverOnceAsync(CancellationToken.None)
+
+                transport.MediaCalls |> should haveLength 1
+                transport.MediaCalls.[0].RandomId |> should equal 888L
+
+                let! sent = outbox.GetByRandomId 888L
+                sent |> Option.isSome |> should be True
+                sent.Value.Status |> should equal Out.Sent
+            finally
+                dispose exec
+        }
+    finally
+        deleteDir dir
+
+[<Fact>]
+let ``media row missing peer after hydration failure defers without marking sent`` () =
+    let dir = makeTempDir ()
+    let dbPath = Path.Combine(dir, "phos.db")
+
+    try
+        task {
+            let exec = createExecutor dbPath
+
+            try
+                let _, outbox = mkRepos exec
+                let! _ = outbox.Insert(1L, 0, testChat.Id, 999L, "caption", [], ?media = Some testMedia)
+
+                let transport = FakeTransport()
+                transport.SetMissingPeerReason MissingPeerReason.HydrationFailed
+                transport.MissingPeerNext 1
+
+                let delivery = OutboxDelivery(outbox, transport, NullLogger.Instance)
+                let! _ = delivery.DeliverOnceAsync(CancellationToken.None)
+
+                let! deferred = outbox.GetByRandomId 999L
+                deferred.Value.Status |> should not' (equal Out.Sent)
+                deferred.Value.Attempts |> should equal 1
+                transport.MediaCalls |> should be Empty
+
+                // The not-before timestamp keeps the row out of the queue.
+                let! notDue = delivery.DeliverOnceAsync(CancellationToken.None)
+                notDue |> should be False
+
+                // Once the row is due again and the peer is resolvable, the
+                // retry succeeds with the same random_id.
+                let! _ =
+                    exec.WriteAsync(fun conn ->
+                        use cmd = conn.CreateCommand()
+                        cmd.CommandText <- "UPDATE message_outbox SET updated_at = $t WHERE random_id = $randomId"
+
+                        cmd.Parameters.AddWithValue("$t", DateTimeOffset.UtcNow.ToUnixTimeSeconds() - 1L)
+                        |> ignore
+
+                        cmd.Parameters.AddWithValue("$randomId", 999L) |> ignore
+                        cmd.ExecuteNonQuery())
+
+                let! _ = delivery.DeliverOnceAsync(CancellationToken.None)
+                transport.MediaCalls |> should haveLength 1
+                transport.MediaCalls.[0].RandomId |> should equal 999L
+
+                let! sent = outbox.GetByRandomId 999L
+                sent.Value.Status |> should equal Out.Sent
+            finally
+                dispose exec
+        }
+    finally
+        deleteDir dir
+
+[<Fact>]
+let ``media row other error is marked failed`` () =
+    let dir = makeTempDir ()
+    let dbPath = Path.Combine(dir, "phos.db")
+
+    try
+        task {
+            let exec = createExecutor dbPath
+
+            try
+                let _, outbox = mkRepos exec
+                let! _ = outbox.Insert(1L, 0, testChat.Id, 987L, "caption", [], ?media = Some testMedia)
+
+                let transport = FakeTransport()
+                transport.FailNext 1
+                let delivery = OutboxDelivery(outbox, transport, NullLogger.Instance)
+                let! _ = delivery.DeliverOnceAsync(CancellationToken.None)
+
+                let! entry = outbox.GetByRandomId 987L
+                entry.Value.Status |> should equal Out.Failed
+                entry.Value.Attempts |> should equal 1
+                transport.MediaCalls |> should be Empty
             finally
                 dispose exec
         }
@@ -1171,7 +1348,7 @@ let ``run async delivers a pending entry until cancelled`` () =
 
             try
                 let _, outbox = mkRepos exec
-                let! _ = outbox.Insert 1L 0 testChat.Id 999L "hello" []
+                let! _ = outbox.Insert(1L, 0, testChat.Id, 999L, "hello", [])
 
                 let transport = FakeTransport()
                 let delivery = OutboxDelivery(outbox, transport, NullLogger.Instance)
@@ -1674,6 +1851,159 @@ let ``buildSendRequest sets peer, message, random id and entities`` () =
     (req2.flags &&& hasEntities = hasEntities) |> should be False
 
 [<Fact>]
+let ``mediaFileName derives the upload filename from kind and mime type`` () =
+    let name (kind: MediaKind) (mime: string) =
+        Transport.mediaFileName
+            { Kind = kind
+              MimeType = mime
+              DataBase64 = "" }
+
+    name MediaKind.Photo "image/png" |> should equal "photo.png"
+    name MediaKind.Photo "image/jpeg" |> should equal "photo.jpg"
+    name MediaKind.Photo "image/bmp" |> should equal "photo.bmp"
+    name MediaKind.Video "video/mp4" |> should equal "video.mp4"
+    name MediaKind.Video "video/quicktime" |> should equal "video.mov"
+    name MediaKind.Video "video/x-matroska" |> should equal "video.mkv"
+    name MediaKind.Video "video/webm" |> should equal "video.webm"
+    name MediaKind.Sticker "image/webp" |> should equal "sticker.webp"
+    name MediaKind.Sticker "application/x-tgsticker" |> should equal "sticker.tgs"
+    name MediaKind.Photo "application/octet-stream" |> should equal "photo.bin"
+
+[<Fact>]
+let ``toInputMedia builds photo, video and sticker input media`` () =
+    let uploaded = TL.InputFile() :> TL.InputFileBase
+
+    let photoMedia =
+        { Kind = MediaKind.Photo
+          MimeType = "image/png"
+          DataBase64 = "" }
+
+    match Transport.toInputMedia photoMedia uploaded with
+    | :? TL.InputMediaUploadedPhoto as photo -> photo.file |> should not' (be null)
+    | _ -> failwith "expected an InputMediaUploadedPhoto"
+
+    let videoMedia =
+        { Kind = MediaKind.Video
+          MimeType = "video/mp4"
+          DataBase64 = "" }
+
+    match Transport.toInputMedia videoMedia uploaded with
+    | :? TL.InputMediaUploadedDocument as doc ->
+        doc.mime_type |> should equal "video/mp4"
+        doc.file |> should not' (be null)
+        doc.attributes |> should haveLength 1
+
+        match doc.attributes.[0] with
+        | :? TL.DocumentAttributeVideo as attr ->
+            let supportsStreaming = TL.DocumentAttributeVideo.Flags.supports_streaming
+            (attr.flags &&& supportsStreaming = supportsStreaming) |> should be True
+        | _ -> failwith "expected a DocumentAttributeVideo"
+    | _ -> failwith "expected an InputMediaUploadedDocument for video"
+
+    let tgsSticker =
+        { Kind = MediaKind.Sticker
+          MimeType = "application/x-tgsticker"
+          DataBase64 = "" }
+
+    match Transport.toInputMedia tgsSticker uploaded with
+    | :? TL.InputMediaUploadedDocument as doc ->
+        doc.attributes |> should haveLength 2
+        (doc.attributes.[0] :? TL.DocumentAttributeAnimated) |> should be True
+        (doc.attributes.[1] :? TL.DocumentAttributeSticker) |> should be True
+    | _ -> failwith "expected an InputMediaUploadedDocument for tgs sticker"
+
+    let webmSticker =
+        { Kind = MediaKind.Sticker
+          MimeType = "image/webm"
+          DataBase64 = "" }
+
+    match Transport.toInputMedia webmSticker uploaded with
+    | :? TL.InputMediaUploadedDocument as doc ->
+        doc.attributes |> should haveLength 2
+
+        match doc.attributes.[0] with
+        | :? TL.DocumentAttributeVideo as attr ->
+            let roundMessage = TL.DocumentAttributeVideo.Flags.round_message
+            (attr.flags &&& roundMessage = roundMessage) |> should be True
+        | _ -> failwith "expected a round DocumentAttributeVideo"
+
+        (doc.attributes.[1] :? TL.DocumentAttributeSticker) |> should be True
+    | _ -> failwith "expected an InputMediaUploadedDocument for webm sticker"
+
+    let webpSticker =
+        { Kind = MediaKind.Sticker
+          MimeType = "image/webp"
+          DataBase64 = "" }
+
+    match Transport.toInputMedia webpSticker uploaded with
+    | :? TL.InputMediaUploadedDocument as doc ->
+        doc.attributes |> should haveLength 1
+        (doc.attributes.[0] :? TL.DocumentAttributeSticker) |> should be True
+    | _ -> failwith "expected an InputMediaUploadedDocument for webp sticker"
+
+[<Fact>]
+let ``buildSendMediaRequest sets peer, media, message, random id and entities`` () =
+    let peer = TL.InputPeerUser(1L, 2L) :> TL.InputPeer
+
+    let target =
+        { ChatId = ChatId 1L
+          RandomId = 42L
+          Caption = "hi"
+          Entities =
+            [ { Offset = 0
+                Length = 2
+                Kind = Bold
+                Url = None } ]
+          Media = testMedia }
+
+    let media = TL.InputMediaUploadedPhoto() :> TL.InputMedia
+    let req = Transport.buildSendMediaRequest peer target media
+    req.peer |> should not' (be null)
+    req.media |> should not' (be null)
+    req.message |> should equal "hi"
+    req.random_id |> should equal 42L
+    req.entities |> should haveLength 1
+    req.entities.[0].offset |> should equal 0
+
+    // `entities` is gated by `flags.has_entities` (bit 3); with flags left at
+    // zero the field is never serialized and Telegram renders plaintext.
+    let hasEntities = TL.Methods.Messages_SendMedia.Flags.has_entities
+    (req.flags &&& hasEntities = hasEntities) |> should be True
+
+    let noEntities =
+        { ChatId = ChatId 1L
+          RandomId = 43L
+          Caption = "hi"
+          Entities = []
+          Media = testMedia }
+
+    let req2 = Transport.buildSendMediaRequest peer noEntities media
+    req2.message |> should equal "hi"
+    req2.random_id |> should equal 43L
+    (req2.flags &&& hasEntities = hasEntities) |> should be False
+
+[<Fact>]
+let ``extractMediaMessageId finds UpdateMessageID by random id and falls back to short sent`` () =
+    let updates = TL.Updates()
+
+    let um = TL.UpdateMessageID()
+    um.random_id <- 42L
+    um.id <- 77
+    updates.updates <- [| um :> TL.Update |]
+
+    Transport.extractMediaMessageId updates 42L |> should equal 77L
+
+    // A non-matching random_id is not used.
+    Transport.extractMediaMessageId updates 99L |> should equal 0L
+
+    let sent = TL.UpdateShortSentMessage()
+    sent.id <- 55
+    Transport.extractMediaMessageId sent 123L |> should equal 55L
+
+    let other = TL.Updates()
+    Transport.extractMediaMessageId other 5L |> should equal 0L
+
+[<Fact>]
 let ``buildEditRequest sets peer, id, message and entities`` () =
     let peer = TL.InputPeerUser(1L, 2L) :> TL.InputPeer
 
@@ -1809,8 +2139,7 @@ let ``collectChannels collects channels and skips basic groups`` () =
     let group = TL.Chat()
     group.id <- 7L
 
-    let chats =
-        System.Collections.Generic.Dictionary<int64, TL.ChatBase>()
+    let chats = System.Collections.Generic.Dictionary<int64, TL.ChatBase>()
 
     chats.[1001234567890L] <- ch
     chats.[7L] <- group
@@ -1837,8 +2166,7 @@ let ``collectBasicChats collects inputPeerChat for every returned group`` () =
     let forbidden = TL.ChatForbidden()
     forbidden.id <- 8L
 
-    let chats =
-        System.Collections.Generic.Dictionary<int64, TL.ChatBase>()
+    let chats = System.Collections.Generic.Dictionary<int64, TL.ChatBase>()
 
     chats.[7L] <- group
     chats.[8L] <- forbidden

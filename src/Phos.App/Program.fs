@@ -141,6 +141,7 @@ let main (argv: string[]) : int =
                 HostToolExecutor(
                     sp.GetRequiredService<ITelegramTransport>(),
                     sp.GetRequiredService<IVoiceProcessor>(),
+                    sp.GetRequiredService<WorkspaceManager>(),
                     sp.GetRequiredService<IScheduleJobRepository>(),
                     Config.toScheduleQuota cfg,
                     sp.GetRequiredService<ILogger<HostToolExecutor>>()
@@ -180,13 +181,17 @@ let main (argv: string[]) : int =
                 let enqueueOutbox (env: OutboxEnvelope) : Task<unit> =
                     task {
                         let! _ =
-                            sp.GetRequiredService<IMessageOutbox>().Insert
-                                env.CommandId
-                                env.ChunkIndex
-                                env.ChatId
-                                env.RandomId
-                                env.Payload
-                                env.Entities
+                            sp
+                                .GetRequiredService<IMessageOutbox>()
+                                .Insert(
+                                    env.CommandId,
+                                    env.ChunkIndex,
+                                    env.ChatId,
+                                    env.RandomId,
+                                    env.Payload,
+                                    env.Entities,
+                                    ?media = env.Media
+                                )
 
                         return ()
                     }
@@ -267,13 +272,17 @@ let main (argv: string[]) : int =
                 let enqueueOutbox (env: OutboxEnvelope) : Task<unit> =
                     task {
                         let! _ =
-                            sp.GetRequiredService<IMessageOutbox>().Insert
-                                env.CommandId
-                                env.ChunkIndex
-                                env.ChatId
-                                env.RandomId
-                                env.Payload
-                                env.Entities
+                            sp
+                                .GetRequiredService<IMessageOutbox>()
+                                .Insert(
+                                    env.CommandId,
+                                    env.ChunkIndex,
+                                    env.ChatId,
+                                    env.RandomId,
+                                    env.Payload,
+                                    env.Entities,
+                                    ?media = env.Media
+                                )
 
                         return ()
                     }

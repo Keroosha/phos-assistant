@@ -372,7 +372,7 @@ let ``mixed concurrent operations are serialized correctly`` () =
                           task {
                               let! _ = inbox.Insert(mkEnvelope (sprintf "mix-%d" i))
                               do! exec.CheckpointNow()
-                              let! _ = outbox.Insert (int64 i) 0 (ChatId 1L) (int64 i) "m" []
+                              let! _ = outbox.Insert((int64 i), 0, ChatId 1L, int64 i, "m", [])
                               ()
                           } ]
 
@@ -741,7 +741,7 @@ let ``outbox retry keeps random id and sent stores remote id`` () =
         withExecutor dbPath (fun exec ->
             task {
                 let outbox = Repositories.messageOutbox exec
-                let! id = outbox.Insert 1L 0 (ChatId 1L) 42L "hello" []
+                let! id = outbox.Insert(1L, 0, ChatId 1L, 42L, "hello", [])
                 let! next = outbox.NextPending()
                 next |> should not' (be None)
                 let eid = next.Value.Id
@@ -777,8 +777,8 @@ let ``outbox duplicate random id collapses to one row`` () =
         withExecutor dbPath (fun exec ->
             task {
                 let outbox = Repositories.messageOutbox exec
-                let! id1 = outbox.Insert 1L 0 (ChatId 1L) 42L "hello" []
-                let! id2 = outbox.Insert 1L 1 (ChatId 1L) 42L "hello" []
+                let! id1 = outbox.Insert(1L, 0, ChatId 1L, 42L, "hello", [])
+                let! id2 = outbox.Insert(1L, 1, ChatId 1L, 42L, "hello", [])
                 id2 |> should equal id1
                 let! count = outbox.CountPending()
                 count |> should equal 1
@@ -806,7 +806,7 @@ let ``outbox entities roundtrip through insert and read`` () =
                         Kind = Phos.Core.Chunker.Italic
                         Url = None } ]
 
-                let! id = outbox.Insert 1L 0 (ChatId 1L) 42L "**bold** *italic*" entities
+                let! id = outbox.Insert(1L, 0, ChatId 1L, 42L, "**bold** *italic*", entities)
 
                 id |> should not' (equal 0L)
 
@@ -841,7 +841,7 @@ let ``outbox roundtrips TextUrl entities with their url`` () =
                         Kind = Phos.Core.Chunker.Bold
                         Url = None } ]
 
-                let! id = outbox.Insert 1L 0 (ChatId 1L) 77L "[text](https://example.com) **x**" entities
+                let! id = outbox.Insert(1L, 0, ChatId 1L, 77L, "[text](https://example.com) **x**", entities)
 
                 id |> should not' (equal 0L)
 
@@ -852,6 +852,116 @@ let ``outbox roundtrips TextUrl entities with their url`` () =
                 let! next = outbox.NextPending()
                 next |> should not' (be None)
                 next.Value.Entities |> should equal entities
+            })
+    finally
+        deleteDir dir
+
+[<Fact>]
+let ``outbox media roundtrips photo video and sticker`` () =
+    let dir = makeTempDir ()
+    let dbPath = Path.Combine(dir, "phos.db")
+
+    try
+        withExecutor dbPath (fun exec ->
+            task {
+                let outbox = Repositories.messageOutbox exec
+
+                let cases =
+                    [ { Kind = MediaKind.Photo
+                        MimeType = "image/png"
+                        DataBase64 = "cGhvdG8=" }
+                      { Kind = MediaKind.Video
+                        MimeType = "video/mp4"
+                        DataBase64 = "dmlkZW8=" }
+                      { Kind = MediaKind.Sticker
+                        MimeType = "application/x-tgsticker"
+                        DataBase64 = "c3RpY2tlcg==" } ]
+
+                for i, media in List.indexed cases do
+                    let! id =
+                        outbox.Insert(int64 (i + 1), 0, ChatId 1L, int64 (i + 1), "caption", [], ?media = Some media)
+
+                    id |> should not' (equal 0L)
+
+                    let! next = outbox.NextPending()
+                    next |> should not' (be None)
+                    next.Value.Media |> should equal (Some media)
+
+                    do! outbox.BeginSend next.Value.Id
+            })
+    finally
+        deleteDir dir
+
+[<Fact>]
+let ``outbox text-only insert roundtrips with no media`` () =
+    let dir = makeTempDir ()
+    let dbPath = Path.Combine(dir, "phos.db")
+
+    try
+        withExecutor dbPath (fun exec ->
+            task {
+                let outbox = Repositories.messageOutbox exec
+                let! id = outbox.Insert(1L, 0, ChatId 1L, 55L, "plain text", [])
+                id |> should not' (equal 0L)
+                let! next = outbox.NextPending()
+                next |> should not' (be None)
+                next.Value.Media |> should equal None
+                next.Value.Payload |> should equal "plain text"
+            })
+    finally
+        deleteDir dir
+
+[<Fact>]
+let ``outbox duplicate random id keeps original media`` () =
+    let dir = makeTempDir ()
+    let dbPath = Path.Combine(dir, "phos.db")
+
+    try
+        withExecutor dbPath (fun exec ->
+            task {
+                let outbox = Repositories.messageOutbox exec
+
+                let media =
+                    { Kind = MediaKind.Photo
+                      MimeType = "image/png"
+                      DataBase64 = "cGhvdG8=" }
+
+                let! id1 = outbox.Insert(1L, 0, ChatId 1L, 42L, "hello", [], ?media = Some media)
+                let! id2 = outbox.Insert(1L, 1, ChatId 1L, 42L, "hello", [])
+                id2 |> should equal id1
+                let! count = outbox.CountPending()
+                count |> should equal 1
+                let! byRandom = outbox.GetByRandomId 42L
+                byRandom.Value.Media |> should equal (Some media)
+            })
+    finally
+        deleteDir dir
+
+[<Fact>]
+let ``outbox corrupt media row degrades to text`` () =
+    let dir = makeTempDir ()
+    let dbPath = Path.Combine(dir, "phos.db")
+
+    try
+        withExecutor dbPath (fun exec ->
+            task {
+                // Media kind present but data missing: readEntry must degrade to
+                // a text-only entry instead of blocking delivery.
+                do!
+                    exec.WriteAsync(fun conn ->
+                        use cmd = conn.CreateCommand()
+
+                        cmd.CommandText <-
+                            "INSERT INTO message_outbox(command_id, chunk_index, chat_id, random_id, payload, media_kind, media_mime, media_data, status, created_at, updated_at) VALUES (1, 0, 1, 99, 'text', 'photo', 'image/png', NULL, 'pending', 0, 0);"
+
+                        cmd.ExecuteNonQuery() |> ignore
+                        ())
+
+                let outbox = Repositories.messageOutbox exec
+                let! byRandom = outbox.GetByRandomId 99L
+                byRandom |> should not' (be None)
+                byRandom.Value.Media |> should equal None
+                byRandom.Value.Payload |> should equal "text"
             })
     finally
         deleteDir dir

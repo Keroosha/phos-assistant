@@ -126,9 +126,12 @@ type FakeTransport(?voiceBytes: byte[], ?photoBytes: byte[]) =
     let mutable sendCount = 0
     let mutable editCount = 0
     let mutable sentText = ""
+    let mediaCalls = ResizeArray<MediaTarget>()
     member _.SendCount = sendCount
     member _.EditCount = editCount
     member _.SentText = sentText
+    member _.MediaCalls = List.ofSeq mediaCalls
+    member _.MediaCount = mediaCalls.Count
 
     interface ITelegramTransport with
         member _.Login() =
@@ -138,6 +141,12 @@ type FakeTransport(?voiceBytes: byte[], ?photoBytes: byte[]) =
             task {
                 sendCount <- sendCount + 1
                 sentText <- t.Text
+                return Ok { RemoteMessageId = 1L }
+            }
+
+        member _.SendMedia(target: MediaTarget) =
+            task {
+                mediaCalls.Add target
                 return Ok { RemoteMessageId = 1L }
             }
 
@@ -173,13 +182,15 @@ type FakeOutbox() =
 
     interface IMessageOutbox with
         member _.Insert
-            (commandId: int64)
-            (chunkIndex: int)
-            (chatId: ChatId)
-            (randomId: int64)
-            (payload: string)
-            (entities: Entity list)
-            =
+            (
+                commandId: int64,
+                chunkIndex: int,
+                chatId: ChatId,
+                randomId: int64,
+                payload: string,
+                entities: Entity list,
+                ?media: MediaPayload
+            ) =
             task {
                 let e =
                     { Id = int64 entries.Count
@@ -189,6 +200,7 @@ type FakeOutbox() =
                       RandomId = randomId
                       Payload = payload
                       Entities = entities
+                      Media = media
                       Status = Phos.Core.OutboxStateMachine.Status.Pending
                       Attempts = 0
                       MaxAttempts = 5
@@ -480,6 +492,7 @@ let private makeSessionManager
         HostToolExecutor(
             ctx.Transport,
             ctx.Voice,
+            ctx.Workspaces,
             FakeScheduleRepo(),
             { MaxJobsPerUser = 20
               MinIntervalSeconds = 60
@@ -1012,10 +1025,13 @@ let ``scheduler prompt-driven loop end to end`` () =
                   MinIntervalSeconds = 60
                   MaxPromptLength = 2000 }
 
+            let workspaces = WorkspaceManager(Path.Combine(dir, "workspaces"))
+
             let hostTools =
                 HostToolExecutor(
                     FakeTransport(),
                     FakeVoiceProcessor(Ok "hi"),
+                    workspaces,
                     jobs,
                     quota,
                     NullLogger<HostToolExecutor>.Instance
@@ -1142,6 +1158,7 @@ let ``scheduler prompt-driven loop end to end`` () =
                 HostToolExecutor(
                     FakeTransport(),
                     FakeVoiceProcessor(Ok "hi"),
+                    workspaces,
                     jobs2,
                     quota,
                     NullLogger<HostToolExecutor>.Instance
@@ -1199,10 +1216,13 @@ let ``scheduler one-shot fires once end to end`` () =
                   MinIntervalSeconds = 60
                   MaxPromptLength = 2000 }
 
+            let workspaces = WorkspaceManager(Path.Combine(dir, "workspaces"))
+
             let hostTools =
                 HostToolExecutor(
                     FakeTransport(),
                     FakeVoiceProcessor(Ok "hi"),
+                    workspaces,
                     jobs,
                     quota,
                     NullLogger<HostToolExecutor>.Instance

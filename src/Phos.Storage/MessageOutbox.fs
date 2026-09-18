@@ -18,6 +18,7 @@ type OutboxEntry =
       RandomId: int64
       Payload: string
       Entities: Entity list
+      Media: MediaPayload option
       Status: OutboxStateMachine.Status
       Attempts: int
       MaxAttempts: int
@@ -28,12 +29,13 @@ type OutboxEntry =
 /// Repository for the `message_outbox` table.
 type IMessageOutbox =
     abstract Insert:
-        commandId: int64 ->
-        chunkIndex: int ->
-        chatId: ChatId ->
-        randomId: int64 ->
-        payload: string ->
-        entities: Entity list ->
+        commandId: int64 *
+        chunkIndex: int *
+        chatId: ChatId *
+        randomId: int64 *
+        payload: string *
+        entities: Entity list *
+        ?media: MediaPayload ->
             Task<int64>
 
     abstract NextPending: unit -> Task<OutboxEntry option>
@@ -113,8 +115,28 @@ type MessageOutbox(exec: StorageExecutor) =
             with _ ->
                 []
 
+    /// Decodes the outbox media kind column back into a MediaKind. Unknown
+    /// values degrade to `None` so a corrupt row never blocks delivery.
+    let decodeMediaKind (s: string) : MediaKind option =
+        match s.ToLowerInvariant() with
+        | "photo" -> Some MediaKind.Photo
+        | "video" -> Some MediaKind.Video
+        | "sticker" -> Some MediaKind.Sticker
+        | _ -> None
+
+    /// Adds a nullable string parameter; `DBNull` when absent so text-only rows
+    /// keep the media columns NULL.
+    let addOpt (cmd: SqliteCommand) (name: string) (v: string option) =
+        cmd.Parameters.AddWithValue(
+            name,
+            match v with
+            | Some s -> box s
+            | None -> box DBNull.Value
+        )
+        |> ignore
+
     let selectColumns =
-        "id, command_id, chunk_index, chat_id, random_id, payload, entities, status, attempts, max_attempts, remote_message_id, created_at, updated_at"
+        "id, command_id, chunk_index, chat_id, random_id, payload, entities, media_kind, media_mime, media_data, status, attempts, max_attempts, remote_message_id, created_at, updated_at"
 
     let readEntry (reader: SqliteDataReader) : OutboxEntry =
         let id = reader.GetInt64 0
@@ -126,18 +148,33 @@ type MessageOutbox(exec: StorageExecutor) =
 
         let entities = decodeEntities (if reader.IsDBNull 6 then "" else reader.GetString 6)
 
-        let status = statusOfString (reader.GetString 7)
-        let attempts = reader.GetInt32 8
-        let maxAttempts = reader.GetInt32 9
-
-        let remoteMessageId =
-            if reader.IsDBNull 10 then
+        let media =
+            if reader.IsDBNull 7 then
                 None
             else
-                Some(reader.GetInt64 10)
+                match decodeMediaKind (reader.GetString 7) with
+                | None -> None
+                | Some kind ->
+                    if reader.IsDBNull 8 || reader.IsDBNull 9 then
+                        None
+                    else
+                        Some
+                            { Kind = kind
+                              MimeType = reader.GetString 8
+                              DataBase64 = reader.GetString 9 }
 
-        let createdAt = fromUnix (reader.GetInt64 11)
-        let updatedAt = fromUnix (reader.GetInt64 12)
+        let status = statusOfString (reader.GetString 10)
+        let attempts = reader.GetInt32 11
+        let maxAttempts = reader.GetInt32 12
+
+        let remoteMessageId =
+            if reader.IsDBNull 13 then
+                None
+            else
+                Some(reader.GetInt64 13)
+
+        let createdAt = fromUnix (reader.GetInt64 14)
+        let updatedAt = fromUnix (reader.GetInt64 15)
 
         { Id = id
           CommandId = commandId
@@ -146,6 +183,7 @@ type MessageOutbox(exec: StorageExecutor) =
           RandomId = randomId
           Payload = payload
           Entities = entities
+          Media = media
           Status = status
           Attempts = attempts
           MaxAttempts = maxAttempts
@@ -155,20 +193,22 @@ type MessageOutbox(exec: StorageExecutor) =
 
     interface IMessageOutbox with
         member _.Insert
-            (commandId: int64)
-            (chunkIndex: int)
-            (chat: ChatId)
-            (randomId: int64)
-            (payload: string)
-            (entities: Entity list)
-            =
+            (
+                commandId: int64,
+                chunkIndex: int,
+                chat: ChatId,
+                randomId: int64,
+                payload: string,
+                entities: Entity list,
+                ?media: MediaPayload
+            ) =
             exec.WriteAsync(fun conn ->
                 use cmd = conn.CreateCommand()
 
                 cmd.CommandText <-
                     """
-                    INSERT INTO message_outbox(command_id, chunk_index, chat_id, random_id, payload, entities, status, created_at, updated_at)
-                    VALUES ($commandId, $chunkIndex, $chatId, $randomId, $payload, $entities, 'pending', $now, $now)
+                    INSERT INTO message_outbox(command_id, chunk_index, chat_id, random_id, payload, entities, media_kind, media_mime, media_data, status, created_at, updated_at)
+                    VALUES ($commandId, $chunkIndex, $chatId, $randomId, $payload, $entities, $mediaKind, $mediaMime, $mediaData, 'pending', $now, $now)
                     ON CONFLICT DO NOTHING
                     RETURNING id;
                 """
@@ -179,6 +219,15 @@ type MessageOutbox(exec: StorageExecutor) =
                 cmd.Parameters.AddWithValue("$randomId", randomId) |> ignore
                 cmd.Parameters.AddWithValue("$payload", payload) |> ignore
                 cmd.Parameters.AddWithValue("$entities", encodeEntities entities) |> ignore
+
+                let mediaKind, mediaMime, mediaData =
+                    match media with
+                    | Some m -> Some(m.Kind.ToString().ToLowerInvariant()), Some m.MimeType, Some m.DataBase64
+                    | None -> None, None, None
+
+                addOpt cmd "$mediaKind" mediaKind
+                addOpt cmd "$mediaMime" mediaMime
+                addOpt cmd "$mediaData" mediaData
 
                 cmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToUnixTimeSeconds())
                 |> ignore
@@ -220,12 +269,11 @@ type MessageOutbox(exec: StorageExecutor) =
                     LIMIT 1;
                 """
                         selectColumns
+
                 cmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToUnixTimeSeconds())
                 |> ignore
-                cmd.Parameters.AddWithValue(
-                    "$sendingStaleBefore",
-                    DateTimeOffset.UtcNow.ToUnixTimeSeconds() - 10L
-                )
+
+                cmd.Parameters.AddWithValue("$sendingStaleBefore", DateTimeOffset.UtcNow.ToUnixTimeSeconds() - 10L)
                 |> ignore
 
                 use reader = cmd.ExecuteReader()
@@ -249,10 +297,8 @@ type MessageOutbox(exec: StorageExecutor) =
 
                 cmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToUnixTimeSeconds())
                 |> ignore
-                cmd.Parameters.AddWithValue(
-                    "$sendingStaleBefore",
-                    DateTimeOffset.UtcNow.ToUnixTimeSeconds() - 10L
-                )
+
+                cmd.Parameters.AddWithValue("$sendingStaleBefore", DateTimeOffset.UtcNow.ToUnixTimeSeconds() - 10L)
                 |> ignore
 
                 cmd.ExecuteNonQuery() |> ignore
@@ -303,7 +349,8 @@ type MessageOutbox(exec: StorageExecutor) =
 
                 cmd.ExecuteNonQuery() |> ignore
                 ())
-        member _.Defer(id: int64) (availableAt: DateTimeOffset) =
+
+        member _.Defer (id: int64) (availableAt: DateTimeOffset) =
             exec.WriteAsync(fun conn ->
                 use cmd = conn.CreateCommand()
 
@@ -311,8 +358,7 @@ type MessageOutbox(exec: StorageExecutor) =
                     "UPDATE message_outbox SET status = 'pending', updated_at = $availableAt WHERE id = $id AND (status = 'sending' OR (status = 'failed' AND attempts < max_attempts));"
 
                 cmd.Parameters.AddWithValue("$id", id) |> ignore
-                cmd.Parameters.AddWithValue("$availableAt", toUnix availableAt)
-                |> ignore
+                cmd.Parameters.AddWithValue("$availableAt", toUnix availableAt) |> ignore
 
                 cmd.ExecuteNonQuery() |> ignore
                 ())

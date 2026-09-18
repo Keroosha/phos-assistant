@@ -32,3 +32,16 @@ type User =
     { Id: UserId
       Username: string option
       Role: UserRole }
+
+/// Kind of media an agent can send to a Telegram chat.
+type MediaKind =
+    | Photo
+    | Video
+    | Sticker
+
+/// Media bytes (base64-encoded) queued for outbox delivery, together with its
+/// Telegram kind and MIME type.
+type MediaPayload =
+    { Kind: MediaKind
+      MimeType: string
+      DataBase64: string }
