@@ -1138,8 +1138,7 @@ let ``duePolicy wraps catchup with max one catchup`` () =
 [<Fact>]
 let ``parseRunAt resolves local wall clock in timezone`` () =
     match Sj.parseRunAt "Europe/Berlin" "2026-10-02T09:00" with
-    | Ok occurrence ->
-        occurrence |> should equal (DateTimeOffset(2026, 10, 2, 7, 0, 0, TimeSpan.Zero))
+    | Ok occurrence -> occurrence |> should equal (DateTimeOffset(2026, 10, 2, 7, 0, 0, TimeSpan.Zero))
     | Error e -> failwithf "expected a valid run_at, got %s" e
 
 [<Fact>]
@@ -1158,21 +1157,22 @@ let ``parseRunAt rejects invalid DST local time`` () =
 let ``parseRunAt chooses standard offset on ambiguous local time`` () =
     match Sj.parseRunAt "Europe/Berlin" "2026-10-25T02:30" with
     | Ok occurrence ->
-        occurrence |> should equal (DateTimeOffset(2026, 10, 25, 1, 30, 0, TimeSpan.Zero))
+        occurrence
+        |> should equal (DateTimeOffset(2026, 10, 25, 1, 30, 0, TimeSpan.Zero))
     | Error e -> failwithf "expected a valid ambiguous run_at, got %s" e
 
 [<Fact>]
 let ``parseRunAt normalizes explicit offset to UTC`` () =
     match Sj.parseRunAt "Europe/Berlin" "2026-10-02T09:00+03:00" with
-    | Ok occurrence ->
-        occurrence |> should equal (DateTimeOffset(2026, 10, 2, 6, 0, 0, TimeSpan.Zero))
+    | Ok occurrence -> occurrence |> should equal (DateTimeOffset(2026, 10, 2, 6, 0, 0, TimeSpan.Zero))
     | Error e -> failwithf "expected an explicit offset to parse, got %s" e
 
 [<Fact>]
 let ``parseRunAt accepts explicit offset during timezone DST gap`` () =
     match Sj.parseRunAt "Europe/Berlin" "2026-03-29T02:30+01:00" with
     | Ok occurrence ->
-        occurrence |> should equal (DateTimeOffset(2026, 3, 29, 1, 30, 0, TimeSpan.Zero))
+        occurrence
+        |> should equal (DateTimeOffset(2026, 3, 29, 1, 30, 0, TimeSpan.Zero))
     | Error e -> failwithf "explicit offset should represent an instant: %s" e
 
 [<Fact>]
@@ -1186,8 +1186,8 @@ let ``validateAt rejects past calendar occurrence and mixed modes`` () =
     |> Result.isError
     |> should be True
 
-    let mixed = { validCronDraft with RunAt = Some(DateTimeOffset.UtcNow.AddHours 1.0) }
+    let mixed =
+        { validCronDraft with
+            RunAt = Some(DateTimeOffset.UtcNow.AddHours 1.0) }
 
-    Sj.validate testQuota mixed
-    |> Result.isError
-    |> should be True
+    Sj.validate testQuota mixed |> Result.isError |> should be True

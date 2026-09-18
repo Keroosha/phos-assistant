@@ -43,15 +43,13 @@ type WorkspaceManager(root: string, ?personaFile: string) =
                     content
                 else
                     let before = content.Substring(0, start).TrimEnd([| '\r'; '\n' |])
+
                     let after =
                         content.Substring(endIndex + schedulingBlockEnd.Length).TrimStart([| '\r'; '\n' |])
 
-                    if String.IsNullOrEmpty before then
-                        after
-                    elif String.IsNullOrEmpty after then
-                        before
-                    else
-                        before + "\n\n" + after
+                    if String.IsNullOrEmpty before then after
+                    elif String.IsNullOrEmpty after then before
+                    else before + "\n\n" + after
 
         let baseContent = withoutExisting.TrimEnd([| '\r'; '\n' |])
 

@@ -18,36 +18,40 @@ type ScheduleStatus =
 
 /// A persisted schedule job (the Core-side model; storage lives in Phos.Storage).
 type ScheduleJob =
-    { Id: int64
-      UserId: UserId
-      ChatId: ChatId
-      Prompt: string
-      CronExpr: string option
-      IntervalSeconds: int option
-      AfterSeconds: int option
-      /// Absolute one-time occurrence, normalized to UTC.
-      RunAt: DateTimeOffset option
-      Timezone: string
-      Catchup: CatchupPolicy
-      Status: ScheduleStatus
-      NextRun: DateTimeOffset option
-      LastRunAt: DateTimeOffset option
-      LastError: string option
-      CreatedAt: DateTimeOffset
-      UpdatedAt: DateTimeOffset }
+    {
+        Id: int64
+        UserId: UserId
+        ChatId: ChatId
+        Prompt: string
+        CronExpr: string option
+        IntervalSeconds: int option
+        AfterSeconds: int option
+        /// Absolute one-time occurrence, normalized to UTC.
+        RunAt: DateTimeOffset option
+        Timezone: string
+        Catchup: CatchupPolicy
+        Status: ScheduleStatus
+        NextRun: DateTimeOffset option
+        LastRunAt: DateTimeOffset option
+        LastError: string option
+        CreatedAt: DateTimeOffset
+        UpdatedAt: DateTimeOffset
+    }
 
 /// Input for creating a schedule job (before an id/status/timestamps exist).
 type ScheduleJobDraft =
-    { UserId: UserId
-      ChatId: ChatId
-      Prompt: string
-      CronExpr: string option
-      IntervalSeconds: int option
-      AfterSeconds: int option
-      /// Absolute one-time occurrence, normalized to UTC.
-      RunAt: DateTimeOffset option
-      Timezone: string
-      Catchup: CatchupPolicy }
+    {
+        UserId: UserId
+        ChatId: ChatId
+        Prompt: string
+        CronExpr: string option
+        IntervalSeconds: int option
+        AfterSeconds: int option
+        /// Absolute one-time occurrence, normalized to UTC.
+        RunAt: DateTimeOffset option
+        Timezone: string
+        Catchup: CatchupPolicy
+    }
 
 /// Per-user scheduling quotas.
 type ScheduleQuota =
@@ -169,7 +173,10 @@ let validate (quota: ScheduleQuota) (draft: ScheduleJobDraft) : Result<ScheduleJ
         | Some _, None, None, None ->
             match validateTimezone draft with
             | Error e -> Error e
-            | Ok() -> Ok { draft with RunAt = draft.RunAt |> Option.map (fun value -> value.ToUniversalTime()) }
+            | Ok() ->
+                Ok
+                    { draft with
+                        RunAt = draft.RunAt |> Option.map (fun value -> value.ToUniversalTime()) }
         | None, Some c, None, None ->
             match validateTimezone draft with
             | Error e -> Error e
@@ -208,8 +215,7 @@ let validateAt
     | Error e -> Error e
     | Ok valid ->
         match valid.RunAt with
-        | Some runAt when runAt <= now ->
-            Error "поле run_at должно указывать время в будущем"
+        | Some runAt when runAt <= now -> Error "поле run_at должно указывать время в будущем"
         | _ -> Ok valid
 
 

@@ -1181,7 +1181,10 @@ let ``workspace copies persona file when configured`` () =
 
         let content = File.ReadAllText(Path.Combine(wsDir, ".omp", "APPEND_SYSTEM.md"))
         content.StartsWith("CUSTOM PERSONA", StringComparison.Ordinal) |> should be True
-        content.Contains("PHOS_HOST_SCHEDULING_START", StringComparison.Ordinal) |> should be True
+
+        content.Contains("PHOS_HOST_SCHEDULING_START", StringComparison.Ordinal)
+        |> should be True
+
         content.Contains("run_at", StringComparison.Ordinal) |> should be True
     finally
         deleteDir dir
@@ -1205,21 +1208,32 @@ let ``workspace ensure upserts scheduling block in existing persona`` () =
 
         let first = File.ReadAllText appendPath
         first.Contains("CUSTOM PERSONA", StringComparison.Ordinal) |> should be True
-        first.Contains("Old scheduling rules", StringComparison.Ordinal) |> should be True
-        first.Contains("PHOS_HOST_SCHEDULING_START", StringComparison.Ordinal) |> should be True
-        first.Contains("supersede", StringComparison.OrdinalIgnoreCase) |> should be True
+
+        first.Contains("Old scheduling rules", StringComparison.Ordinal)
+        |> should be True
+
+        first.Contains("PHOS_HOST_SCHEDULING_START", StringComparison.Ordinal)
+        |> should be True
+
+        first.Contains("supersede", StringComparison.OrdinalIgnoreCase)
+        |> should be True
+
         first.Contains("date", StringComparison.OrdinalIgnoreCase) |> should be True
         first.Contains("run_at", StringComparison.Ordinal) |> should be True
         first.Contains("timezone", StringComparison.OrdinalIgnoreCase) |> should be True
-        first.Contains("confirmation", StringComparison.OrdinalIgnoreCase) |> should be True
+
+        first.Contains("confirmation", StringComparison.OrdinalIgnoreCase)
+        |> should be True
 
         let marker = "<!-- PHOS_HOST_SCHEDULING_START -->"
+
         first.IndexOf(marker, StringComparison.Ordinal)
         |> should equal (first.LastIndexOf(marker, StringComparison.Ordinal))
 
         match ws.Ensure(UserId 9L) with
         | Ok actual -> actual |> should equal (Path.Combine(wsRoot, "9"))
         | Error e -> failwith e
+
         let second = File.ReadAllText appendPath
         second |> should equal first
     finally
@@ -3315,10 +3329,7 @@ let ``schedule_add rejects date-only past and mixed calendar modes`` () =
         let! past = call "toolu_past" "2000-10-02T09:00" false
         let! mixed = call "toolu_mixed" "2099-10-02T09:00" true
 
-        for result, expected in
-            [ dateOnly, "точное время"
-              past, "будущ"
-              mixed, "ровно один" ] do
+        for result, expected in [ dateOnly, "точное время"; past, "будущ"; mixed, "ровно один" ] do
             match result with
             | Some frame ->
                 Json.getBool "isError" frame |> should equal (Some true)

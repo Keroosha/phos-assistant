@@ -193,7 +193,10 @@ type HostToolExecutor
                     let cron = Json.getString "cron_expr" args
                     let interval = Json.getInt "interval_seconds" args
                     let after = Json.getInt64 "after_seconds" args |> Option.map int
-                    let timezone = Json.getString "timezone" args |> Option.defaultValue TimeZoneInfo.Local.Id
+
+                    let timezone =
+                        Json.getString "timezone" args |> Option.defaultValue TimeZoneInfo.Local.Id
+
                     let now = DateTimeOffset.UtcNow
 
                     let runAt =
@@ -245,7 +248,8 @@ type HostToolExecutor
                                     if validDraft.RunAt.IsSome || validDraft.AfterSeconds.IsSome then
                                         let timeText =
                                             ScheduleJobs.nextRunAfter validDraft now
-                                            |> Option.map (fun occ -> ScheduleJobs.formatOccurrences validDraft.Timezone [ occ ])
+                                            |> Option.map (fun occ ->
+                                                ScheduleJobs.formatOccurrences validDraft.Timezone [ occ ])
                                             |> Option.defaultValue ""
 
                                         let text =
@@ -315,9 +319,13 @@ type HostToolExecutor
                     let statusText =
                         let s = ScheduleJobs.statusToString job.Status
 
-                        if job.AfterSeconds.IsSome || job.RunAt.IsSome then s + " (разово)" else s
+                        if job.AfterSeconds.IsSome || job.RunAt.IsSome then
+                            s + " (разово)"
+                        else
+                            s
 
                     sprintf "#%d [%s] %s next: %s" job.Id statusText prompt next)
+
             return Ok(String.concat "\n" lines)
         }
 
