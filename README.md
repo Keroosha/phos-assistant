@@ -19,14 +19,18 @@
 - **Шедулер (loop), управляемый промптом**: агент сам создаёт задания через
   host tools (`schedule_add` → подтверждение → `schedule_confirm`; также
   `schedule_list`/`schedule_pause`/`schedule_resume`/`schedule_remove`/`schedule_cancel`/
-  `schedule_run_now`). Cron или интервал, таймзона per-job (IANA), задания
-  персистентны в SQLite и переживают рестарт; остановка — только промптом.
+  `schedule_run_now`). Поддерживаются cron, интервал и одноразовый запуск
+  `after_seconds`; таймзона per-job (IANA), задания персистентны в SQLite и
+  переживают рестарт; остановка — только промптом.
 - **Host tools агента**: `tg_send_message`, `tg_edit_message`, `stt_transcribe`,
   `schedule_*`; чтение `tg://` URI (например, голосовые сообщения как контекст).
-- **Пер-юзер OMP-профиль и workspace**: профиль создаётся из `SourceProfile`
-  (`config.yml`, `models.yml`, `.env`), workspace — `~/.phos/workspace/<uid>` с
-  `APPEND_SYSTEM.md` (персона, по умолчанию `personas/phos.md`); простаивающие
-  сессии завершаются по `IdleTimeoutMinutes` и возрождаются с `--resume`.
+- **Общий OMP-профиль и per-user workspace**: профиль `Omp:Profile` создаётся
+  из `Omp:SourceProfile` (`models.yml`, `.env` и `config.yml` с `modelRoles`),
+  а workspace — `~/.phos/workspace/<uid>/.omp/APPEND_SYSTEM.md` с
+  изолированной сессией и памятью пользователя; по умолчанию используется
+  встроенная персона, `Omp:PersonaFile` позволяет указать `personas/phos.md`.
+  Простаивающие сессии завершаются по `IdleTimeoutMinutes` и возрождаются с
+  `--resume`.
 - **Локальные бэкапы** (см. ниже): снапшот SQLite + OMP-профиля + workspace,
   манифест с sha256, шифрование age, retention.
 
@@ -37,7 +41,8 @@
 ## Предварительные требования
 
 - **.NET SDK 10** (пиннится через `global.json`);
-- **omp** — `@oh-my-pi/pi-coding-agent` (ставится через bun: `curl -fsSL https://bun.sh/install | bash`, затем `npm install -g @oh-my-pi/pi-coding-agent`);
+- **Node.js и npm** — установка `omp`:
+  `npm install -g @oh-my-pi/pi-coding-agent`;
 - **ffmpeg** (декодирование голосовых сообщений, путь — `Stt:FfmpegPath`);
 - **age** (только если включены бэкапы `Backup:Enabled`).
 
@@ -50,8 +55,8 @@
    cp appsettings.example.json appsettings.json
    ```
 
-   Заполните `Whitelist:Users[0].Id` вашим Telegram user id (роль `owner`) и
-   перечислите id групп/каналов в `Whitelist:AllowedChats`.
+   Заполните в JSON `Whitelist.Users[0].Id` вашим Telegram user id (роль
+   `owner`) и перечислите id групп/каналов в `Whitelist.AllowedChats`.
 
 2. Задайте секреты через переменные окружения (не храните их в файле):
 
@@ -81,12 +86,20 @@
 dotnet run --project src/Phos.App
 ```
 
-При старте: применяются миграции SQLite (`Storage:DatabasePath`, по умолчанию
+Перед первым сообщением убедитесь, что `Omp:SourceProfile` указывает на
+существующий OMP-профиль с `models.yml` и `.env` (профиль и его секреты
+хранятся вне репозитория), либо что целевой `Omp:Profile` уже создан.
+При чистой установке до первого OMP-хода можно временно установить
+`Backup:Enabled` в `false`: бэкап при старте требует уже созданный целевой
+профиль и корректный публичный ключ `Backup:AgeRecipient`.
+
+При старте применяются миграции SQLite (`Storage:DatabasePath`, по умолчанию
 `data/phos.db`), логин бота выполняется в фоне с flood-aware backoff (сетевой
-сбой не валит хост), при `Stt:Enabled` модели проверяются по sha256 (ошибка
-логируется, хост продолжает работу), создаётся/проверяется OMP-профиль
-(`Omp:Profile` из `Omp:SourceProfile` — источник `config.yml`/`models.yml`/`.env`)
-и workspace-каталог. Первый ответ появляется в Telegram после успешного логина.
+сбой не валит хост), а при `Stt:Enabled` модели проверяются по sha256 (ошибка
+логируется, хост продолжает работу). OMP-профиль и workspace создаются
+лениво при обработке первой обычной команды; при первом создании профиль
+берётся из `Omp:SourceProfile`. Первый ответ появляется в Telegram после
+успешного логина и запуска OMP.
 
 ## Конфигурация и её приоритет
 
@@ -95,12 +108,12 @@ dotnet run --project src/Phos.App
 1. `appsettings.json` (обязательны секции `Telegram`, `Storage`, `Whitelist`,
    `Stt`, `Omp`, `Scheduler`, `Backup` — валидация типов/границ на старте,
    ошибка конфигурации завершает процесс с кодом 1);
-2. переменные окружения с префиксом `PHOS_`;
-3. аргументы командной строки, например:
+2. аргументы командной строки, например:
 
    ```bash
    dotnet run --project src/Phos.App -- --Storage:DatabasePath /tmp/phos.db
    ```
+3. переменные окружения с префиксом `PHOS_` (имеют максимальный приоритет).
 
 ## Операционные заметки
 
@@ -118,7 +131,8 @@ dotnet run --project src/Phos.App
 ### STT: модели и ffmpeg
 
 - Основной путь: ffmpeg-декод (whitelist кодеков, лимиты `Stt:MaxBytes`,
-  `Stt:MaxDurationSeconds`) → Silero VAD → GigaAM; при отсутствии речи — пусто.
+  `Stt:MaxDurationSeconds`) → Silero VAD → GigaAM; при отсутствии речи
+  пользователю отправляется `⚠️ не удалось распознать речь`.
 - `Stt:NumThreads`, `Stt:MaxConcurrentStt` (по умолчанию 4 и 1 — по данным
   бенчмарка, `spikes/spike-03-stt-benchmark.md`), `Stt:ModelSha256` — pin чек-суммы.
 - Не найденный ffmpeg или модель не валят хост: ошибки транскрипции приходят
@@ -127,9 +141,10 @@ dotnet run --project src/Phos.App
 ### Шедулер
 
 - Квоты в секции `Scheduler`: `MaxJobsPerUser` (20), `MinIntervalSeconds` (60),
-  `MaxPromptLength` (2000), `MaxFailedTicks` (3 — после трёх неудачных тиков
-  подряд задание ставится на паузу), `TickSeconds` (15), `PendingTtlHours` (24 —
-  неподтверждённые черновики протухают).
+  `MaxPromptLength` (2000), `MaxFailedTicks` (3 — после трёх неудачных
+  сканов БД включается двукратная задержка опроса), `TickSeconds` (15),
+  `PendingTtlHours` (24 — неподтверждённые черновики протухают). Задания
+  при ошибках скана не ставятся на паузу автоматически.
 - Подтверждение (`schedule_confirm`) возможно только из хода, инициированного
   пользователем — scheduled-ход не может активировать задание (защита от
   саморепликации). Cron — через Cronos, поведение DST покрыто тестами.
@@ -161,6 +176,6 @@ scripts/ci.sh                                    # полный гейт: tool r
 ```
 
 CI (`.github/workflows/ci.yml`) на каждый push/PR: ставит .NET из `global.json`,
-устанавливает omp (`@oh-my-pi/pi-coding-agent`), провижинит STT-модели и
+устанавливает `omp` (`@oh-my-pi/pi-coding-agent@18.1.19`), провижинит STT-модели и
 запускает `scripts/ci.sh`. Интеграционные тесты поднимают реальный `omp --mode
 rpc` с изолированным временным профилем и fake-LLM (`tests/Phos.IntegrationTests`).
