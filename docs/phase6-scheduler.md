@@ -1,102 +1,137 @@
 # Phase 6 — Шедулер, управляемый промптом (персистентный loop)
 
-Дата: 2026-09-14. Статус: **дизайн, без кода** (решение владельца). Дополняет `research-plan.md` §2.6 и Phase 6.
+Дата актуализации: 2026-09-18. Статус: **реализовано**.
+
+Phase 6 реализует prompt-driven расписания в `Phos.Core`, `Phos.Storage`, `Phos.Scheduler` и `Phos.Omp`. Архитектурное решение сохраняется: нужен только loop-режим, без goal-режима; расписания переживают рестарты и выключаются явным действием пользователя.
 
 ## 0. Зачем
 
-Владелец: «шедулер Фос должна выставляться по промпту, что-то типа loop из Claude Code, только персистентно». Уточнение владельца: **goal-режим не нужен совсем — только loop**, и он должен переживать рестарты, пока промпт его не отключит.
+Пользователь пишет в Telegram естественным языком: «напоминай мне каждый день в 09:00» или «проверяй деплой каждые 5 минут». Агент управляет расписанием через host tools, без слэш-команд (`/stop` по-прежнему останавливает текущий ход, но не удаляет расписание).
 
-- Пользователь пишет в Telegram естественным языком: «напоминай мне каждый день в 09:00…», «проверяй деплой каждые 5 минут и чини».
-- Агент (OMP) распознаёт намерение и **сам** управляет расписанием через host tools — никаких слэш-команд (`/schedule_add` из старого плана **отменяется**; команды уже убраны, остался только `/stop`).
-- Персистентность: задания живут в SQLite (`schedule_jobs`/`schedule_runs` уже в схеме), переживают рестарт бота/хоста; **loop работает бессрочно, пока пользователь не отключит его промптом** («останови/удали напоминание» → агент вызывает `schedule_pause`/`schedule_remove`). В отличие от Claude Code `/loop` (session-scoped, fixed-интервалы умирают через 7 дней) — у нас durable: рестарт → `--resume` → цикл продолжается.
+Задание и его состояние живут в SQLite. После рестарта scheduler продолжает работу, а уже поставленные команды доставляются через durable `command_inbox` с at-least-once семантикой. Периодический loop продолжается до `schedule_pause`/`schedule_remove`; одноразовое задание завершается после единственной постановки команды.
 
-## 1. Loop (зеркало Claude Code `/loop`, но персистентный)
+## 1. Виды расписаний и жизненный цикл
 
-| | Claude Code `/loop` | phos |
+`schedule_add` принимает ровно один режим:
+
+| Поле | Режим | Семантика |
 |---|---|---|
-| Механика | перезапуск промпта по интервалу (фикс. или динамический) | задание: cron или интервал → каждый тик кладёт промпт в сессию пользователя |
-| Жизненный цикл | session-scoped; fixed-интервалы expire через 7 дней | **бессрочный**; завершается только промптом пользователя (`schedule_pause`/`schedule_remove` через агента) |
-| Персистентность | нет (нужен запущенный CC) | **да**: DB + `--resume`, at-least-once по инбоксу |
+| `cron_expr` | recurring | Повтор по cron. |
+| `interval_seconds` | recurring | Повтор через заданное число секунд. |
+| `run_at` | one-shot | Один календарный запуск в будущем, с точным временем. |
+| `after_seconds` | one-shot | Один запуск через заданное число секунд после подтверждения. |
 
-## 2. Host tools (агентские, через `set_host_tools`)
+Проверка выполняется до записи: нельзя смешивать режимы, `prompt` обязателен, cron должен разбираться, интервал не меньше квоты, `after_seconds >= 1`, а `run_at` должен указывать будущее.
 
-Все — идемпотентны по `toolCallId` (кэш, как у существующих), мутирующие — с side-effect-защитой.
+Новый job имеет `status=pending` и не запускается до явного подтверждения. Подтверждение переводит его в `active` и вычисляет `next_run`. Pending-задание можно отменить; просроченный черновик становится `expired`. Active можно приостановить и возобновить. One-shot после атомарной постановки ровно одной команды получает `completed` и больше не срабатывает.
+
+## 2. Host tools
+
+Инструменты регистрируются через `set_host_tools`:
 
 | Tool | Параметры | Результат |
 |---|---|---|
-| `schedule_add` | `prompt` (req), `cron_expr` \| `interval_seconds` (ровно одно), `timezone` (IANA, default UTC), `catch_up` (skip\|once, default skip), `chat_id` (default текущий) | `job_id`, `status=pending`, **следующие 5 срабатываний UTC+local** |
-| `schedule_confirm` | `job_id` | `status=active` (только из user-хода — см. §5) |
-| `schedule_cancel` | `job_id` | `status=cancelled` (отказ от pending) |
-| `schedule_list` | — | задания пользователя + `status`, `next_run`, `last_run_at` |
-| `schedule_pause` / `schedule_resume` | `job_id` | `paused` / `active` — управление циклом по промпту |
-| `schedule_remove` | `job_id` | удаление + отмена `schedule_runs` |
-| `schedule_run_now` | `job_id` | немедленный тик (ручной запуск, тесты) |
+| `schedule_add` | `prompt` (обязателен); ровно одно из `run_at`, `cron_expr`, `interval_seconds`, `after_seconds`; `timezone`, `catch_up`, `chat_id` — необязательны | Создаёт `pending`. Для recurring возвращает ближайшие 5 срабатываний в UTC и локальном времени; для one-shot — единственное рассчитанное время и ожидание подтверждения. |
+| `schedule_confirm` | `job_id` | `pending → active`; разрешён только из хода с Telegram/user origin. |
+| `schedule_cancel` | `job_id` | Отменяет `pending`. |
+| `schedule_list` | — | Jobs пользователя, status и `next_run`; one-shot помечается как разовый. |
+| `schedule_pause` / `schedule_resume` | `job_id` | `active → paused` / `paused → active`. |
+| `schedule_remove` | `job_id` | Удаляет job и связанные `schedule_runs`. |
+| `schedule_run_now` | `job_id` | Для active выставляет `next_run` на сейчас; запуск произойдёт на ближайшем скане. |
 
-Отключение цикла — только через промпт: пользователь говорит «отключи/останови/удали» → агент вызывает `schedule_pause`/`schedule_remove`. Никаких автоматических стопов (нет капов ходов, дедлайнов, 7-дневных протуханий).
+Если `timezone` не передан, используется `TimeZoneInfo.Local.Id` процесса-хоста. `chat_id` можно передать явно, иначе берётся текущий чат. `catch_up` принимает `skip` или `once`, по умолчанию `skip`; для one-shot поздний запуск всё равно происходит один раз.
 
-## 3. Модель данных (миграция 9; существующие таблицы расширяются)
+Исполнитель host tools кэширует результат по `toolCallId` в памяти. Для `schedule_add` дополнительная защита от повтора после рестарта — поиск по `origin_tool_call_id` и уникальный индекс в SQLite.
 
-`schedule_jobs` — добавляется:
+## 3. Модель данных и миграции
 
-```sql
-chat_id            INTEGER NOT NULL                        -- куда доставлять (в плане отсутствовало!)
-interval_seconds   INTEGER NULL                            -- sugar: ровно одно с cron_expr
-status             TEXT NOT NULL DEFAULT 'pending'         -- pending|active|paused|cancelled|expired
-origin_tool_call_id TEXT NULL UNIQUE                        -- restart-безопасная идемпотентность schedule_add
-last_run_at        TEXT NULL
-last_error         TEXT NULL
+Текущая `schedule_jobs` содержит:
+
+```text
+user_id, chat_id, prompt
+cron_expr NULL, interval_seconds NULL
+run_at NULL, after_seconds NULL
+timezone, catchup_policy
+status: pending | active | paused | cancelled | expired | completed
+next_run, last_run_at, last_error
+origin_tool_call_id UNIQUE
+created_at, updated_at
 ```
 
-`enabled` (bool) поглощается `status`; `next_run`, `cron_expr`, `timezone`, `catchup_policy`, `prompt`, `user_id` — уже есть. **Никаких goal-полей** (режим один — loop).
+`run_at`, `next_run`, `last_run_at` и служебные timestamps хранятся как Unix seconds. Значение `run_at` нормализуется к UTC до записи. Режим расписания задаётся валидацией (в базе все четыре поля остаются nullable); поле `enabled` удалено, его заменяет `status`.
 
-`schedule_runs(job_id, scheduled_for, status, command_id, PK(job_id, scheduled_for))` — без изменений: гарантия «один occurrence → одна команда».
+`schedule_runs(job_id, scheduled_for, status, command_id)` имеет логическую уникальность `(job_id, scheduled_for)`. Она не позволяет повторно заявить один occurrence; `command_id` связывает его с командой в `command_inbox`.
 
-## 4. Рантайм (новый проект `src/Phos.Scheduler`)
+Актуальная схема получается последовательностью миграций 1–12:
 
-- Фоновый тик (`TickSeconds`, default 15 с) + wake при вставке задания/подтверждении.
-- **Тик loop**: `isDue(policy, now, last_run_at, next_run)` (уже в `SchedulePolicy`) → транзакция: `UPDATE next_run = nextOccurrences(...)[0], last_run_at = now`; `INSERT schedule_runs(job_id, scheduled_for, 'claimed')`; `INSERT command_inbox(origin=Schedule, user_id, chat_id, payload=prompt, priority=10)`. COMMIT.
-- Доставка — существующий пайплайн: команда `origin=Schedule` попадает в очередь пользователя, `OmpWorker` уже всё умеет (одна сессия на пользователя, serialized turns, `--resume` после рестарта).
-- Промпт scheduled-хода получает префикс `[по расписанию]` — агент видит контекст.
-- Приоритет: scheduled-команды `priority=10`, пользовательские `0` — очередь сначала разбирает пользователя.
-- `/stop` — по-прежнему abort текущего хода (цикл не трогается); остановка цикла — через промпт → `schedule_pause`/`schedule_remove`.
+- миграция 9 добавляет `chat_id`, `interval_seconds`, lifecycle/status, `origin_tool_call_id`, `last_run_at`, `last_error` и удаляет `enabled`;
+- миграция 10 добавляет относительный one-shot `after_seconds`;
+- миграция 11 делает `cron_expr` nullable для режимов без cron;
+- миграция 12 добавляет nullable `run_at` для абсолютного one-shot (UTC Unix seconds).
 
-## 5. Guard'ы
+## 4. Реализация runtime
 
-- **Квоты — через конфиг** (секция `Scheduler`, `[<CLIMutable>] SchedulerSettings` в `Phos.App/Config.fs` + `appsettings.example.json`, по паттерну существующих секций). Дефолты:
-  - `MaxJobsPerUser = 20` — max активных заданий на пользователя;
-  - `MinIntervalSeconds = 60` — минимальный интервал/период cron;
-  - `MaxPromptLength = 2000` — длина промпта задания;
-  - `MaxFailedTicks = 3` — столько неудачных тиков подряд → `status=paused`, `last_error`, уведомление пользователю (без автоповтора);
-  - `TickSeconds = 15` — период скана due-заданий;
-  - `PendingTtlHours = 24` — TTL непринятых `pending`-черновиков → `expired` (cleanup).
-  Нарушение квоты → `isError` с понятным текстом. Квоты не ограничивают время жизни цикла.
-- **Confirm-флоу**: `schedule_add` всегда создаёт `pending` + показывает 5 ближайших; агент пересказывает пользователю и спрашивает подтверждение; `schedule_confirm` разрешён **только из user-хода** (OmpWorker держит per-user `CurrentTurnOrigin: Telegram|Schedule`, выставляется при старте хода). Саморепликация запрещена по построению: из scheduled-хода агент может создать `pending`, но активировать может только ход, инициированный человеком.
-- **Идемпотентность**: `origin_tool_call_id` UNIQUE — повторный `schedule_add` после рестарта не дублирует задание; `schedule_runs` PK — повторный тик не дублирует команду.
+`Phos.App` подключает `SchedulerService` из `Phos.Scheduler` вместе с OMP worker. Фоновый цикл с `TickSeconds=15` на каждом скане:
 
-## 6. DST и таймзоны
+1. переводит pending jobs старше `PendingTtlHours=24` в `expired`;
+2. повторяет `ClaimDueOccurrence`, пока есть due jobs;
+3. после каждой успешной claim будит OMP worker.
 
-Поведение проверено фикстурами (`nextOccurrences`, CoreTests): spring-forward gap — Cronos **сдвигает** несуществующее локальное время на пост-прыжковое (02:30 → 03:00 local), детерминированно: ежедневное задание срабатывает и в день перевода часов. Fall-back — одно детерминированное срабатывание в 02:30 local (не два). `SchedulePolicy.resolveLocal` (invalid → None, ambiguous → winter offset) остаётся для локального разрешения. Таймзона — per-job (IANA), default UTC; агент при неясности спрашивает пользователя. Колонка `users.timezone` больше не пишется (команды удалены) — источник истины таймзона задания.
+`ClaimDueOccurrence` выполняет выбор due active job, постановку и обновление расписания одной SQLite-транзакцией. Команда получает `origin=schedule`, priority `10`, внешний ключ `sched:<job_id>:<scheduled_ticks>` и payload с префиксом `[по расписанию]`. Повторный тик защищён уникальностью `command_inbox.external_key` и `(job_id, scheduled_for)`.
 
-## 7. Acceptance (расширение из research-plan Phase 6)
+Для recurring `isDue` учитывает `catch_up`: пропущенный occurrence либо пропускается (`skip`), либо выполняется один раз (`once`), после чего `next_run` сдвигается. Для `run_at` и `after_seconds` команда ставится один раз, job становится `completed`; даже опоздавший после рестарта one-shot не теряется и не повторяется.
 
-- DST spring/fall fixtures (расширить существующие тесты SchedulePolicy на scheduler);
-- рестарт: active/paused переживают; in-flight ход — at-least-once через inbox lease; **цикл продолжает тикать после рестарта**;
-- duplicate tick → ровно одна команда (`schedule_runs` UNIQUE);
-- квоты и confirm: pending→active только через `schedule_confirm` из user-хода; pending протухает за 24 ч; отказ/удаление — `schedule_cancel`/`schedule_remove`;
-- prompt-driven E2E: «напоминай каждый день в 09:00» → агент `schedule_add` → confirm → активен → тик доставляет промпт → агент отвечает в чат;
-- остановка по промпту: «отключи напоминание» → `schedule_pause`/`schedule_remove` → тиков больше нет;
-- саморепликация: scheduled-ход не может активировать новое задание.
+Дальше команда идёт через существующий per-user serialized OMP pipeline и `--resume`. Telegram-команды имеют priority `0`, scheduled — `10`; `/stop` прерывает текущий ход, но не меняет состояние job.
 
-## 8. Пофазная разбивка (TDD, отдельные саб-агенты + проверка по плану)
+## 5. Guard'ы и отказоустойчивость
 
-- **6a Core**: модель задания + валидация квот — чистое, тесты.
-- **6b Storage**: миграция 9 + репозиторий заданий (CRUD, claim, confirm).
-- **6c Scheduler**: тик-цикл, транзакция claim, enqueue; тесты рестарта/дубликата/DST.
-- **6d Host tools**: `schedule_*` executor + per-turn origin + confirm/guard'ы + конфиг-секция `Scheduler` (квоты, тик, TTL) с валидацией как у существующих секций.
-- **6e E2E**: сквозной сценарий «по промпту» (add→confirm→tick→reply→stop) + интеграционные тесты.
+Секция `Scheduler` в конфигурации (`SchedulerSettings`) имеет следующие значения по умолчанию:
 
-## 9. Риски
+- `MaxJobsPerUser = 20` — учитываются active jobs;
+- `MinIntervalSeconds = 60` — минимальный `interval_seconds`;
+- `MaxPromptLength = 2000`;
+- `MaxFailedTicks = 3`;
+- `TickSeconds = 15`;
+- `PendingTtlHours = 24`.
 
-- Агент обязан спрашивать подтверждение — прописать правило в `APPEND_SYSTEM.md` (persona) + guard на `schedule_confirm` (нельзя обойти промптом).
-- Цикл бессрочный: пользователь должен уметь остановить («отключи/удали») — это часть промпт-контракта; без этого цикл будет тикать вечно (по замыслу).
-- Scheduled-промпты вперемешку с диалогом — сериализация очередью уже есть; приоритет 10 у scheduled.
+Дополнительная валидация проверяет непустой prompt, известную IANA/system timezone, корректный cron, ровно один режим и будущий `run_at`. One-shot `after_seconds` должен быть положительным. Ошибка квоты или формата возвращается как `isError` и не создаёт job.
+
+`MaxFailedTicks` относится к последовательным ошибкам **скана scheduler**, а не к отдельному job. После трёх ошибок polling delay увеличивается с `TickSeconds` до `2 * TickSeconds`; успешный скан сбрасывает счётчик. Ошибка базы не переводит jobs в `paused`: они остаются durable и будут повторно проверены.
+
+Confirm-guard принимает `schedule_confirm` только из Telegram/user-origin хода и только для pending job. Поэтому scheduled-ход может создать pending-черновик, но не может сам его активировать. Status guards ограничивают cancel pending, pause active и resume paused.
+
+## 6. Timezone и DST
+
+Timezone хранится у каждого job. Без offset `run_at` интерпретируется как local wall-clock в указанной timezone; `Z` или явный offset обозначают instant и нормализуются к UTC. Без поля `timezone` используется локальная timezone процесса-хоста, а не фиксированная зона. Поддерживаются явные IANA timezone; неизвестная зона отклоняется.
+
+`run_at` требует ISO-8601 даты **и точного времени** (например, `2026-10-02T09:00`). Ввод только даты (`2026-10-02`) отклоняется, чтобы агент запросил время, а не угадывал его. Невозможное offset-less local время в spring-forward gap отклоняется; неоднозначное fall-back время разрешается детерминированно стандартным (зимним) offset.
+
+Для recurring cron используется Cronos: spring-forward gap сдвигается на существующее post-jump local time (например, 02:30 → 03:00), а fall-back даёт одно детерминированное срабатывание. В ответах время показывается одновременно в UTC и timezone job. Колонка `users.timezone` не является источником scheduling-настроек.
+
+## 7. Acceptance реализации
+
+- `schedule_add` принимает четыре взаимоисключающих режима; `run_at` требует будущую дату-время, date-only отклоняется с просьбой назвать точное время.
+- One-shot `run_at` и `after_seconds` проходят `pending → active → completed`, ставят ровно одну inbox-команду и не повторяются после рестарта или позднего скана.
+- Recurring cron/interval показывают ближайшие 5 occurrence, учитывают catch-up policy и продолжаются после рестарта.
+- Confirm доступен только из Telegram/user-origin хода; scheduled-ход не может сам себя активировать.
+- Атомарный claim и уникальные ключи не допускают duplicate tick/duplicate command.
+- Pending TTL, квоты, cancel/pause/resume/remove и `schedule_run_now` работают через host tools.
+- DST spring/fall, локальный default timezone, UTC-нормализация и миграция 12 покрыты core/storage сценариями.
+- Ошибки scan увеличивают только polling delay по правилу `MaxFailedTicks`; jobs не ставятся на автопаузу.
+- Scheduled prompt попадает в durable inbox с origin `schedule`, priority `10` и префиксом `[по расписанию]`, затем обрабатывается обычным serialized OMP pipeline.
+
+## 8. Компоненты реализации
+
+- **`Phos.Core`**: `ScheduleJob`/`ScheduleJobDraft`, статусы, валидация, parsing `run_at`, вычисление occurrence и DST policy.
+- **`Phos.Storage`**: миграции 1–12, repository CRUD/status transitions, pending cleanup и атомарный `ClaimDueOccurrence` с inbox insert.
+- **`Phos.Scheduler`**: hosted background loop, последовательный scan, wake worker и scan-failure backoff.
+- **`Phos.Omp`**: регистрация и выполнение `schedule_*`, origin guard для confirm, idempotency cache и доставка prompt через inbox.
+- **`Phos.App`**: binding/validation `Scheduler` settings и wiring scheduler с OMP worker.
+- **Workspace**: host-managed блок scheduling-инструкций в `.omp/APPEND_SYSTEM.md` обновляется idempotently при каждом `Ensure`, включая уже существующие workspaces; пользовательский остальной persona-контент сохраняется.
+
+## 9. Архитектурные решения и риски
+
+- Явное подтверждение перед активацией — обязательная граница между предложением агента и side effect.
+- SQLite job state плюс durable inbox дают restart-safe at-least-once путь; уникальные ключи ограничивают повтор одной occurrence.
+- Очередь сериализует scheduled-промпты с обычным диалогом; priority `10` позволяет обработать расписание, не вводя второй pipeline.
+- Бесконечность recurring loop — осознанный контракт: пользователь должен явно сказать «пауза» или «удали». Pending TTL и scan backoff защищают систему, но не заменяют пользовательское управление.
