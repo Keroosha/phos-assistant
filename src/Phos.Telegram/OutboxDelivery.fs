@@ -10,14 +10,27 @@ open Phos.Storage
 ///
 /// Each entry carries a stable MTProto `random_id`. On success the entry is
 /// marked sent; on `FLOOD_WAIT`/`SLOWMODE_WAIT` the entry is retried later with
-/// the SAME `random_id` (never a new message); on a `MissingPeer` error the
-/// entry is moved back to `pending` without a meaningful penalty (the transport
-/// has already hydrated the peer once and retried internally — this state means
-/// the peer could not be resolved yet, e.g. login still in progress); on any
-/// other error the entry is marked failed with attempts+1. Before sending,
-/// `GetByRandomId` guards against re-sending a `random_id` that is already
-/// sent/sending.
-type OutboxDelivery(outbox: IMessageOutbox, transport: ITelegramTransport, logger: ILogger) =
+/// the SAME `random_id` (never a new message). A `MissingPeer` caused by login
+/// readiness or the hydration cooldown is deferred without consuming an
+/// attempt; a completed failed probe consumes one bounded retry attempt. Any
+/// other error is marked failed. Before sending, `GetByRandomId` guards against
+/// re-sending a `random_id` that is already sent/sending.
+///
+/// Deferred rows carry a not-before timestamp, so later chats use the same
+/// delivery loop instead of waiting behind an unresolved peer.
+type OutboxDelivery
+    (
+        outbox: IMessageOutbox,
+        transport: ITelegramTransport,
+        logger: ILogger,
+        ?missingPeerBackoff: TimeSpan
+    ) =
+    /// Backoff after a pass ended on a missing-peer deferral. Keeps the loop
+    /// from spinning on a chat whose peer cannot be resolved (e.g. the bot has
+    /// never interacted with it).
+    let missingPeerBackoff =
+        defaultArg missingPeerBackoff (TimeSpan.FromSeconds 30.0)
+
     /// Delivers at most one pending outbox entry. Returns `true` if an entry was
     /// processed (sent, marked failed, or scheduled for a flood-wait retry).
     member _.DeliverOnceAsync(ct: CancellationToken) : Task<bool> =
@@ -27,9 +40,9 @@ type OutboxDelivery(outbox: IMessageOutbox, transport: ITelegramTransport, logge
             match entry with
             | None -> return false
             | Some entry ->
-                // NextPending only ever returns retryable entries ('pending' or
-                // retryable 'failed'), so no idempotency re-check is needed here;
-                // the stable random_id is preserved across retries by the outbox.
+                // NextPending returns pending/failed entries and stale sending
+                // entries left by a crashed process; BeginSend reclaims only
+                // rows outside the same freshness window.
                 do! outbox.BeginSend entry.Id
 
                 let target =
@@ -52,16 +65,18 @@ type OutboxDelivery(outbox: IMessageOutbox, transport: ITelegramTransport, logge
                     PhosLog.floodWait.Invoke(logger, seconds, entry.Id, entry.RandomId, null)
                     do! Task.Delay(TimeSpan.FromSeconds(float seconds), ct)
                     return true
-                | Error(MissingPeer chatId) ->
+                | Error(MissingPeer(chatId, reason)) ->
                     // A restart empties the in-memory peer cache while outbox
-                    // rows survive. The transport already hydrates once and
-                    // retries internally; reaching here means hydration could
-                    // not resolve the peer yet (e.g. login still in progress).
-                    // The attempt is NOT consumed: the row is reverted from
-                    // `sending` to `pending` and the loop retries it on a later
-                    // pass with the same random_id — no stuck rows, no warning
-                    // spam per scan.
-                    do! outbox.RevertToPending entry.Id
+                    // rows survive. A login/cooldown miss is deferred without
+                    // consuming an attempt; a completed failed probe consumes
+                    // one bounded attempt before the same not-before delay.
+                    match reason with
+                    | MissingPeerReason.LoginNotReady ->
+                        do! outbox.Defer entry.Id (DateTimeOffset.UtcNow.Add missingPeerBackoff)
+                    | MissingPeerReason.HydrationFailed ->
+                        do! outbox.MarkFailed entry.Id
+                        do! outbox.Defer entry.Id (DateTimeOffset.UtcNow.Add missingPeerBackoff)
+
                     PhosLog.peerMissing.Invoke(logger, entry.Id, chatId, null)
                     return true
                 | Error(Other msg) ->

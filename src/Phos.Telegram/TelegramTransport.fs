@@ -1,6 +1,7 @@
 namespace Phos.Telegram
 
 open System
+open System.Collections.Concurrent
 open System.IO
 open System.Threading
 open System.Threading.Tasks
@@ -67,81 +68,114 @@ type TelegramTransport(config: TelegramConfig, ?logger: ILogger) =
     /// the same chat coalesce into one refetch instead of a refetch storm.
     let hydrationGate = new SemaphoreSlim(1, 1)
 
-    /// Refetches the peers for `chatIds` that are still missing from the cache,
-    /// waiting until login completes first. Coalesced: callers whose peers were
-    /// hydrated by an earlier pass leave without making any API call. All
-    /// failures are logged, never thrown (best-effort recovery path).
-    let hydratePeersCore (chatIds: ChatId list) : Task<unit> =
+    /// Per-chat cooldown/in-flight suppression after a failed hydration pass.
+    /// Raw MTProto chat id -> earliest moment a new pass may probe again:
+    /// during an outage concurrent/rapid misses must not repeat all three RPC
+    /// probes. Cache hits bypass the gate entirely, so this never delays the
+    /// steady-state path.
+    let hydrationCooldown = ConcurrentDictionary<int64, DateTimeOffset>()
+
+    /// Backoff applied to a chat after a hydration pass cannot resolve it.
+    let hydrationCooldownSpan = TimeSpan.FromSeconds 30.0
+
+    /// Refetches missing peers only after login readiness. Cache hits bypass the
+    /// gate, concurrent passes are coalesced, and failed/ambiguous chats are
+    /// cooled down. All failures are logged at Debug and never escape this
+    /// best-effort recovery path.
+    let hydratePeersCore (chatIds: ChatId list) : Task<bool> =
         task {
             if List.isEmpty chatIds then
-                return ()
+                return false
+            elif not loginReady.Task.IsCompleted then
+                // Hydration never races the login loop: before login is ready,
+                // leave the peer unresolved and let callers retry later.
+                return false
             else
-                // Never wait indefinitely on a login that may not be running
-                // (e.g. wrong credentials, cancelled startup).
-                let! ready =
-                    Task.WhenAny(loginReady.Task, Task.Delay(TimeSpan.FromSeconds 30.0))
+                let! _ = hydrationGate.WaitAsync()
 
-                if ready <> loginReady.Task then
-                    logger.LogWarning("peer hydration skipped: login not ready")
-                    return ()
-                else
-                    let! _ = hydrationGate.WaitAsync()
-                    try
-                        // Recheck under the gate: an earlier waiter may have
-                        // already hydrated (part of) these peers.
-                        let missing =
-                            chatIds |> List.filter (fun chat -> peers.Get chat |> Option.isNone)
+                try
+                    // Recheck under the gate: an earlier waiter may have
+                    // already hydrated (part of) these peers, and a chat whose
+                    // previous pass failed is cooling down.
+                    let nowUtc = DateTimeOffset.UtcNow
 
-                        if List.isEmpty missing then
-                            return ()
-                        else
-                            // Raw MTProto ids overlap (a user id can collide with
-                            // the low bits of a -100… channel id), so peer kind
-                            // is NOT classified by sign: every id is probed
-                            // against all three refetch methods and only
-                            // successful responses are cached.
-                            let ids = missing |> List.map (fun (ChatId cid) -> cid)
+                    let isCoolingDown (cid: int64) =
+                        match hydrationCooldown.TryGetValue cid with
+                        | true, until -> until > nowUtc
+                        | _ -> false
 
+                    let missing =
+                        chatIds
+                        |> List.filter (fun (ChatId cid) ->
+                            peers.Get (ChatId cid) |> Option.isNone
+                            && not (isCoolingDown cid))
+
+                    let attempted = not (List.isEmpty missing)
+
+                    if attempted then
+                        // Raw MTProto user/chat/channel id sequences OVERLAP
+                        // (see core.telegram.org/api/bots/ids), so peer kind is
+                        // NOT classified by sign: every id is probed against all
+                        // three refetch methods. Each probe writes into its OWN
+                        // candidate cache, so a raw-id collision can never
+                        // overwrite the intended peer — only an unambiguous
+                        // single candidate is merged into the real PeerCache.
+                        let ids = missing |> List.map (fun (ChatId cid) -> cid)
+
+                        let userCandidates =
+                            ConcurrentDictionary<int64, TL.InputPeer>()
+
+                        let channelCandidates =
+                            ConcurrentDictionary<int64, TL.InputPeer>()
+
+                        let chatCandidates =
+                            ConcurrentDictionary<int64, TL.InputPeer>()
+
+                        for batch in ids |> List.chunkBySize 100 do
                             // users.getUsers with zero access hashes — bots may
-                            // address any peer they have already interacted with
-                            // (see core.telegram.org/api/peers#access-hash).
-                            for batch in ids |> List.chunkBySize 100 do
-                                try
-                                    let! users = client.Invoke(Transport.buildGetUsersRequest batch)
-                                    Transport.hydrateUsers peers users
-                                with ex ->
-                                    logger.LogWarning(
-                                        ex,
-                                        "peer hydration (users.getUsers) failed"
-                                    )
+                            // address peers they have already interacted with.
+                            // Wrong-kind errors are expected, so keep them Debug.
+                            try
+                                let! users = client.Invoke(Transport.buildGetUsersRequest batch)
+                                Transport.collectUsers userCandidates users
+                            with ex ->
+                                logger.LogDebug(ex, "peer hydration probe (users.getUsers) rejected")
 
                             // channels.getChannels with zero access hashes.
-                            for batch in ids |> List.chunkBySize 100 do
-                                try
-                                    let! chats = client.Invoke(Transport.buildGetChannelsRequest batch)
-                                    Transport.hydrateChats peers chats.chats
-                                with ex ->
-                                    logger.LogWarning(
-                                        ex,
-                                        "peer hydration (channels.getChannels) failed"
-                                    )
+                            try
+                                let! chats = client.Invoke(Transport.buildGetChannelsRequest batch)
+                                Transport.collectChannels channelCandidates chats.chats
+                            with ex ->
+                                logger.LogDebug(ex, "peer hydration probe (channels.getChannels) rejected")
 
-                            // Basic (legacy) groups resolve to inputPeerChat with
-                            // no access hash; messages.getChats is bot-allowed.
-                            // getDialogs is users-only (400 BOT_METHOD_INVALID).
-                            for batch in ids |> List.chunkBySize 100 do
-                                try
-                                    let! chats = client.Invoke(Transport.buildGetChatsRequest batch)
-                                    Transport.cacheBasicChats peers chats.chats
-                                with ex ->
-                                    logger.LogWarning(
-                                        ex,
-                                        "peer hydration (messages.getChats) failed"
-                                    )
-                    finally
-                        hydrationGate.Release() |> ignore
+                            // messages.getChats resolves legacy basic groups.
+                            // messages.getDialogs is users-only and must not be used.
+                            try
+                                let! chats = client.Invoke(Transport.buildGetChatsRequest batch)
+                                Transport.collectBasicChats chatCandidates chats.chats
+                            with ex ->
+                                logger.LogDebug(ex, "peer hydration probe (messages.getChats) rejected")
+
+                        // Merge only an unambiguous candidate. Zero candidates
+                        // and raw-id collisions enter cooldown.
+                        let cooldownUntil = nowUtc.Add hydrationCooldownSpan
+
+                        for cid in ids do
+                            let candidates =
+                                [ if userCandidates.ContainsKey cid then userCandidates.[cid]
+                                  if channelCandidates.ContainsKey cid then channelCandidates.[cid]
+                                  if chatCandidates.ContainsKey cid then chatCandidates.[cid] ]
+
+                            match candidates with
+                            | [ peer ] -> peers.Cache(ChatId cid, peer)
+                            | _ -> hydrationCooldown.[cid] <- cooldownUntil
+
+                    hydrationGate.Release() |> ignore
+                    return attempted
+                with ex ->
+                    hydrationGate.Release() |> ignore
+                    return raise ex
         }
-
     /// Runs `op` with the peer resolved from the cache. On a missing peer (the
     /// in-memory cache is empty after a restart while durable rows survive),
     /// hydrates the chat once and retries — the hydration gate coalesces
@@ -154,35 +188,47 @@ type TelegramTransport(config: TelegramConfig, ?logger: ILogger) =
             try
                 return! op (Transport.resolvePeer peers chat)
             with :? NoCachedPeerException ->
-                do! hydratePeersCore [ chat ]
+                let! _ = hydratePeersCore [ chat ]
 
                 // Retry once: the peer is now cached, or hydration failed and
                 // the typed error surfaces to the caller.
                 return! op (Transport.resolvePeer peers chat)
         }
 
-    /// Sends a message; a missing peer is recovered once (hydration + retry with
-    /// the same `random_id`) inside `withPeer`. If the peer still cannot be
-    /// resolved, the typed retryable `MissingPeer` error is returned instead of
-    /// a generic failure, so the outbox delivery loop does not consume a retry
-    /// attempt and simply tries again on a later pass.
-    let sendMessageCore (target: SendTarget) : TaskResult<SendResult, SendError> =
-        taskResult {
-            try
-                let! result =
-                    withPeer
-                        target.ChatId
-                        (fun peer ->
-                            task {
-                                let req = Transport.buildSendRequest peer target
-                                let! result = client.Invoke(req)
-                                return { RemoteMessageId = Transport.extractRemoteMessageId result }
-                            })
+    /// Resolves a send destination and preserves whether hydration was
+    /// attempted. Login/cooldown misses are deferred without consuming a
+    /// delivery attempt; a completed but unsuccessful probe is bounded by the
+    /// outbox retry policy.
+    let resolveSendPeer (chat: ChatId) : Task<Result<TL.InputPeer, MissingPeerReason>> =
+        task {
+            match peers.Get chat with
+            | Some peer -> return Ok peer
+            | None ->
+                let! probed = hydratePeersCore [ chat ]
 
-                return result
-            with
-            | :? NoCachedPeerException -> return! Error(MissingPeer target.ChatId)
-            | ex -> return! Error(Transport.mapRpcError ex)
+                match peers.Get chat with
+                | Some peer -> return Ok peer
+                | None ->
+                    return
+                        Error(
+                            if probed then
+                                MissingPeerReason.HydrationFailed
+                            else
+                                MissingPeerReason.LoginNotReady
+                        )
+        }
+
+    let sendMessageCore (target: SendTarget) : TaskResult<SendResult, SendError> =
+        task {
+            match! resolveSendPeer target.ChatId with
+            | Error reason -> return Error(MissingPeer(target.ChatId, reason))
+            | Ok peer ->
+                try
+                    let req = Transport.buildSendRequest peer target
+                    let! result = client.Invoke(req)
+                    return Ok { RemoteMessageId = Transport.extractRemoteMessageId result }
+                with ex ->
+                    return Error(Transport.mapRpcError ex)
         }
 
     let editMessageCore (chat: ChatId) (messageId: int64) (text: string) (entities: TelegramEntity list) : Task<unit> =

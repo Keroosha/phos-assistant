@@ -41,11 +41,7 @@ type IMessageOutbox =
     abstract MarkSent: id: int64 -> remoteMessageId: int64 -> Task<unit>
     abstract MarkFailed: id: int64 -> Task<unit>
     abstract Retry: id: int64 -> Task<unit>
-    /// Moves a `sending` row back to `pending` WITHOUT incrementing `attempts`:
-    /// the send could not even start (the peer was not resolvable yet — the
-    /// in-memory cache is empty after a restart while durable rows survive), so
-    /// the failure was recoverable and must not consume a retry slot.
-    abstract RevertToPending: id: int64 -> Task<unit>
+    abstract Defer: id: int64 -> availableAt: DateTimeOffset -> Task<unit>
     abstract GetByRandomId: randomId: int64 -> Task<OutboxEntry option>
     abstract CountPending: unit -> Task<int>
 
@@ -217,11 +213,20 @@ type MessageOutbox(exec: StorageExecutor) =
                     sprintf
                         """
                     SELECT %s FROM message_outbox
-                    WHERE status = 'pending' OR (status = 'failed' AND attempts < max_attempts)
+                    WHERE (status = 'pending' AND updated_at <= $now)
+                       OR (status = 'failed' AND attempts < max_attempts)
+                       OR (status = 'sending' AND updated_at <= $sendingStaleBefore)
                     ORDER BY id ASC
                     LIMIT 1;
                 """
                         selectColumns
+                cmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToUnixTimeSeconds())
+                |> ignore
+                cmd.Parameters.AddWithValue(
+                    "$sendingStaleBefore",
+                    DateTimeOffset.UtcNow.ToUnixTimeSeconds() - 10L
+                )
+                |> ignore
 
                 use reader = cmd.ExecuteReader()
                 if reader.Read() then Some(readEntry reader) else None)
@@ -232,14 +237,22 @@ type MessageOutbox(exec: StorageExecutor) =
 
                 cmd.CommandText <-
                     """
-                    UPDATE message_outbox
-                    SET status = 'sending', updated_at = $now
-                    WHERE id = $id AND (status = 'pending' OR (status = 'failed' AND attempts < max_attempts));
+                UPDATE message_outbox
+                SET status = 'sending', updated_at = $now
+                WHERE id = $id
+                  AND ((status = 'pending' AND updated_at <= $now)
+                    OR (status = 'failed' AND attempts < max_attempts)
+                    OR (status = 'sending' AND updated_at <= $sendingStaleBefore));
                 """
 
                 cmd.Parameters.AddWithValue("$id", id) |> ignore
 
                 cmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToUnixTimeSeconds())
+                |> ignore
+                cmd.Parameters.AddWithValue(
+                    "$sendingStaleBefore",
+                    DateTimeOffset.UtcNow.ToUnixTimeSeconds() - 10L
+                )
                 |> ignore
 
                 cmd.ExecuteNonQuery() |> ignore
@@ -281,7 +294,7 @@ type MessageOutbox(exec: StorageExecutor) =
                 use cmd = conn.CreateCommand()
 
                 cmd.CommandText <-
-                    "UPDATE message_outbox SET status = 'pending', updated_at = $now WHERE id = $id AND status = 'failed';"
+                    "UPDATE message_outbox SET status = 'pending', updated_at = $now WHERE id = $id AND status = 'failed' AND attempts < max_attempts;"
 
                 cmd.Parameters.AddWithValue("$id", id) |> ignore
 
@@ -290,17 +303,15 @@ type MessageOutbox(exec: StorageExecutor) =
 
                 cmd.ExecuteNonQuery() |> ignore
                 ())
-
-        member _.RevertToPending(id: int64) =
+        member _.Defer(id: int64) (availableAt: DateTimeOffset) =
             exec.WriteAsync(fun conn ->
                 use cmd = conn.CreateCommand()
 
                 cmd.CommandText <-
-                    "UPDATE message_outbox SET status = 'pending', updated_at = $now WHERE id = $id AND status = 'sending';"
+                    "UPDATE message_outbox SET status = 'pending', updated_at = $availableAt WHERE id = $id AND (status = 'sending' OR (status = 'failed' AND attempts < max_attempts));"
 
                 cmd.Parameters.AddWithValue("$id", id) |> ignore
-
-                cmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToUnixTimeSeconds())
+                cmd.Parameters.AddWithValue("$availableAt", toUnix availableAt)
                 |> ignore
 
                 cmd.ExecuteNonQuery() |> ignore

@@ -101,6 +101,7 @@ type FakeTransport
     let mutable voiceBytes = Array.empty
     let mutable failCount = 0
     let mutable missingPeerCount = 0
+    let mutable missingPeerReason = MissingPeerReason.LoginNotReady
     let mutable floodCount = 0
     let mutable slowmodeCount = 0
     let mutable floodSeconds = 0
@@ -126,6 +127,7 @@ type FakeTransport
     /// `MissingPeer` error (simulating a restart with a peer the transport
     /// could not hydrate yet), decrementing the counter each time.
     member _.MissingPeerNext(n: int) = missingPeerCount <- n
+    member _.SetMissingPeerReason(reason: MissingPeerReason) = missingPeerReason <- reason
 
     member _.FloodNext(n: int) = floodCount <- n
 
@@ -157,7 +159,7 @@ type FakeTransport
             task {
                 if missingPeerCount > 0 then
                     missingPeerCount <- missingPeerCount - 1
-                    return Error(MissingPeer target.ChatId)
+                    return Error(MissingPeer(target.ChatId, missingPeerReason))
                 elif failCount > 0 then
                     failCount <- failCount - 1
                     return Error(Other "boom")
@@ -878,7 +880,56 @@ let ``flood wait retries later with the same random id`` () =
         deleteDir dir
 
 [<Fact>]
-let ``missing peer defers the entry without consuming a retry attempt`` () =
+let ``stale sending outbox rows are reclaimed after a crash`` () =
+    let dir = makeTempDir ()
+    let dbPath = Path.Combine(dir, "phos.db")
+
+    try
+        task {
+            let exec = createExecutor dbPath
+
+            try
+                let _, outbox = mkRepos exec
+                let! id = outbox.Insert 1L 0 testChat.Id 777L "hello" []
+                do! outbox.BeginSend id
+
+                // A live sender keeps a fresh `sending` row out of the queue.
+                let! fresh = outbox.NextPending()
+                fresh |> should equal None
+
+                // A process crash leaves the row stale; the next process may
+                // reclaim it and reuse the stable random_id.
+                let cutoff = DateTimeOffset.UtcNow.AddSeconds(-11.0).ToUnixTimeSeconds()
+
+                let! _ =
+                    exec.WriteAsync(fun conn ->
+                        use cmd = conn.CreateCommand()
+                        cmd.CommandText <- "UPDATE message_outbox SET updated_at = $t WHERE id = $id"
+                        cmd.Parameters.AddWithValue("$t", cutoff) |> ignore
+                        cmd.Parameters.AddWithValue("$id", id) |> ignore
+                        cmd.ExecuteNonQuery())
+
+                let! stale = outbox.NextPending()
+                stale |> should not' (be None)
+                stale.Value.Status |> should equal Out.Sending
+
+                let transport = FakeTransport()
+                let delivery = OutboxDelivery(outbox, transport, NullLogger.Instance, TimeSpan.Zero)
+                let! processed = delivery.DeliverOnceAsync(CancellationToken.None)
+                processed |> should be True
+                transport.SendCalls |> should haveLength 1
+                transport.SendCalls.[0].RandomId |> should equal 777L
+
+                let! sent = outbox.GetByRandomId 777L
+                sent.Value.Status |> should equal Out.Sent
+            finally
+                dispose exec
+        }
+    finally
+        deleteDir dir
+
+[<Fact>]
+let ``missing peer defers without consuming attempts and resumes when due`` () =
     let dir = makeTempDir ()
     let dbPath = Path.Combine(dir, "phos.db")
 
@@ -896,20 +947,29 @@ let ``missing peer defers the entry without consuming a retry attempt`` () =
                 let delivery = OutboxDelivery(outbox, transport, NullLogger.Instance)
                 let! _ = delivery.DeliverOnceAsync(CancellationToken.None)
 
-                // The entry is back to `pending` and the attempt is NOT
-                // consumed — the loop retries it on a later pass.
-                let! entry = outbox.GetByRandomId 999L
-                entry.Value.Status |> should equal Out.Pending
-                entry.Value.Attempts |> should equal 0
+                let! deferred = outbox.GetByRandomId 999L
+                deferred.Value.Status |> should equal Out.Pending
+                deferred.Value.Attempts |> should equal 0
 
-                // Now the send succeeds (peer resolvable again).
+                // The not-before timestamp keeps the row out of the queue.
+                let! notDue = delivery.DeliverOnceAsync(CancellationToken.None)
+                notDue |> should be False
+
+                let! _ =
+                    exec.WriteAsync(fun conn ->
+                        use cmd = conn.CreateCommand()
+                        cmd.CommandText <- "UPDATE message_outbox SET updated_at = $t WHERE random_id = $randomId"
+                        cmd.Parameters.AddWithValue("$t", DateTimeOffset.UtcNow.ToUnixTimeSeconds() - 1L)
+                        |> ignore
+                        cmd.Parameters.AddWithValue("$randomId", 999L) |> ignore
+                        cmd.ExecuteNonQuery())
+
                 let! _ = delivery.DeliverOnceAsync(CancellationToken.None)
                 transport.SendCalls |> should haveLength 1
                 transport.SendCalls.[0].RandomId |> should equal 999L
 
                 let! sent = outbox.GetByRandomId 999L
                 sent.Value.Status |> should equal Out.Sent
-
             finally
                 dispose exec
         }
@@ -917,7 +977,7 @@ let ``missing peer defers the entry without consuming a retry attempt`` () =
         deleteDir dir
 
 [<Fact>]
-let ``missing peer deferral keeps the same random id across retries`` () =
+let ``deferred missing peer does not starve later outbox rows`` () =
     let dir = makeTempDir ()
     let dbPath = Path.Combine(dir, "phos.db")
 
@@ -927,30 +987,30 @@ let ``missing peer deferral keeps the same random id across retries`` () =
 
             try
                 let _, outbox = mkRepos exec
-                let! _ = outbox.Insert 1L 0 testChat.Id 321L "hello" []
+                let! _ = outbox.Insert 1L 0 testChat.Id 999L "blocked" []
+                let! _ = outbox.Insert 2L 0 testChat.Id 1000L "later" []
 
                 let transport = FakeTransport()
-                transport.MissingPeerNext 2
-
+                transport.MissingPeerNext 1
                 let delivery = OutboxDelivery(outbox, transport, NullLogger.Instance)
-                let! _ = delivery.DeliverOnceAsync(CancellationToken.None)
+
                 let! _ = delivery.DeliverOnceAsync(CancellationToken.None)
                 let! _ = delivery.DeliverOnceAsync(CancellationToken.None)
 
-                // Every deferred pass preserved the stable random_id.
                 transport.SendCalls |> should haveLength 1
-                transport.SendCalls.[0].RandomId |> should equal 321L
-
-                let! sent = outbox.GetByRandomId 321L
-                sent.Value.Status |> should equal Out.Sent
+                transport.SendCalls.[0].RandomId |> should equal 1000L
+                let! blocked = outbox.GetByRandomId 999L
+                blocked.Value.Status |> should equal Out.Pending
+                blocked.Value.Attempts |> should equal 0
             finally
                 dispose exec
         }
     finally
         deleteDir dir
 
+
 [<Fact>]
-let ``repeated missing-peer passes do not increment attempts`` () =
+let ``failed peer probes consume a bounded retry budget`` () =
     let dir = makeTempDir ()
     let dbPath = Path.Combine(dir, "phos.db")
 
@@ -960,22 +1020,22 @@ let ``repeated missing-peer passes do not increment attempts`` () =
 
             try
                 let _, outbox = mkRepos exec
-                let! _ = outbox.Insert 1L 0 testChat.Id 654L "hello" []
+                let! _ = outbox.Insert 1L 0 testChat.Id 1001L "unresolvable" []
 
                 let transport = FakeTransport()
-                transport.MissingPeerNext 3
+                transport.SetMissingPeerReason MissingPeerReason.HydrationFailed
+                transport.MissingPeerNext 99
+                let delivery = OutboxDelivery(outbox, transport, NullLogger.Instance, TimeSpan.Zero)
 
-                let delivery = OutboxDelivery(outbox, transport, NullLogger.Instance)
-                let! _ = delivery.DeliverOnceAsync(CancellationToken.None)
-                let! _ = delivery.DeliverOnceAsync(CancellationToken.None)
-                let! _ = delivery.DeliverOnceAsync(CancellationToken.None)
-                let! _ = delivery.DeliverOnceAsync(CancellationToken.None)
+                for _ in 1 .. 6 do
+                    let! _ = delivery.DeliverOnceAsync(CancellationToken.None)
+                    ()
 
-                // Three deferrals (attempts stay 0, max_attempts never
-                // reached) followed by a successful send.
-                let! entry = outbox.GetByRandomId 654L
-                entry.Value.Status |> should equal Out.Sent
-                entry.Value.Attempts |> should equal 0
+                let! entry = outbox.GetByRandomId 1001L
+                entry.Value.Status |> should equal Out.Failed
+                entry.Value.Attempts |> should equal entry.Value.MaxAttempts
+                let! next = outbox.NextPending()
+                next |> should equal None
             finally
                 dispose exec
         }
@@ -1716,28 +1776,32 @@ let ``buildGetChatsRequest passes the basic group ids verbatim`` () =
     req.id |> should equal [| 7L; 42L |]
 
 [<Fact>]
-let ``hydrateUsers caches full user constructors`` () =
+let ``collectUsers collects full user constructors as candidates`` () =
     let u = TL.User()
     u.id <- 5L
     u.access_hash <- 100L
 
-    let cache = PeerCache()
-    Transport.hydrateUsers cache [ u :> TL.UserBase ]
+    let candidates =
+        System.Collections.Concurrent.ConcurrentDictionary<int64, TL.InputPeer>()
 
-    match cache.Get(ChatId 5L) with
-    | Some(:? TL.InputPeerUser as p) ->
+    Transport.collectUsers candidates [ u :> TL.UserBase ]
+
+    match candidates.TryGetValue 5L with
+    | true, (:? TL.InputPeerUser as p) ->
         p.user_id |> should equal 5L
         p.access_hash |> should equal 100L
-    | _ -> failwith "expected InputPeerUser"
+    | _ -> failwith "expected InputPeerUser candidate"
 
 [<Fact>]
-let ``hydrateUsers ignores userEmpty entries`` () =
-    let cache = PeerCache()
-    Transport.hydrateUsers cache [ TL.UserEmpty(id = 5L) :> TL.UserBase ]
-    cache.Get(ChatId 5L) |> Option.isNone |> should be True
+let ``collectUsers ignores userEmpty entries`` () =
+    let candidates =
+        System.Collections.Concurrent.ConcurrentDictionary<int64, TL.InputPeer>()
+
+    Transport.collectUsers candidates [ TL.UserEmpty(id = 5L) :> TL.UserBase ]
+    candidates.IsEmpty |> should be True
 
 [<Fact>]
-let ``hydrateChats caches channels and skips basic groups`` () =
+let ``collectChannels collects channels and skips basic groups`` () =
     let ch = TL.Channel()
     ch.id <- 1001234567890L
     ch.access_hash <- 200L
@@ -1751,20 +1815,22 @@ let ``hydrateChats caches channels and skips basic groups`` () =
     chats.[1001234567890L] <- ch
     chats.[7L] <- group
 
-    let cache = PeerCache()
-    Transport.hydrateChats cache chats
+    let candidates =
+        System.Collections.Concurrent.ConcurrentDictionary<int64, TL.InputPeer>()
 
-    match cache.Get(ChatId 1001234567890L) with
-    | Some(:? TL.InputPeerChannel as p) ->
+    Transport.collectChannels candidates chats
+
+    match candidates.TryGetValue 1001234567890L with
+    | true, (:? TL.InputPeerChannel as p) ->
         p.channel_id |> should equal 1001234567890L
         p.access_hash |> should equal 200L
-    | _ -> failwith "expected InputPeerChannel"
+    | _ -> failwith "expected InputPeerChannel candidate"
 
-    // Basic groups are hydrated via cacheBasicChats (messages.getChats), not here.
-    cache.Get(ChatId 7L) |> Option.isNone |> should be True
+    // Basic groups are candidates via collectBasicChats, not here.
+    candidates.ContainsKey 7L |> should be False
 
 [<Fact>]
-let ``cacheBasicChats caches inputPeerChat for every returned group`` () =
+let ``collectBasicChats collects inputPeerChat for every returned group`` () =
     let group = TL.Chat()
     group.id <- 7L
 
@@ -1777,16 +1843,18 @@ let ``cacheBasicChats caches inputPeerChat for every returned group`` () =
     chats.[7L] <- group
     chats.[8L] <- forbidden
 
-    let cache = PeerCache()
-    Transport.cacheBasicChats cache chats
+    let candidates =
+        System.Collections.Concurrent.ConcurrentDictionary<int64, TL.InputPeer>()
 
-    match cache.Get(ChatId 7L) with
-    | Some(:? TL.InputPeerChat as p) -> p.chat_id |> should equal 7L
-    | _ -> failwith "expected InputPeerChat"
+    Transport.collectBasicChats candidates chats
 
-    match cache.Get(ChatId 8L) with
-    | Some(:? TL.InputPeerChat as p) -> p.chat_id |> should equal 8L
-    | _ -> failwith "expected InputPeerChat"
+    match candidates.TryGetValue 7L with
+    | true, (:? TL.InputPeerChat as p) -> p.chat_id |> should equal 7L
+    | _ -> failwith "expected InputPeerChat candidate"
+
+    match candidates.TryGetValue 8L with
+    | true, (:? TL.InputPeerChat as p) -> p.chat_id |> should equal 8L
+    | _ -> failwith "expected InputPeerChat candidate"
 
 [<Fact>]
 let ``cachePeers populates user and channel peers from updates`` () =

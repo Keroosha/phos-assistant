@@ -33,15 +33,19 @@ type SendResult = { RemoteMessageId: int64 }
 /// Expected Telegram-side send failures, typed so callers never parse exception
 /// text.
 ///
-/// `MissingPeer` is the retryable send-error case: the `InputPeer` (with access
-/// hash) is not in the cache — the in-memory cache is empty after a restart
-/// while durable outbox rows survive. The transport hydrates the peer before
-/// surfacing it, so it means "hydration could not resolve the peer yet; the
-/// delivery loop should try again later without consuming a retry attempt".
+/// `LoginNotReady` means no hydration probe was attempted yet; callers should
+/// defer without consuming a delivery attempt. `HydrationFailed` means the
+/// logged-in transport probed Telegram but still could not resolve the peer;
+/// callers may apply their bounded failure policy.
+[<RequireQualifiedAccess>]
+type MissingPeerReason =
+    | LoginNotReady
+    | HydrationFailed
+
 type SendError =
     | FloodWait of int
     | SlowModeWait of int
-    | MissingPeer of ChatId
+    | MissingPeer of ChatId * MissingPeerReason
     | Other of string
 
 /// Reference to a Telegram voice message to download.
@@ -80,10 +84,9 @@ type HistoryEntry =
 /// Thrown by `Transport.resolvePeer` when a chat's `InputPeer` (with access
 /// hash) is not in the cache. This happens after a restart: the in-memory cache
 /// is empty while durable inbox/outbox rows still reference those chats.
-/// Consumers that can recover (the outbox delivery loop, the OMP worker scan)
-/// catch this type and trigger `HydratePeers`; everyone else keeps the
-/// well-known "no cached peer" failure. Typed so callers never parse exception
-/// text.
+/// `TelegramTransport` catches it, performs login-aware hydration, and retries;
+/// callers that cannot recover keep the typed failure. Typed so callers never
+/// parse exception text.
 type NoCachedPeerException(chat: ChatId) =
     inherit Exception(sprintf "no cached peer for %A" chat)
 
@@ -344,24 +347,35 @@ module Transport =
     /// A bot may pass `access_hash = 0` for users it has already interacted with
     /// (Telegram relaxes the access-hash requirement for bots, see the "Zero
     /// access hash" rule in https://core.telegram.org/api/peers#access-hash), so
-    /// the returned full `User` constructors are cached as-is.
-    let hydrateUsers (cache: PeerCache) (users: TL.UserBase seq) : unit =
+    /// the returned full `User` constructors are usable as-is.
+    ///
+    /// Results are COLLECTED into a per-kind candidate cache instead of the
+    /// shared PeerCache: raw MTProto user/chat/channel id sequences overlap, so
+    /// a direct write could overwrite the intended peer with another kind. The
+    /// transport merges only unambiguous single candidates (see
+    /// `TelegramTransport.hydratePeersCore`).
+    let collectUsers
+        (candidates: System.Collections.Concurrent.ConcurrentDictionary<int64, TL.InputPeer>)
+        (users: TL.UserBase seq)
+        : unit =
         for u in users do
             match box u with
-            | :? TL.User as user -> cache.CacheUser(user.id, user.access_hash)
+            | :? TL.User as user ->
+                candidates.[user.id] <- (TL.InputPeerUser(user.id, user.access_hash) :> TL.InputPeer)
             | _ -> ()
 
-    /// Bulk hydrates chats from a chat-id dictionary (e.g. `channels.chats`):
-    /// full `Channel` constructors carry their `access_hash`; basic groups are
-    /// skipped (they need no access hash and are hydrated via
-    /// `messages.getChats` + `cacheBasicChats`).
-    let hydrateChats
-        (cache: PeerCache)
+    /// Collects channel candidates from a chat-id dictionary (e.g.
+    /// `channels.chats`): full `Channel` constructors carry their
+    /// `access_hash`; basic groups are skipped (they are hydrated via
+    /// `messages.getChats` + `collectBasicChats`).
+    let collectChannels
+        (candidates: System.Collections.Concurrent.ConcurrentDictionary<int64, TL.InputPeer>)
         (chats: System.Collections.Generic.KeyValuePair<int64, TL.ChatBase> seq)
         : unit =
         for kv in chats do
             match kv.Value with
-            | :? TL.Channel as ch -> cache.CacheChannel(ch.id, ch.access_hash)
+            | :? TL.Channel as ch ->
+                candidates.[ch.id] <- (TL.InputPeerChannel(ch.id, ch.access_hash) :> TL.InputPeer)
             | _ -> ()
 
     /// Builds the `users.getUsers` request with zero access hashes.
@@ -398,15 +412,16 @@ module Transport =
         req.id <- Array.ofList chatIds
         req
 
-    /// Caches basic-group peers from a `messages.chats` response. A basic group
-    /// resolves to `inputPeerChat` (no access hash); the full `Chat` constructor
-    /// mainly confirms the bot still knows the group.
-    let cacheBasicChats
-        (cache: PeerCache)
+    /// Collects basic-group candidates from a `messages.chats` response. A
+    /// basic group resolves to `inputPeerChat` (no access hash). Candidates go
+    /// into a per-kind cache and are merged only when unambiguous — never
+    /// directly into the shared PeerCache (raw ids overlap).
+    let collectBasicChats
+        (candidates: System.Collections.Concurrent.ConcurrentDictionary<int64, TL.InputPeer>)
         (chats: System.Collections.Generic.KeyValuePair<int64, TL.ChatBase> seq)
         : unit =
         for kv in chats do
-            cache.CacheChat(kv.Key)
+            candidates.[kv.Key] <- (TL.InputPeerChat(kv.Key) :> TL.InputPeer)
 
 /// The Telegram transport boundary, fakeable in tests.
 type ITelegramTransport =
