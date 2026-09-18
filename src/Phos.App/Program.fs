@@ -84,11 +84,13 @@ let main (argv: string[]) : int =
                 WtLog.wire (sp.GetRequiredService<ILoggerFactory>().CreateLogger("WTelegramClient"))
                 |> ignore
 
-                TelegramTransport
+                let tgConfig: TelegramConfig =
                     { ApiId = cfg.Telegram.ApiId
                       ApiHash = cfg.Telegram.ApiHash
                       BotToken = cfg.Telegram.BotToken
-                      SessionPath = cfg.Telegram.SessionPath })
+                      SessionPath = cfg.Telegram.SessionPath }
+
+                TelegramTransport(tgConfig, sp.GetRequiredService<ILogger<TelegramTransport>>()))
             |> ignore
 
             builder.Services.AddSingleton<ITelegramTransport>(fun sp ->

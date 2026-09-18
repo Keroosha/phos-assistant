@@ -2,6 +2,7 @@ namespace Phos.Telegram
 
 open System
 open Microsoft.Extensions.Logging
+open Phos.Core.DomainTypes
 
 /// High-performance logging helpers for Phos.Telegram.
 ///
@@ -38,4 +39,14 @@ module PhosLog =
             LogLevel.Warning,
             EventId(3, "DeliveryFailed"),
             "Outbox {OutboxId} delivery failed: {Error}"
+        )
+
+    /// Event id 4 — a peer could not be resolved for an outbox entry (post-
+    /// restart, before hydration succeeds). Info level, once per delivery pass
+    /// on the affected entry — never a repeated warning per heartbeat.
+    let peerMissing: Action<ILogger, int64, ChatId, Exception | null> =
+        LoggerMessage.Define<int64, ChatId>(
+            LogLevel.Information,
+            EventId(4, "PeerMissing"),
+            "Outbox {OutboxId} deferred: peer for chat {ChatId} not resolvable yet"
         )

@@ -41,6 +41,11 @@ type IMessageOutbox =
     abstract MarkSent: id: int64 -> remoteMessageId: int64 -> Task<unit>
     abstract MarkFailed: id: int64 -> Task<unit>
     abstract Retry: id: int64 -> Task<unit>
+    /// Moves a `sending` row back to `pending` WITHOUT incrementing `attempts`:
+    /// the send could not even start (the peer was not resolvable yet — the
+    /// in-memory cache is empty after a restart while durable rows survive), so
+    /// the failure was recoverable and must not consume a retry slot.
+    abstract RevertToPending: id: int64 -> Task<unit>
     abstract GetByRandomId: randomId: int64 -> Task<OutboxEntry option>
     abstract CountPending: unit -> Task<int>
 
@@ -277,6 +282,21 @@ type MessageOutbox(exec: StorageExecutor) =
 
                 cmd.CommandText <-
                     "UPDATE message_outbox SET status = 'pending', updated_at = $now WHERE id = $id AND status = 'failed';"
+
+                cmd.Parameters.AddWithValue("$id", id) |> ignore
+
+                cmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToUnixTimeSeconds())
+                |> ignore
+
+                cmd.ExecuteNonQuery() |> ignore
+                ())
+
+        member _.RevertToPending(id: int64) =
+            exec.WriteAsync(fun conn ->
+                use cmd = conn.CreateCommand()
+
+                cmd.CommandText <-
+                    "UPDATE message_outbox SET status = 'pending', updated_at = $now WHERE id = $id AND status = 'sending';"
 
                 cmd.Parameters.AddWithValue("$id", id) |> ignore
 

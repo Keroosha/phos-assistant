@@ -205,6 +205,7 @@ type FakeOutbox() =
         member _.MarkSent (_: int64) (_: int64) = Task.FromResult(())
         member _.MarkFailed(_: int64) = Task.FromResult(())
         member _.Retry(_: int64) = Task.FromResult(())
+        member _.RevertToPending(_: int64) = Task.FromResult(())
         member _.GetByRandomId(_: int64) = task { return None }
         member _.CountPending() = task { return 0 }
 

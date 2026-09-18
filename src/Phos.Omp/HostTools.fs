@@ -113,6 +113,7 @@ type HostToolExecutor
         match err with
         | FloodWait s -> sprintf "telegram flood wait %ds" s
         | SlowModeWait s -> sprintf "telegram slowmode wait %ds" s
+        | MissingPeer _ -> "peer not resolved yet, try again later"
         | Other msg -> msg
 
     let buildResult (id: string) (text: string) (isError: bool) : JsonObject =

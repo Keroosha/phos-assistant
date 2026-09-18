@@ -87,7 +87,18 @@ type OmpWorker
                 try
                     do! transport.SetReaction cmd.Envelope.ChatId messageId "👀"
                 with ex ->
-                    logger.LogWarning(ex, "set reaction failed for command {Id}", cmd.Id)
+                    match ex with
+                    | :? NoCachedPeerException ->
+                        // Post-restart the peer cache is empty; the transport
+                        // has already tried to hydrate once. A missing peer
+                        // must not spam warnings (the command itself is
+                        // durable), so log at Debug only.
+                        logger.LogDebug(
+                            "peer for command {Id} (chat {ChatId}) not resolvable yet; reaction skipped",
+                            cmd.Id,
+                            cmd.Envelope.ChatId
+                        )
+                    | _ -> logger.LogWarning(ex, "set reaction failed for command {Id}", cmd.Id)
             | None -> ()
         }
 
@@ -105,7 +116,17 @@ type OmpWorker
                 try
                     do! transport.SetTyping chatId
                 with ex ->
-                    logger.LogWarning(ex, "set typing failed for command {Id}", cmdId)
+                    match ex with
+                    | :? NoCachedPeerException ->
+                        // Post-restart the peer cache is empty; the transport
+                        // has already tried to hydrate once. Retyping every 4s
+                        // must not produce a warning storm while the peer is
+                        // unresolved — log at Debug only.
+                        logger.LogDebug(
+                            "peer for command {Id} not resolvable yet; typing skipped",
+                            cmdId
+                        )
+                    | _ -> logger.LogWarning(ex, "set typing failed for command {Id}", cmdId)
             }
 
         let loop: Task =
