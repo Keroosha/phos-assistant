@@ -125,6 +125,11 @@ dotnet run --project src/Phos.App
   `Omp:WorkspaceRoot` (по умолчанию `~/.phos/workspace`), по каталогу на
   user id. Персона подключается через `Omp:PersonaFile` (по умолчанию пусто —
   используется встроенная дефолтная персона; для «Фос» укажите `personas/phos.md`).
+- MCP-серверы профиля — `~/.omp/profiles/<Omp:Profile>/agent/mcp.json`;
+  подхватываются при старте новой OMP-сессии (в живой — `/mcp reload`).
+  Пример, локальный ComfyUI: `comfy-mcp` с `COMFY_BIN` (установка
+  `uv tool install comfy-cli comfy-mcp`, регистрация существующего
+  workspace — `comfy set-default <path>`).
 - `Omp:Enabled: false` отключает воркер и шедулер (команды остаются в durable-очереди).
 - Квоты очереди: `Omp:MaxQueuePerUser` (переполнение не теряет команды — они
   остаются в очереди), `Omp:IdleTimeoutMinutes`, `Omp:Tools`, `Omp:ApprovalMode`,
