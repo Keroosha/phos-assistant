@@ -3311,12 +3311,21 @@ let ``WtLog levelOf maps library levels to LogLevel`` () =
     WtLog.levelOf -1 |> should equal LogLevel.Information
 
 [<Fact>]
-let ``WtLog downgrades expected wrong-kind peer probe errors`` () =
+let ``WtLog downgrades recoverable protocol and peer probe errors`` () =
     WtLog.levelFor 4 "→ RpcError 400 CHANNEL_INVALID #DC65"
     |> should equal LogLevel.Debug
 
     WtLog.levelFor 4 "→ RpcError 400 CHAT_ID_INVALID #080A"
     |> should equal LogLevel.Debug
+
+    WtLog.levelFor 4 "BadMsgNotification 17 for msg #A183"
+    |> should equal LogLevel.Debug
+
+    WtLog.levelFor 4 "BadMsgNotification 16 for msg #A183"
+    |> should equal LogLevel.Debug
+
+    WtLog.levelFor 4 "BadMsgNotification 32 for msg #A183"
+    |> should equal LogLevel.Error
 
     WtLog.levelFor 4 "→ RpcError 400 AUTH_KEY_UNREGISTERED"
     |> should equal LogLevel.Error

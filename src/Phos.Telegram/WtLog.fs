@@ -19,13 +19,16 @@ module WtLog =
             LanguagePrimitives.EnumOfValue<int, LogLevel> level
         else
             LogLevel.Information
-    /// Downgrades the two expected wrong-kind RPC responses produced while
-    /// probing a raw ChatId as user/channel/basic-group. The transport still
-    /// handles the exception; this only removes duplicate WTelegram error logs.
+    /// Downgrades the recoverable clock-resync notifications emitted by
+    /// WTelegram plus the expected wrong-kind RPC responses from peer probes.
+    /// WTelegram itself resets the message-id clock offset for BadMsg 16/17;
+    /// this only prevents duplicate low-level Error logs.
     let levelFor (level: int) (message: string) : LogLevel =
         if
             message.Contains("RpcError 400 CHANNEL_INVALID", StringComparison.Ordinal)
             || message.Contains("RpcError 400 CHAT_ID_INVALID", StringComparison.Ordinal)
+            || message.Contains("BadMsgNotification 16", StringComparison.Ordinal)
+            || message.Contains("BadMsgNotification 17", StringComparison.Ordinal)
         then
             LogLevel.Debug
         else
