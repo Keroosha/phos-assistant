@@ -3311,6 +3311,17 @@ let ``WtLog levelOf maps library levels to LogLevel`` () =
     WtLog.levelOf -1 |> should equal LogLevel.Information
 
 [<Fact>]
+let ``WtLog downgrades expected wrong-kind peer probe errors`` () =
+    WtLog.levelFor 4 "→ RpcError 400 CHANNEL_INVALID #DC65"
+    |> should equal LogLevel.Debug
+
+    WtLog.levelFor 4 "→ RpcError 400 CHAT_ID_INVALID #080A"
+    |> should equal LogLevel.Debug
+
+    WtLog.levelFor 4 "→ RpcError 400 AUTH_KEY_UNREGISTERED"
+    |> should equal LogLevel.Error
+
+[<Fact>]
 let ``WtLog wire routes library logs into our logger with mapped level`` () =
     let previous = WTelegram.Helpers.Log
 
@@ -3321,5 +3332,19 @@ let ``WtLog wire routes library logs into our logger with mapped level`` () =
 
         cap.Entries
         |> should equal [ (LogLevel.Information, EventId 0, "hello from wt") ]
+    finally
+        WTelegram.Helpers.Log <- previous
+
+[<Fact>]
+let ``WtLog wire downgrades expected peer probe errors`` () =
+    let previous = WTelegram.Helpers.Log
+
+    try
+        let cap = CapturingLogger()
+        WtLog.wire cap |> ignore
+        WTelegram.Helpers.Log.Invoke(4, "→ RpcError 400 CHANNEL_INVALID #DC65")
+
+        cap.Entries
+        |> should equal [ (LogLevel.Debug, EventId 0, "→ RpcError 400 CHANNEL_INVALID #DC65") ]
     finally
         WTelegram.Helpers.Log <- previous

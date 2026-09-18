@@ -19,11 +19,23 @@ module WtLog =
             LanguagePrimitives.EnumOfValue<int, LogLevel> level
         else
             LogLevel.Information
+    /// Downgrades the two expected wrong-kind RPC responses produced while
+    /// probing a raw ChatId as user/channel/basic-group. The transport still
+    /// handles the exception; this only removes duplicate WTelegram error logs.
+    let levelFor (level: int) (message: string) : LogLevel =
+        if
+            message.Contains("RpcError 400 CHANNEL_INVALID", StringComparison.Ordinal)
+            || message.Contains("RpcError 400 CHAT_ID_INVALID", StringComparison.Ordinal)
+        then
+            LogLevel.Debug
+        else
+            levelOf level
+
 
     /// Install the callback. Process-global static: call once at startup
     /// before any WTelegram.Client activity. Returns the previous delegate so
     /// tests can restore it.
     let wire (logger: ILogger) : Action<int, string> =
         let previous = Helpers.Log
-        Helpers.Log <- fun level message -> logger.Log(levelOf level, message)
+        Helpers.Log <- fun level message -> logger.Log(levelFor level message, message)
         previous
