@@ -229,6 +229,7 @@ type FakeScheduleRepo() =
                       CronExpr = draft.CronExpr
                       IntervalSeconds = draft.IntervalSeconds
                       AfterSeconds = draft.AfterSeconds
+                      RunAt = draft.RunAt
                       Timezone = draft.Timezone
                       Catchup = draft.Catchup
                       Status = ScheduleStatus.Pending

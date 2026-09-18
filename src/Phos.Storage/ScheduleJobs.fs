@@ -66,7 +66,7 @@ type ScheduleJobRepository(exec: StorageExecutor) =
         | None -> failwithf "unknown schedule status: %s" s
 
     let selectColumns =
-        "id, user_id, chat_id, cron_expr, interval_seconds, timezone, prompt, catchup_policy, status, next_run, last_run_at, last_error, created_at, updated_at, after_seconds"
+        "id, user_id, chat_id, cron_expr, interval_seconds, timezone, prompt, catchup_policy, status, next_run, last_run_at, last_error, created_at, updated_at, after_seconds, run_at"
 
     let readJob (reader: SqliteDataReader) : ScheduleJob =
         let id = reader.GetInt64 0
@@ -106,6 +106,12 @@ type ScheduleJobRepository(exec: StorageExecutor) =
             else
                 Some(reader.GetInt32 14)
 
+        let runAt =
+            if reader.IsDBNull 15 then
+                None
+            else
+                Some(fromUnix (reader.GetInt64 15))
+
         { Id = id
           UserId = uid
           ChatId = cid
@@ -113,6 +119,7 @@ type ScheduleJobRepository(exec: StorageExecutor) =
           CronExpr = cron
           IntervalSeconds = interval
           AfterSeconds = after
+          RunAt = runAt
           Timezone = tz
           Catchup = catchup
           Status = status
@@ -148,13 +155,14 @@ type ScheduleJobRepository(exec: StorageExecutor) =
                 use cmd = conn.CreateCommand()
 
                 cmd.CommandText <-
-                    "INSERT INTO schedule_jobs(user_id, chat_id, cron_expr, interval_seconds, after_seconds, timezone, prompt, catchup_policy, status, next_run, origin_tool_call_id, created_at, updated_at) VALUES ($userId, $chatId, $cron, $interval, $after, $timezone, $prompt, $catchup, 'pending', NULL, $origin, $now, $now) RETURNING id;"
+                    "INSERT INTO schedule_jobs(user_id, chat_id, cron_expr, interval_seconds, after_seconds, run_at, timezone, prompt, catchup_policy, status, next_run, origin_tool_call_id, created_at, updated_at) VALUES ($userId, $chatId, $cron, $interval, $after, $runAt, $timezone, $prompt, $catchup, 'pending', NULL, $origin, $now, $now) RETURNING id;"
 
                 cmd.Parameters.AddWithValue("$userId", userId draft.UserId) |> ignore
                 cmd.Parameters.AddWithValue("$chatId", chatId draft.ChatId) |> ignore
                 addOpt cmd "$cron" draft.CronExpr
                 addOpt cmd "$interval" draft.IntervalSeconds
                 addOpt cmd "$after" draft.AfterSeconds
+                addOpt cmd "$runAt" (draft.RunAt |> Option.map (fun value -> value.ToUniversalTime() |> toUnix))
                 cmd.Parameters.AddWithValue("$timezone", draft.Timezone) |> ignore
                 cmd.Parameters.AddWithValue("$prompt", draft.Prompt) |> ignore
                 cmd.Parameters.AddWithValue("$catchup", catchupToString draft.Catchup) |> ignore
@@ -172,6 +180,7 @@ type ScheduleJobRepository(exec: StorageExecutor) =
                       CronExpr = draft.CronExpr
                       IntervalSeconds = draft.IntervalSeconds
                       AfterSeconds = draft.AfterSeconds
+                      RunAt = draft.RunAt |> Option.map (fun value -> value.ToUniversalTime())
                       Timezone = draft.Timezone
                       Catchup = draft.Catchup
                       Status = ScheduleStatus.Pending
@@ -234,6 +243,7 @@ type ScheduleJobRepository(exec: StorageExecutor) =
                           CronExpr = job.CronExpr
                           IntervalSeconds = job.IntervalSeconds
                           AfterSeconds = job.AfterSeconds
+                          RunAt = job.RunAt
                           Timezone = job.Timezone
                           Catchup = job.Catchup }
 
@@ -288,6 +298,7 @@ type ScheduleJobRepository(exec: StorageExecutor) =
                           CronExpr = job.CronExpr
                           IntervalSeconds = job.IntervalSeconds
                           AfterSeconds = job.AfterSeconds
+                          RunAt = job.RunAt
                           Timezone = job.Timezone
                           Catchup = job.Catchup }
 
@@ -406,10 +417,10 @@ type ScheduleJobRepository(exec: StorageExecutor) =
                             Some commandId
                         | _ -> None
 
-                    if job.AfterSeconds.IsSome then
-                        // One-shot: fires once (even when late — the user asked "in 5
-                        // minutes", so delivering at +6min after a restart is correct),
-                        // then the job auto-completes without advancing next_run.
+                    if job.AfterSeconds.IsSome || job.RunAt.IsSome then
+                        // Relative and calendar one-shots fire once (even when
+                        // late after a restart), then complete without advancing
+                        // next_run.
                         match enqueueCommand () with
                         | Some commandId ->
                             use upd = conn.CreateCommand()

@@ -460,6 +460,18 @@ type MakeScheduleCronNullable() =
 
     override this.Down() = this.Rebuild(true, "schedule_jobs_old")
 
+[<Migration(12L)>]
+type AddScheduleRunAt() =
+    inherit Migration()
+
+    override this.Up() =
+        // Absolute one-time calendar occurrence, stored as UTC Unix seconds.
+        this.Alter.Table("schedule_jobs").AddColumn("run_at").AsInt64().Nullable()
+        |> ignore
+
+    override this.Down() =
+        this.Delete.Column("run_at").FromTable("schedule_jobs") |> ignore
+
 // ---------------------------------------------------------------------------
 // Runner
 // ---------------------------------------------------------------------------

@@ -1,6 +1,7 @@
 module Phos.Core.ScheduleJobs
 
 open System
+open System.Globalization
 open Phos.Core.DomainTypes
 open Phos.Core.SchedulePolicy
 open Cronos
@@ -24,6 +25,8 @@ type ScheduleJob =
       CronExpr: string option
       IntervalSeconds: int option
       AfterSeconds: int option
+      /// Absolute one-time occurrence, normalized to UTC.
+      RunAt: DateTimeOffset option
       Timezone: string
       Catchup: CatchupPolicy
       Status: ScheduleStatus
@@ -41,6 +44,8 @@ type ScheduleJobDraft =
       CronExpr: string option
       IntervalSeconds: int option
       AfterSeconds: int option
+      /// Absolute one-time occurrence, normalized to UTC.
+      RunAt: DateTimeOffset option
       Timezone: string
       Catchup: CatchupPolicy }
 
@@ -56,45 +61,157 @@ let private tryResolveTimezone (tzName: string) : TimeZoneInfo option =
     with _ ->
         None
 
+let private localRunAtFormats =
+    [| "yyyy-MM-dd'T'HH':'mm"
+       "yyyy-MM-dd'T'HH':'mm':'ss"
+       "yyyy-MM-dd'T'HH':'mm':'ss.FFFFFFF" |]
+
+let private offsetRunAtFormats =
+    [| "yyyy-MM-dd'T'HH':'mmzzz"
+       "yyyy-MM-dd'T'HH':'mm':'sszzz"
+       "yyyy-MM-dd'T'HH':'mm':'ss.FFFFFFFzzz" |]
+
+let private hasExplicitOffset (value: string) =
+    let value = value.Trim()
+    let separator = value.IndexOf('T')
+
+    if separator < 0 then
+        false
+    else
+        value.EndsWith("Z", StringComparison.OrdinalIgnoreCase)
+        || value.LastIndexOf('+') > separator
+        || value.LastIndexOf('-') > separator
+
+let private invalidLocalRunAt (value: string) (timezone: string) =
+    Error(sprintf "поле run_at: локальное время '%s' не существует в таймзоне '%s'" value timezone)
+
+let private isDateOnly (value: string) =
+    let mutable parsed = DateTime.MinValue
+    DateTime.TryParseExact(value, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, &parsed)
+
+/// Parses an ISO-8601 one-time occurrence in a timezone.
+///
+/// A value without an offset is interpreted as a local wall-clock time. The
+/// existing `resolveLocal` policy rejects spring-forward gaps and chooses the
+/// standard-time offset for fall-back ambiguity. Values with an explicit `Z` or
+/// offset are normalized to UTC, while the selected timezone remains available
+/// for display. Date-only input is rejected so the caller can ask for a time.
+let parseRunAt (timezone: string) (value: string) : Result<DateTimeOffset, string> =
+    match tryResolveTimezone timezone with
+    | None -> Error(sprintf "поле timezone: неизвестная таймзона '%s'" timezone)
+    | Some tz ->
+        let value = value.Trim()
+
+        if String.IsNullOrWhiteSpace value then
+            Error "поле run_at не может быть пустым"
+        elif isDateOnly value then
+            Error "поле run_at должно содержать точное время (например, 2026-10-02T09:00), а не только дату"
+        elif hasExplicitOffset value then
+            let normalized =
+                if value.EndsWith("Z", StringComparison.OrdinalIgnoreCase) then
+                    value.Substring(0, value.Length - 1) + "+00:00"
+                else
+                    value
+
+            let mutable parsed = DateTimeOffset.MinValue
+
+            if
+                DateTimeOffset.TryParseExact(
+                    normalized,
+                    offsetRunAtFormats,
+                    CultureInfo.InvariantCulture,
+                    DateTimeStyles.None,
+                    &parsed
+                )
+            then
+                Ok(parsed.ToUniversalTime())
+            else
+                Error "поле run_at должно быть датой и временем ISO-8601, например 2026-10-02T09:00"
+        else
+            let mutable local = DateTime.MinValue
+
+            if
+                DateTime.TryParseExact(
+                    value,
+                    localRunAtFormats,
+                    CultureInfo.InvariantCulture,
+                    DateTimeStyles.None,
+                    &local
+                )
+            then
+                match resolveLocal tz local with
+                | Some resolved -> Ok(resolved.ToUniversalTime())
+                | None -> invalidLocalRunAt value timezone
+            else
+                Error "поле run_at должно быть датой и временем ISO-8601, например 2026-10-02T09:00"
+
+/// Alias that makes the parsing intent explicit at call sites.
+let tryParseRunAt = parseRunAt
+
+let private validateTimezone (draft: ScheduleJobDraft) : Result<unit, string> =
+    match tryResolveTimezone draft.Timezone with
+    | None -> Error(sprintf "поле timezone: неизвестная таймзона '%s'" draft.Timezone)
+    | Some _ -> Ok()
+
 /// Validates a draft against the quota. Pure; no IO.
 ///
 /// Rules: prompt non-blank and within `MaxPromptLength`; exactly one of
-/// `CronExpr`/`IntervalSeconds`/`AfterSeconds`; `AfterSeconds >= 1`; the chosen
-/// schedule expression is well-formed and within the minimum interval; the
-/// timezone is a known IANA zone.
+/// `RunAt`/`CronExpr`/`IntervalSeconds`/`AfterSeconds`; `AfterSeconds >= 1`;
+/// the chosen schedule expression is well-formed and within the minimum
+/// interval; and the timezone is a known IANA zone.
 let validate (quota: ScheduleQuota) (draft: ScheduleJobDraft) : Result<ScheduleJobDraft, string> =
     if String.IsNullOrWhiteSpace draft.Prompt then
         Error "поле prompt не может быть пустым"
     elif draft.Prompt.Length > quota.MaxPromptLength then
         Error(sprintf "поле prompt: длина %d превышает максимум %d" draft.Prompt.Length quota.MaxPromptLength)
     else
-        match draft.CronExpr, draft.IntervalSeconds, draft.AfterSeconds with
-        | Some _, Some _, _
-        | Some _, _, Some _
-        | _, Some _, Some _ -> Error "укажите ровно один из cron_expr, interval_seconds или after_seconds"
-        | None, None, None -> Error "укажите ровно один из cron_expr, interval_seconds или after_seconds"
-        | Some c, None, None ->
-            match tryResolveTimezone draft.Timezone with
-            | None -> Error(sprintf "поле timezone: неизвестная таймзона '%s'" draft.Timezone)
-            | Some _ ->
+        match draft.RunAt, draft.CronExpr, draft.IntervalSeconds, draft.AfterSeconds with
+        | Some _, None, None, None ->
+            match validateTimezone draft with
+            | Error e -> Error e
+            | Ok() -> Ok { draft with RunAt = draft.RunAt |> Option.map (fun value -> value.ToUniversalTime()) }
+        | None, Some c, None, None ->
+            match validateTimezone draft with
+            | Error e -> Error e
+            | Ok() ->
                 try
                     CronExpression.Parse(c) |> ignore
                     Ok draft
                 with _ ->
                     Error(sprintf "поле cron_expr: некорректное cron-выражение '%s'" c)
-        | None, Some s, None ->
-            match tryResolveTimezone draft.Timezone with
-            | None -> Error(sprintf "поле timezone: неизвестная таймзона '%s'" draft.Timezone)
-            | Some _ ->
+        | None, None, Some s, None ->
+            match validateTimezone draft with
+            | Error e -> Error e
+            | Ok() ->
                 if s < quota.MinIntervalSeconds then
                     Error(sprintf "поле interval_seconds: %d меньше минимального %d" s quota.MinIntervalSeconds)
                 else
                     Ok draft
-        | None, None, Some a ->
-            if a < 1 then
-                Error "after_seconds должен быть >= 1"
-            else
-                Ok draft
+        | None, None, None, Some a ->
+            match validateTimezone draft with
+            | Error e -> Error e
+            | Ok() ->
+                if a < 1 then
+                    Error "after_seconds должен быть >= 1"
+                else
+                    Ok draft
+        | _ -> Error "укажите ровно один из run_at, cron_expr, interval_seconds или after_seconds"
+
+/// Validates a draft and rejects an absolute one-time occurrence that is not
+/// strictly in the future relative to `now`.
+let validateAt
+    (quota: ScheduleQuota)
+    (now: DateTimeOffset)
+    (draft: ScheduleJobDraft)
+    : Result<ScheduleJobDraft, string> =
+    match validate quota draft with
+    | Error e -> Error e
+    | Ok valid ->
+        match valid.RunAt with
+        | Some runAt when runAt <= now ->
+            Error "поле run_at должно указывать время в будущем"
+        | _ -> Ok valid
+
 
 /// Computes the next `count` occurrences strictly after `after`.
 ///
@@ -122,14 +239,18 @@ let nextOccurrences
 /// Computes the single next run for a draft strictly after `now`.
 ///
 /// Cron/interval schedules delegate to `nextOccurrences`; a one-shot
-/// (`AfterSeconds`) fires exactly `AfterSeconds` seconds from `now`.
+/// (`RunAt` or `AfterSeconds`) uses its absolute occurrence or fires exactly
+/// `AfterSeconds` seconds from `now`.
 let nextRunAfter (draft: ScheduleJobDraft) (now: DateTimeOffset) : DateTimeOffset option =
-    match draft.CronExpr, draft.IntervalSeconds with
-    | Some _, _
-    | _, Some _ ->
-        nextOccurrences draft.CronExpr draft.IntervalSeconds draft.Timezone now 1
-        |> List.tryHead
-    | None, None -> draft.AfterSeconds |> Option.map (fun a -> now.AddSeconds(float a))
+    match draft.RunAt with
+    | Some runAt -> Some(runAt.ToUniversalTime())
+    | None ->
+        match draft.CronExpr, draft.IntervalSeconds with
+        | Some _, _
+        | _, Some _ ->
+            nextOccurrences draft.CronExpr draft.IntervalSeconds draft.Timezone now 1
+            |> List.tryHead
+        | None, None -> draft.AfterSeconds |> Option.map (fun a -> now.AddSeconds(float a))
 
 /// Renders occurrences one per line: `"2026-09-14 09:00 UTC (11:00 Europe/Berlin)"`.
 /// The UTC label is fixed; the local time is shown in the job's timezone.

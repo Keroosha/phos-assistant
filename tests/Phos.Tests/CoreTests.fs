@@ -783,6 +783,7 @@ let private validCronDraft: Sj.ScheduleJobDraft =
       CronExpr = Some "0 9 * * *"
       IntervalSeconds = None
       AfterSeconds = None
+      RunAt = None
       Timezone = "Europe/Berlin"
       Catchup = SkipMissed }
 
@@ -793,6 +794,7 @@ let private validIntervalDraft: Sj.ScheduleJobDraft =
       CronExpr = None
       IntervalSeconds = Some 300
       AfterSeconds = None
+      RunAt = None
       Timezone = "UTC"
       Catchup = CatchUpOnce }
 
@@ -1132,3 +1134,60 @@ let ``duePolicy wraps catchup with max one catchup`` () =
         equal
         { Catchup = CatchUpOnce
           MaxCatchUp = 1 }
+
+[<Fact>]
+let ``parseRunAt resolves local wall clock in timezone`` () =
+    match Sj.parseRunAt "Europe/Berlin" "2026-10-02T09:00" with
+    | Ok occurrence ->
+        occurrence |> should equal (DateTimeOffset(2026, 10, 2, 7, 0, 0, TimeSpan.Zero))
+    | Error e -> failwithf "expected a valid run_at, got %s" e
+
+[<Fact>]
+let ``parseRunAt rejects date without time`` () =
+    match Sj.parseRunAt "Europe/Berlin" "2026-10-02" with
+    | Error e -> e.Contains("точное время") |> should be True
+    | Ok _ -> failwith "expected date-only run_at to be rejected"
+
+[<Fact>]
+let ``parseRunAt rejects invalid DST local time`` () =
+    match Sj.parseRunAt "Europe/Berlin" "2026-03-29T02:30" with
+    | Error e -> e.Contains("не существует") |> should be True
+    | Ok _ -> failwith "expected spring-forward gap to be rejected"
+
+[<Fact>]
+let ``parseRunAt chooses standard offset on ambiguous local time`` () =
+    match Sj.parseRunAt "Europe/Berlin" "2026-10-25T02:30" with
+    | Ok occurrence ->
+        occurrence |> should equal (DateTimeOffset(2026, 10, 25, 1, 30, 0, TimeSpan.Zero))
+    | Error e -> failwithf "expected a valid ambiguous run_at, got %s" e
+
+[<Fact>]
+let ``parseRunAt normalizes explicit offset to UTC`` () =
+    match Sj.parseRunAt "Europe/Berlin" "2026-10-02T09:00+03:00" with
+    | Ok occurrence ->
+        occurrence |> should equal (DateTimeOffset(2026, 10, 2, 6, 0, 0, TimeSpan.Zero))
+    | Error e -> failwithf "expected an explicit offset to parse, got %s" e
+
+[<Fact>]
+let ``parseRunAt accepts explicit offset during timezone DST gap`` () =
+    match Sj.parseRunAt "Europe/Berlin" "2026-03-29T02:30+01:00" with
+    | Ok occurrence ->
+        occurrence |> should equal (DateTimeOffset(2026, 3, 29, 1, 30, 0, TimeSpan.Zero))
+    | Error e -> failwithf "explicit offset should represent an instant: %s" e
+
+[<Fact>]
+let ``validateAt rejects past calendar occurrence and mixed modes`` () =
+    let past =
+        { validCronDraft with
+            CronExpr = None
+            RunAt = Some(DateTimeOffset(2026, 1, 1, 9, 0, 0, TimeSpan.Zero)) }
+
+    Sj.validateAt testQuota (DateTimeOffset(2026, 1, 2, 0, 0, 0, TimeSpan.Zero)) past
+    |> Result.isError
+    |> should be True
+
+    let mixed = { validCronDraft with RunAt = Some(DateTimeOffset.UtcNow.AddHours 1.0) }
+
+    Sj.validate testQuota mixed
+    |> Result.isError
+    |> should be True

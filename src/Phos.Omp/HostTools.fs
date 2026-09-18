@@ -54,10 +54,11 @@ module HostTools =
           { Name = "schedule_add"
             Label = "Add schedule job"
             Description =
-              "Create a scheduled prompt for the user. Provide exactly one of cron_expr, interval_seconds or after_seconds (a one-shot job that fires once and completes itself)."
+              "Create a scheduled prompt. Provide exactly one of run_at, cron_expr, interval_seconds or after_seconds. Use run_at for a one-time calendar date; cron repeats."
             Parameters =
               jsonSchema
                   [ "prompt", "string", true
+                    "run_at", "string", false
                     "cron_expr", "string", false
                     "interval_seconds", "integer", false
                     "after_seconds", "integer", false
@@ -192,72 +193,84 @@ type HostToolExecutor
                     let cron = Json.getString "cron_expr" args
                     let interval = Json.getInt "interval_seconds" args
                     let after = Json.getInt64 "after_seconds" args |> Option.map int
-                    let timezone = Json.getString "timezone" args |> Option.defaultValue "UTC"
+                    let timezone = Json.getString "timezone" args |> Option.defaultValue TimeZoneInfo.Local.Id
+                    let now = DateTimeOffset.UtcNow
 
-                    let catchup =
-                        match Json.getString "catch_up" args with
-                        | Some "once" -> CatchUpOnce
-                        | _ -> SkipMissed
+                    let runAt =
+                        match Json.getString "run_at" args with
+                        | None -> Ok None
+                        | Some value ->
+                            match ScheduleJobs.parseRunAt timezone value with
+                            | Error e -> Error e
+                            | Ok resolved -> Ok(Some resolved)
 
-                    let targetChatId =
-                        match Json.getInt64 "chat_id" args, chatId with
-                        | Some cid, _ -> Some(ChatId cid)
-                        | None, Some cid -> Some cid
-                        | None, None -> None
+                    match runAt with
+                    | Error e -> return Error e
+                    | Ok runAt ->
+                        let catchup =
+                            match Json.getString "catch_up" args with
+                            | Some "once" -> CatchUpOnce
+                            | _ -> SkipMissed
 
-                    match targetChatId with
-                    | None -> return Error "неизвестен chat_id"
-                    | Some targetChatId ->
-                        let! active = jobs.CountActiveForUser userId
+                        let targetChatId =
+                            match Json.getInt64 "chat_id" args, chatId with
+                            | Some cid, _ -> Some(ChatId cid)
+                            | None, Some cid -> Some cid
+                            | None, None -> None
 
-                        if active >= quota.MaxJobsPerUser then
-                            return Error(sprintf "достигнут лимит заданий (%d)" quota.MaxJobsPerUser)
-                        else
-                            let draft =
-                                { UserId = userId
-                                  ChatId = targetChatId
-                                  Prompt = prompt
-                                  CronExpr = cron
-                                  IntervalSeconds = interval
-                                  AfterSeconds = after
-                                  Timezone = timezone
-                                  Catchup = catchup }
+                        match targetChatId with
+                        | None -> return Error "неизвестен chat_id"
+                        | Some targetChatId ->
+                            let! active = jobs.CountActiveForUser userId
 
-                            match ScheduleJobs.validate quota draft with
-                            | Error e -> return Error e
-                            | Ok _ ->
-                                let! job = jobs.Insert draft (Some toolCallId)
+                            if active >= quota.MaxJobsPerUser then
+                                return Error(sprintf "достигнут лимит заданий (%d)" quota.MaxJobsPerUser)
+                            else
+                                let draft =
+                                    { UserId = userId
+                                      ChatId = targetChatId
+                                      Prompt = prompt
+                                      CronExpr = cron
+                                      IntervalSeconds = interval
+                                      AfterSeconds = after
+                                      RunAt = runAt
+                                      Timezone = timezone
+                                      Catchup = catchup }
 
-                                match after with
-                                | Some _ ->
-                                    let timeText =
-                                        ScheduleJobs.nextRunAfter draft DateTimeOffset.UtcNow
-                                        |> Option.map (fun occ -> ScheduleJobs.formatOccurrences draft.Timezone [ occ ])
-                                        |> Option.defaultValue ""
+                                match ScheduleJobs.validateAt quota now draft with
+                                | Error e -> return Error e
+                                | Ok validDraft ->
+                                    let! job = jobs.Insert validDraft (Some toolCallId)
 
-                                    let text =
-                                        sprintf
-                                            "Задание #%d создано (сработает один раз, ожидает подтверждения).\nСработает примерно в %s\nСпроси у пользователя подтверждение."
-                                            job.Id
-                                            timeText
+                                    if validDraft.RunAt.IsSome || validDraft.AfterSeconds.IsSome then
+                                        let timeText =
+                                            ScheduleJobs.nextRunAfter validDraft now
+                                            |> Option.map (fun occ -> ScheduleJobs.formatOccurrences validDraft.Timezone [ occ ])
+                                            |> Option.defaultValue ""
 
-                                    return Ok text
-                                | None ->
-                                    let next5 =
-                                        ScheduleJobs.nextOccurrences
-                                            job.CronExpr
-                                            job.IntervalSeconds
-                                            job.Timezone
-                                            DateTimeOffset.UtcNow
-                                            5
+                                        let text =
+                                            sprintf
+                                                "Задание #%d создано (сработает один раз, ожидает подтверждения).\nСработает примерно в %s\nСпроси у пользователя подтверждение."
+                                                job.Id
+                                                timeText
 
-                                    let text =
-                                        sprintf
-                                            "Задание #%d создано (ожидает подтверждения). Ближайшие:\n%s\nСпроси у пользователя подтверждение."
-                                            job.Id
-                                            (ScheduleJobs.formatOccurrences job.Timezone next5)
+                                        return Ok text
+                                    else
+                                        let next5 =
+                                            ScheduleJobs.nextOccurrences
+                                                job.CronExpr
+                                                job.IntervalSeconds
+                                                job.Timezone
+                                                now
+                                                5
 
-                                    return Ok text
+                                        let text =
+                                            sprintf
+                                                "Задание #%d создано (ожидает подтверждения). Ближайшие:\n%s\nСпроси у пользователя подтверждение."
+                                                job.Id
+                                                (ScheduleJobs.formatOccurrences job.Timezone next5)
+
+                                        return Ok text
         }
 
     let scheduleConfirm (origin: Origin option) (args: JsonObject) : Task<Result<string, string>> =
@@ -302,10 +315,9 @@ type HostToolExecutor
                     let statusText =
                         let s = ScheduleJobs.statusToString job.Status
 
-                        if job.AfterSeconds.IsSome then s + " (разово)" else s
+                        if job.AfterSeconds.IsSome || job.RunAt.IsSome then s + " (разово)" else s
 
                     sprintf "#%d [%s] %s next: %s" job.Id statusText prompt next)
-
             return Ok(String.concat "\n" lines)
         }
 

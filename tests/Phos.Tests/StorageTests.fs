@@ -1317,6 +1317,7 @@ let private mkDraft (cron: string option) (interval: int option) (catchup: Catch
       CronExpr = cron
       IntervalSeconds = interval
       AfterSeconds = None
+      RunAt = None
       Timezone = "UTC"
       Catchup = catchup }
 
@@ -1410,6 +1411,21 @@ let ``migration 11 makes cron_expr nullable`` () =
 
     try
         withExecutor dbPath (fun exec -> task { columnNotNull exec "schedule_jobs" "cron_expr" |> should equal 0 })
+    finally
+        deleteDir dir
+
+[<Fact>]
+let ``migration 12 adds nullable run_at column`` () =
+    let dir = makeTempDir ()
+    let dbPath = Path.Combine(dir, "phos.db")
+
+    try
+        withExecutor dbPath (fun exec ->
+            task {
+                let cols = tableColumns exec "schedule_jobs"
+                cols |> List.contains "run_at" |> should be True
+                columnNotNull exec "schedule_jobs" "run_at" |> should equal 0
+            })
     finally
         deleteDir dir
 
@@ -1832,6 +1848,42 @@ let ``one-shot fires late after restart semantics`` () =
 
                 let! claim2 = repo.ClaimDueOccurrence(lateNow.AddSeconds 1.0)
                 claim2 |> should equal None
+                commandCount exec |> should equal 1
+            })
+    finally
+        deleteDir dir
+
+[<Fact>]
+let ``calendar run_at persists and completes exactly once`` () =
+    let dir = makeTempDir ()
+    let dbPath = Path.Combine(dir, "phos.db")
+
+    try
+        withExecutor dbPath (fun exec ->
+            task {
+                let repo = Repositories.scheduleJobRepository exec
+                let runAt = DateTimeOffset(2099, 10, 2, 7, 0, 0, TimeSpan.Zero)
+
+                let draft =
+                    { mkDraft None None SkipMissed with
+                        RunAt = Some runAt }
+
+                let! job = repo.Insert draft None
+                let! persisted = repo.GetById job.Id
+                persisted.Value.RunAt |> should equal (Some runAt)
+
+                do! repo.Confirm job.Id
+                let! confirmed = repo.GetById job.Id
+                confirmed.Value.NextRun |> should equal (Some runAt)
+
+                let! claim = repo.ClaimDueOccurrence(runAt.AddSeconds 1.0)
+                claim |> should not' (be None)
+
+                let! completed = repo.GetById job.Id
+                completed.Value.Status |> should equal ScheduleStatus.Completed
+
+                let! second = repo.ClaimDueOccurrence(runAt.AddSeconds 2.0)
+                second |> should equal None
                 commandCount exec |> should equal 1
             })
     finally

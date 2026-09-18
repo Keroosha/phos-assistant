@@ -242,6 +242,7 @@ type FakeScheduleRepo() =
                       CronExpr = draft.CronExpr
                       IntervalSeconds = draft.IntervalSeconds
                       AfterSeconds = draft.AfterSeconds
+                      RunAt = draft.RunAt
                       Timezone = draft.Timezone
                       Catchup = draft.Catchup
                       Status = ScheduleStatus.Pending
@@ -1178,8 +1179,49 @@ let ``workspace copies persona file when configured`` () =
             | Ok d -> d
             | Error e -> failwith e
 
-        File.ReadAllText(Path.Combine(wsDir, ".omp", "APPEND_SYSTEM.md"))
-        |> should equal "CUSTOM PERSONA"
+        let content = File.ReadAllText(Path.Combine(wsDir, ".omp", "APPEND_SYSTEM.md"))
+        content.StartsWith("CUSTOM PERSONA", StringComparison.Ordinal) |> should be True
+        content.Contains("PHOS_HOST_SCHEDULING_START", StringComparison.Ordinal) |> should be True
+        content.Contains("run_at", StringComparison.Ordinal) |> should be True
+    finally
+        deleteDir dir
+
+[<Fact>]
+let ``workspace ensure upserts scheduling block in existing persona`` () =
+    let dir = tempDir ()
+
+    try
+        let wsRoot = Path.Combine(dir, "ws")
+        let appendDir = Path.Combine(wsRoot, "9", ".omp")
+        Directory.CreateDirectory(appendDir) |> ignore
+        let appendPath = Path.Combine(appendDir, "APPEND_SYSTEM.md")
+        File.WriteAllText(appendPath, "CUSTOM PERSONA\n\nOld scheduling rules: use cron for dates.")
+
+        let ws = WorkspaceManager wsRoot
+
+        match ws.Ensure(UserId 9L) with
+        | Ok actual -> actual |> should equal (Path.Combine(wsRoot, "9"))
+        | Error e -> failwith e
+
+        let first = File.ReadAllText appendPath
+        first.Contains("CUSTOM PERSONA", StringComparison.Ordinal) |> should be True
+        first.Contains("Old scheduling rules", StringComparison.Ordinal) |> should be True
+        first.Contains("PHOS_HOST_SCHEDULING_START", StringComparison.Ordinal) |> should be True
+        first.Contains("supersede", StringComparison.OrdinalIgnoreCase) |> should be True
+        first.Contains("date", StringComparison.OrdinalIgnoreCase) |> should be True
+        first.Contains("run_at", StringComparison.Ordinal) |> should be True
+        first.Contains("timezone", StringComparison.OrdinalIgnoreCase) |> should be True
+        first.Contains("confirmation", StringComparison.OrdinalIgnoreCase) |> should be True
+
+        let marker = "<!-- PHOS_HOST_SCHEDULING_START -->"
+        first.IndexOf(marker, StringComparison.Ordinal)
+        |> should equal (first.LastIndexOf(marker, StringComparison.Ordinal))
+
+        match ws.Ensure(UserId 9L) with
+        | Ok actual -> actual |> should equal (Path.Combine(wsRoot, "9"))
+        | Error e -> failwith e
+        let second = File.ReadAllText appendPath
+        second |> should equal first
     finally
         deleteDir dir
 
@@ -3194,6 +3236,99 @@ let ``schedule_add with after_seconds creates one-shot pending job`` () =
     }
 
 [<Fact>]
+let ``schedule_add accepts future run_at and defaults timezone to host local`` () =
+    task {
+        let repo = FakeScheduleRepo()
+
+        let executor =
+            HostToolExecutor(
+                FakeTransport(),
+                FakeVoiceProcessor(Ok "hi"),
+                repo,
+                defaultQuota,
+                NullLogger<HostToolExecutor>.Instance
+            )
+
+        let frame = JsonObject()
+        frame["type"] <- "host_tool_call"
+        frame["id"] <- "host_calendar"
+        frame["toolCallId"] <- "toolu_calendar"
+        frame["toolName"] <- "schedule_add"
+        let args = JsonObject()
+        let value = "2099-10-02T09:00"
+        args["prompt"] <- "поздравить"
+        args["run_at"] <- value
+        frame["arguments"] <- (args :> JsonNode)
+
+        let! result = executor.TryExecute(UserId 1L, Some(ChatId 1L), Some Telegram, frame)
+
+        match result with
+        | Some r ->
+            Json.getBool "isError" r |> should equal None
+            Assert.Contains("один раз", hostToolResultText r)
+            Assert.Contains("Спроси у пользователя подтверждение", hostToolResultText r)
+        | None -> failwith "expected a result frame for calendar schedule_add"
+
+        let job = repo.Jobs.Head
+        job.Timezone |> should equal TimeZoneInfo.Local.Id
+
+        let expected =
+            match parseRunAt TimeZoneInfo.Local.Id value with
+            | Ok occurrence -> occurrence
+            | Error e -> failwithf "expected local parse to succeed: %s" e
+
+        job.RunAt |> should equal (Some expected)
+        job.Status |> should equal ScheduleStatus.Pending
+    }
+
+[<Fact>]
+let ``schedule_add rejects date-only past and mixed calendar modes`` () =
+    task {
+        let repo = FakeScheduleRepo()
+
+        let executor =
+            HostToolExecutor(
+                FakeTransport(),
+                FakeVoiceProcessor(Ok "hi"),
+                repo,
+                defaultQuota,
+                NullLogger<HostToolExecutor>.Instance
+            )
+
+        let call (toolCallId: string) (runAt: string) (addInterval: bool) =
+            let frame = JsonObject()
+            frame["type"] <- "host_tool_call"
+            frame["id"] <- "host_" + toolCallId
+            frame["toolCallId"] <- toolCallId
+            frame["toolName"] <- "schedule_add"
+            let args = JsonObject()
+            args["prompt"] <- "напомни"
+            args["run_at"] <- runAt
+
+            if addInterval then
+                args["interval_seconds"] <- 3600
+
+            frame["arguments"] <- (args :> JsonNode)
+            executor.TryExecute(UserId 1L, Some(ChatId 1L), Some Telegram, frame)
+
+        let! dateOnly = call "toolu_date_only" "2099-10-02" false
+        let! past = call "toolu_past" "2000-10-02T09:00" false
+        let! mixed = call "toolu_mixed" "2099-10-02T09:00" true
+
+        for result, expected in
+            [ dateOnly, "точное время"
+              past, "будущ"
+              mixed, "ровно один" ] do
+            match result with
+            | Some frame ->
+                Json.getBool "isError" frame |> should equal (Some true)
+                Assert.Contains(expected, hostToolResultText frame)
+            | None -> failwith "expected an error result frame"
+
+        repo.InsertCount |> should equal 0
+    }
+
+[<Fact>]
 let ``throwing host tool returns isError result frame`` () =
     task {
         let repo = FakeScheduleRepo()
@@ -3278,6 +3413,7 @@ let ``schedule_confirm requires user origin`` () =
               CronExpr = None
               IntervalSeconds = Some 3600
               AfterSeconds = None
+              RunAt = None
               Timezone = "UTC"
               Catchup = SkipMissed }
 
@@ -3343,6 +3479,7 @@ let ``schedule_list renders jobs`` () =
               CronExpr = None
               IntervalSeconds = Some 3600
               AfterSeconds = None
+              RunAt = None
               Timezone = "UTC"
               Catchup = SkipMissed }
 
@@ -3355,6 +3492,7 @@ let ``schedule_list renders jobs`` () =
               CronExpr = None
               IntervalSeconds = Some 3600
               AfterSeconds = None
+              RunAt = None
               Timezone = "UTC"
               Catchup = SkipMissed }
 
@@ -3400,6 +3538,7 @@ let ``schedule_list shows one-shot marker`` () =
               CronExpr = None
               IntervalSeconds = None
               AfterSeconds = Some 300
+              RunAt = None
               Timezone = "UTC"
               Catchup = SkipMissed }
 
@@ -3443,6 +3582,7 @@ let ``schedule_pause resume remove run_now transitions`` () =
               CronExpr = None
               IntervalSeconds = Some 3600
               AfterSeconds = None
+              RunAt = None
               Timezone = "UTC"
               Catchup = SkipMissed }
 
@@ -3498,6 +3638,7 @@ let ``schedule_add idempotent via toolCallId`` () =
               CronExpr = None
               IntervalSeconds = Some 3600
               AfterSeconds = None
+              RunAt = None
               Timezone = "UTC"
               Catchup = SkipMissed }
 
