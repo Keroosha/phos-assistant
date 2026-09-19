@@ -23,4 +23,6 @@ jobs:
       - name: Provision STT models
         run: bash scripts/provision-stt.sh
       - name: Run gates
-        run: bash scripts/ci.sh
+        run: |
+          export PATH="$HOME/.bun/bin:$PATH"
+          bash scripts/ci.sh
