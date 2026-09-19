@@ -61,7 +61,7 @@ type OmpWorker
             let chunks = EntitySend.chunkForSend text []
 
             for i, chunk in List.indexed chunks do
-                let! _ = outbox.Insert cmd.Id i cmd.Envelope.ChatId (Random.Shared.NextInt64()) chunk.Text []
+                let! _ = outbox.Insert(cmd.Id, i, cmd.Envelope.ChatId, Random.Shared.NextInt64(), chunk.Text, [])
                 ()
         }
 
@@ -122,10 +122,7 @@ type OmpWorker
                         // has already tried to hydrate once. Retyping every 4s
                         // must not produce a warning storm while the peer is
                         // unresolved — log at Debug only.
-                        logger.LogDebug(
-                            "peer for command {Id} not resolvable yet; typing skipped",
-                            cmdId
-                        )
+                        logger.LogDebug("peer for command {Id} not resolvable yet; typing skipped", cmdId)
                     | _ -> logger.LogWarning(ex, "set typing failed for command {Id}", cmdId)
             }
 
@@ -167,7 +164,15 @@ type OmpWorker
         task {
             let user = cmd.Envelope.UserId
 
+            logger.LogInformation(
+                "command {Id} processing (chat {ChatId}, user {UserId})",
+                cmd.Id,
+                cmd.Envelope.ChatId,
+                user
+            )
+
             if isStop cmd.Envelope.Payload then
+                logger.LogInformation("command {Id}: /stop handled", cmd.Id)
                 do! acknowledge cmd
                 do! sessions.Abort user
                 do! inbox.MarkStarted cmd.Id
@@ -177,6 +182,7 @@ type OmpWorker
 
                 match! sessions.Prompt(user, cmd) with
                 | Ok() ->
+                    logger.LogInformation("command {Id} accepted", cmd.Id)
                     do! acknowledge cmd
                     do! inbox.MarkStarted cmd.Id
                     startHeartbeat cmd.Id user cmd.Envelope.ChatId

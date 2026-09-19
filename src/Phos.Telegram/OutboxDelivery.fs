@@ -19,17 +19,11 @@ open Phos.Storage
 /// Deferred rows carry a not-before timestamp, so later chats use the same
 /// delivery loop instead of waiting behind an unresolved peer.
 type OutboxDelivery
-    (
-        outbox: IMessageOutbox,
-        transport: ITelegramTransport,
-        logger: ILogger,
-        ?missingPeerBackoff: TimeSpan
-    ) =
+    (outbox: IMessageOutbox, transport: ITelegramTransport, logger: ILogger, ?missingPeerBackoff: TimeSpan) =
     /// Backoff after a pass ended on a missing-peer deferral. Keeps the loop
     /// from spinning on a chat whose peer cannot be resolved (e.g. the bot has
     /// never interacted with it).
-    let missingPeerBackoff =
-        defaultArg missingPeerBackoff (TimeSpan.FromSeconds 30.0)
+    let missingPeerBackoff = defaultArg missingPeerBackoff (TimeSpan.FromSeconds 30.0)
 
     /// Delivers at most one pending outbox entry. Returns `true` if an entry was
     /// processed (sent, marked failed, or scheduled for a flood-wait retry).
@@ -45,44 +39,86 @@ type OutboxDelivery
                 // rows outside the same freshness window.
                 do! outbox.BeginSend entry.Id
 
-                let target =
-                    { ChatId = entry.ChatId
-                      RandomId = entry.RandomId
-                      Text = entry.Payload
-                      Entities = entry.Entities |> List.map EntitySend.toTelegramEntity }
+                match entry.Media with
+                | Some media ->
+                    let target =
+                        { ChatId = entry.ChatId
+                          RandomId = entry.RandomId
+                          Caption = entry.Payload
+                          Entities = entry.Entities |> List.map EntitySend.toTelegramEntity
+                          Media = media }
 
-                match! transport.SendMessage target with
-                | Ok result ->
-                    do! outbox.MarkSent entry.Id result.RemoteMessageId
-                    PhosLog.sentOutbox.Invoke(logger, entry.Id, entry.RandomId, null)
-                    return true
-                | Error(FloodWait seconds | SlowModeWait seconds) ->
-                    // Move out of 'sending' back to a retryable state;
-                    // the random_id is never changed, so a retry does
-                    // not create a second message.
-                    do! outbox.MarkFailed entry.Id
-                    do! outbox.Retry entry.Id
-                    PhosLog.floodWait.Invoke(logger, seconds, entry.Id, entry.RandomId, null)
-                    do! Task.Delay(TimeSpan.FromSeconds(float seconds), ct)
-                    return true
-                | Error(MissingPeer(chatId, reason)) ->
-                    // A restart empties the in-memory peer cache while outbox
-                    // rows survive. A login/cooldown miss is deferred without
-                    // consuming an attempt; a completed failed probe consumes
-                    // one bounded attempt before the same not-before delay.
-                    match reason with
-                    | MissingPeerReason.LoginNotReady ->
-                        do! outbox.Defer entry.Id (DateTimeOffset.UtcNow.Add missingPeerBackoff)
-                    | MissingPeerReason.HydrationFailed ->
+                    match! transport.SendMedia target with
+                    | Ok result ->
+                        do! outbox.MarkSent entry.Id result.RemoteMessageId
+                        PhosLog.sentOutbox.Invoke(logger, entry.Id, entry.RandomId, null)
+                        return true
+                    | Error(FloodWait seconds | SlowModeWait seconds) ->
+                        // Move out of 'sending' back to a retryable state;
+                        // the random_id is never changed, so a retry does
+                        // not create a second message.
                         do! outbox.MarkFailed entry.Id
-                        do! outbox.Defer entry.Id (DateTimeOffset.UtcNow.Add missingPeerBackoff)
+                        do! outbox.Retry entry.Id
+                        PhosLog.floodWait.Invoke(logger, seconds, entry.Id, entry.RandomId, null)
+                        do! Task.Delay(TimeSpan.FromSeconds(float seconds), ct)
+                        return true
+                    | Error(MissingPeer(chatId, reason)) ->
+                        // A restart empties the in-memory peer cache while outbox
+                        // rows survive. A login/cooldown miss is deferred without
+                        // consuming an attempt; a completed failed probe consumes
+                        // one bounded attempt before the same not-before delay.
+                        match reason with
+                        | MissingPeerReason.LoginNotReady ->
+                            do! outbox.Defer entry.Id (DateTimeOffset.UtcNow.Add missingPeerBackoff)
+                        | MissingPeerReason.HydrationFailed ->
+                            do! outbox.MarkFailed entry.Id
+                            do! outbox.Defer entry.Id (DateTimeOffset.UtcNow.Add missingPeerBackoff)
 
-                    PhosLog.peerMissing.Invoke(logger, entry.Id, chatId, null)
-                    return true
-                | Error(Other msg) ->
-                    do! outbox.MarkFailed entry.Id
-                    PhosLog.deliveryFailed.Invoke(logger, entry.Id, msg, null)
-                    return true
+                        PhosLog.peerMissing.Invoke(logger, entry.Id, chatId, null)
+                        return true
+                    | Error(Other msg) ->
+                        do! outbox.MarkFailed entry.Id
+                        PhosLog.deliveryFailed.Invoke(logger, entry.Id, msg, null)
+                        return true
+                | None ->
+                    let target =
+                        { ChatId = entry.ChatId
+                          RandomId = entry.RandomId
+                          Text = entry.Payload
+                          Entities = entry.Entities |> List.map EntitySend.toTelegramEntity }
+
+                    match! transport.SendMessage target with
+                    | Ok result ->
+                        do! outbox.MarkSent entry.Id result.RemoteMessageId
+                        PhosLog.sentOutbox.Invoke(logger, entry.Id, entry.RandomId, null)
+                        return true
+                    | Error(FloodWait seconds | SlowModeWait seconds) ->
+                        // Move out of 'sending' back to a retryable state;
+                        // the random_id is never changed, so a retry does
+                        // not create a second message.
+                        do! outbox.MarkFailed entry.Id
+                        do! outbox.Retry entry.Id
+                        PhosLog.floodWait.Invoke(logger, seconds, entry.Id, entry.RandomId, null)
+                        do! Task.Delay(TimeSpan.FromSeconds(float seconds), ct)
+                        return true
+                    | Error(MissingPeer(chatId, reason)) ->
+                        // A restart empties the in-memory peer cache while outbox
+                        // rows survive. A login/cooldown miss is deferred without
+                        // consuming an attempt; a completed failed probe consumes
+                        // one bounded attempt before the same not-before delay.
+                        match reason with
+                        | MissingPeerReason.LoginNotReady ->
+                            do! outbox.Defer entry.Id (DateTimeOffset.UtcNow.Add missingPeerBackoff)
+                        | MissingPeerReason.HydrationFailed ->
+                            do! outbox.MarkFailed entry.Id
+                            do! outbox.Defer entry.Id (DateTimeOffset.UtcNow.Add missingPeerBackoff)
+
+                        PhosLog.peerMissing.Invoke(logger, entry.Id, chatId, null)
+                        return true
+                    | Error(Other msg) ->
+                        do! outbox.MarkFailed entry.Id
+                        PhosLog.deliveryFailed.Invoke(logger, entry.Id, msg, null)
+                        return true
         }
 
     /// Runs the delivery loop until `ct` is cancelled. Each iteration is

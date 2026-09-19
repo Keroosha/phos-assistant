@@ -37,7 +37,7 @@ module TurnFinalization =
         task {
             let enqueueNotice (payload: string) (c: Command) : Task<unit> =
                 task {
-                    let! _ = outbox.Insert c.Id 0 c.Envelope.ChatId (Random.Shared.NextInt64()) payload []
+                    let! _ = outbox.Insert(c.Id, 0, c.Envelope.ChatId, Random.Shared.NextInt64(), payload, [])
                     return ()
                 }
 

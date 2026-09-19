@@ -6,8 +6,11 @@ open Phos.Core.DomainTypes
 open Phos.Core.Chunker
 open Phos.Telegram
 
-/// Per-session stream state for the pure event formatter.
-type StreamState = { Accumulated: string }
+/// Per-session stream state for the pure event formatter. `MediaCount` tracks
+/// how many `image_end` media envelopes were already emitted, so each media
+/// envelope gets a distinct negative chunk index (text chunks use 0, 1, ...).
+type StreamState =
+    { Accumulated: string; MediaCount: int }
 
 /// Context needed to build outbox envelopes from a session event.
 type FormatterContext = { CommandId: int64; ChatId: ChatId }
@@ -39,7 +42,7 @@ type TurnOutcome =
 /// the command is the caller's job (reaction), not a streamed message.
 module EventFormatter =
 
-    let initialState: StreamState = { Accumulated = "" }
+    let initialState: StreamState = { Accumulated = ""; MediaCount = 0 }
 
     let private envelope (ctx: FormatterContext) (index: int) (text: string) (entities: Entity list) : OutboxEnvelope =
         { CommandId = ctx.CommandId
@@ -47,7 +50,8 @@ module EventFormatter =
           ChatId = ctx.ChatId
           RandomId = Random.Shared.NextInt64()
           Payload = text
-          Entities = entities }
+          Entities = entities
+          Media = None }
 
     /// Classifies a terminal `agent_end` by inspecting its serialized
     /// assistant `messages`: the first assistant message with
@@ -113,6 +117,37 @@ module EventFormatter =
                         st <-
                             { st with
                                 Accumulated = st.Accumulated + delta }
+                | Some "image_end" ->
+                    // Assistant-generated image block: forward it as a photo
+                    // media envelope with a distinct negative chunk index so
+                    // it can never collide with text chunk indices.
+                    match Json.getObject "content" ev with
+                    | Some c ->
+                        match Json.getString "type" c, Json.getString "data" c, Json.getString "mimeType" c with
+                        | Some "image", Some data, Some mime ->
+                            let media =
+                                { Kind = MediaKind.Photo
+                                  MimeType = mime
+                                  DataBase64 = data }
+
+                            let index = -(st.MediaCount + 1)
+
+                            let mediaEnvelope =
+                                { CommandId = ctx.CommandId
+                                  ChunkIndex = index
+                                  ChatId = ctx.ChatId
+                                  RandomId = Random.Shared.NextInt64()
+                                  Payload = ""
+                                  Entities = []
+                                  Media = Some media }
+
+                            st <-
+                                { st with
+                                    MediaCount = st.MediaCount + 1 }
+
+                            envelopes <- mediaEnvelope :: envelopes
+                        | _ -> ()
+                    | None -> ()
                 | _ -> ()
             | None -> ()
         | Some "agent_end" ->

@@ -19,6 +19,7 @@ module WtLog =
             LanguagePrimitives.EnumOfValue<int, LogLevel> level
         else
             LogLevel.Information
+
     /// Downgrades the recoverable clock-resync notifications emitted by
     /// WTelegram plus the expected wrong-kind RPC responses from peer probes.
     /// WTelegram itself resets the message-id clock offset for BadMsg 16/17;
