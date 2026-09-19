@@ -412,7 +412,7 @@ let ``resolveLocal picks standard offset for ambiguous fall-back time`` () =
     match resolveLocal berlinTz (DateTime(2026, 10, 25, 2, 30, 0)) with
     | Some dto ->
         dto.Offset |> should equal (TimeSpan.FromHours 1.0)
-        dto.LocalDateTime |> should equal (DateTime(2026, 10, 25, 2, 30, 0))
+        dto.DateTime |> should equal (DateTime(2026, 10, 25, 2, 30, 0))
     | None -> failwithf "expected a resolved offset for fall-back %O" (DateTime(2026, 10, 25, 2, 30, 0))
 
 [<Fact>]
@@ -480,7 +480,7 @@ let ``nextOccurrences handles DST spring-forward shift`` () =
     let after = DateTimeOffset(2026, 3, 28, 0, 0, 0, TimeSpan.Zero)
     let occs = nextOccurrences cron berlinTz after 2
     occs |> List.length |> should equal 2
-    occs.[1].LocalDateTime |> should equal (DateTime(2026, 3, 29, 3, 0, 0))
+    occs.[1].DateTime |> should equal (DateTime(2026, 3, 29, 3, 0, 0))
     occs.[1].Offset |> should equal (TimeSpan.FromHours 2.0)
 
 // ---------------------------------------------------------------------------
@@ -1002,7 +1002,7 @@ let ``nextOccurrences is deterministic on DST fall-back`` () =
 
     match Sj.nextOccurrences (Some "30 2 * * *") None "Europe/Berlin" after 1 with
     | [ occ ] ->
-        occ.LocalDateTime |> should equal (DateTime(2026, 10, 25, 2, 30, 0))
+        occ.DateTime |> should equal (DateTime(2026, 10, 25, 2, 30, 0))
         let offsets = [ TimeSpan.FromHours 1.0; TimeSpan.FromHours 2.0 ]
         offsets |> should contain occ.Offset
     | _ ->
