@@ -673,7 +673,9 @@ let ``reassembler rejects corrupted byteLength`` () =
     chunk0["chunkId"] <- "rpc-1"
     chunk0["index"] <- 0
     chunk0["count"] <- 2
-    chunk0["byteLength"] <- 5
+    // byteLength is the FULL frame size; the declared total (6) is smaller
+    // than the actual payload sum (10), so the sequence must be rejected.
+    chunk0["byteLength"] <- 6
     chunk0["data"] <- Convert.ToBase64String(Encoding.UTF8.GetBytes "hello")
 
     match r.TryAdd chunk0 with
@@ -684,7 +686,7 @@ let ``reassembler rejects corrupted byteLength`` () =
     chunk1["chunkId"] <- "rpc-1"
     chunk1["index"] <- 1
     chunk1["count"] <- 2
-    chunk1["byteLength"] <- 10
+    chunk1["byteLength"] <- 6
     chunk1["data"] <- Convert.ToBase64String(Encoding.UTF8.GetBytes "world")
 
     match r.TryAdd chunk1 with
@@ -2989,6 +2991,37 @@ let ``reassembler completes single chunk and reports bytes`` () =
     }
 
 [<Fact>]
+let ``reassembler treats byteLength as the total frame size`` () =
+    task {
+        // Mirrors omp's RpcFrameEncoder: byteLength is the FULL reassembled
+        // frame size declared identically in every chunk; chunk payloads are
+        // up to 256 KiB; count = ceil(size / 256 KiB).
+        let payload = String.replicate 300_000 "ab"
+        let json = sprintf """{"type":"message_update","value":"%s"}""" payload
+        let bytes = Encoding.UTF8.GetBytes json
+        let cnt = (bytes.Length + 262_143) / 262_144
+        let r = RpcChunkReassembler(1_000_000L)
+        let mutable result = None
+
+        for i in 0 .. cnt - 1 do
+            let start = i * 262_144
+            let len = min 262_144 (bytes.Length - start)
+            let slice = bytes.[start .. start + len - 1]
+
+            let frame =
+                chunkFrame "c1" i cnt (int64 bytes.Length) (Convert.ToBase64String slice)
+
+            match r.TryAdd frame with
+            | Ok None -> ()
+            | Ok(Some obj) -> result <- Some obj
+            | Error e -> failwithf "unexpected error: %s" e
+
+        match result with
+        | Some obj -> Json.getString "value" obj |> should equal (Some payload)
+        | None -> failwith "expected reassembly completion"
+    }
+
+[<Fact>]
 let ``reassembler rejects frames missing required fields`` () =
     task {
         let r = RpcChunkReassembler(10000L)
@@ -3076,8 +3109,9 @@ let ``reassembler reassembles a two chunk sequence`` () =
         let second = bytes.[half..]
         let r = RpcChunkReassembler(10000L)
 
-        let f1 = chunkFrame "seq" 0 2 (int64 first.Length) (Convert.ToBase64String first)
-        let f2 = chunkFrame "seq" 1 2 (int64 second.Length) (Convert.ToBase64String second)
+        // byteLength is the FULL frame size, identical in every chunk.
+        let f1 = chunkFrame "seq" 0 2 (int64 bytes.Length) (Convert.ToBase64String first)
+        let f2 = chunkFrame "seq" 1 2 (int64 bytes.Length) (Convert.ToBase64String second)
 
         match r.TryAdd f1 with
         | Ok None -> ()

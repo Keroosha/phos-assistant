@@ -54,6 +54,9 @@ function respondViaChunks(id: string, command: string, data: unknown, chunkCount
   const bytes = Buffer.from(json, "utf8");
   const chunkSize = Math.max(1, Math.ceil(bytes.length / chunkCount));
   const chunkId = "rpc-" + id;
+  // Mirrors omp's RpcFrameEncoder: byteLength is the FULL reassembled frame
+  // size, identical in every chunk of the sequence.
+  const byteLength = bytes.length;
   for (let i = 0; i < chunkCount; i++) {
     const slice = bytes.subarray(i * chunkSize, Math.min((i + 1) * chunkSize, bytes.length));
     writeFrame({
@@ -61,7 +64,7 @@ function respondViaChunks(id: string, command: string, data: unknown, chunkCount
       chunkId,
       index: i,
       count: chunkCount,
-      byteLength: slice.length,
+      byteLength,
       data: slice.toString("base64"),
     });
   }
@@ -72,16 +75,17 @@ function respondCorruptChunk(id: string, command: string, data: unknown): void {
   const bytes = Buffer.from(json, "utf8");
   const chunkSize = Math.max(1, Math.ceil(bytes.length / 2));
   const chunkId = "rpc-corrupt-" + id;
+  // Declares a total one byte larger than the payload actually sums to; the
+  // reassembler must reject the sequence at completion.
+  const byteLength = bytes.length + 1;
   for (let i = 0; i < 2; i++) {
     const slice = bytes.subarray(i * chunkSize, Math.min((i + 1) * chunkSize, bytes.length));
-    // Second chunk declares a byteLength one larger than it actually carries.
-    const declared = i === 1 ? slice.length + 1 : slice.length;
     writeFrame({
       type: "rpc_chunk",
       chunkId,
       index: i,
       count: 2,
-      byteLength: declared,
+      byteLength,
       data: slice.toString("base64"),
     });
   }

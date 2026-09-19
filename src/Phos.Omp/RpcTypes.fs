@@ -156,11 +156,15 @@ module RpcProtocol =
 
 /// Reassembles a lossless protocol-v2 object split across `rpc_chunk` frames.
 ///
-/// Validation rules (from `omp://rpc.md`): a sequence is keyed by `chunkId` and
-/// must arrive uninterrupted; `index` must be strictly sequential from 0;
-/// `count` and `byteLength` must match the decoded bytes; the reassembled total
-/// must stay under the advertised ceiling; the concatenated bytes must decode as
-/// strict UTF-8 and parse as a single JSON object.
+/// Validation rules (matching omp's `RpcFrameDecoder` in rpc-frame.ts): a
+/// sequence is keyed by `chunkId` and must arrive uninterrupted; `index` must
+/// be strictly sequential from 0; `count` stays constant; `byteLength` is the
+/// FULL reassembled frame size (not the per-chunk payload); each chunk payload
+/// is at most 256 KiB; the cumulative payload must equal `byteLength` at the
+/// end; the reassembled total must stay under the advertised ceiling; the
+/// concatenated bytes must decode as strict UTF-8 and parse as a single JSON
+/// object. Any failure clears partial state so one bad sequence cannot poison
+/// later ones.
 type RpcChunkReassembler(maxReassembledBytes: int64) =
 
     let mutable activeChunkId: string option = None
@@ -169,12 +173,20 @@ type RpcChunkReassembler(maxReassembledBytes: int64) =
     let mutable totalBytes = 0L
     let chunks = ResizeArray<byte[]>()
 
+    /// Protocol-v2 chunk payload ceiling, mirrors `RPC_CHUNK_PAYLOAD_BYTES`.
+    let rpcChunkPayloadBytes = 262_144
+
     let reset () =
         activeChunkId <- None
         expectedCount <- 0
         received <- 0
         totalBytes <- 0L
         chunks.Clear()
+
+    /// Rejects the current sequence and clears partial state.
+    let fail (msg: string) : Result<'A, string> =
+        reset ()
+        Error msg
 
     let strictUtf8 (bytes: byte[]) : Result<string, string> =
         try
@@ -201,24 +213,33 @@ type RpcChunkReassembler(maxReassembledBytes: int64) =
         match cid, idx, cnt, byteLen, data with
         | Some cid, Some idx, Some cnt, Some byteLen, Some data ->
             if idx < 0 || cnt <= 0 || idx >= cnt then
-                Error(sprintf "invalid rpc_chunk index/count: %d/%d" idx cnt)
+                fail (sprintf "invalid rpc_chunk index/count: %d/%d" idx cnt)
             else
                 match activeChunkId with
                 | Some active when active <> cid ->
-                    Error(sprintf "interleaved rpc_chunk sequence: %s then %s" active cid)
+                    fail (sprintf "interleaved rpc_chunk sequence: %s then %s" active cid)
                 | Some _ ->
-                    if idx <> received then
-                        Error(sprintf "out-of-order rpc_chunk: expected index %d, got %d" received idx)
+                    if cnt <> expectedCount then
+                        fail (sprintf "rpc_chunk count changed mid-sequence: %d then %d" expectedCount cnt)
+                    elif idx <> received then
+                        fail (sprintf "out-of-order rpc_chunk: expected index %d, got %d" received idx)
                     else
                         let bytes = Convert.FromBase64String data
 
-                        if bytes.Length <> int byteLen then
-                            Error(sprintf "rpc_chunk byteLength mismatch: declared %d, actual %d" byteLen bytes.Length)
+                        if bytes.Length > rpcChunkPayloadBytes then
+                            fail (
+                                sprintf
+                                    "rpc_chunk payload exceeds the transport limit: %d > %d"
+                                    bytes.Length
+                                    rpcChunkPayloadBytes
+                            )
                         else
-                            totalBytes <- totalBytes + byteLen
+                            totalBytes <- totalBytes + int64 bytes.Length
 
-                            if totalBytes > maxReassembledBytes then
-                                Error(
+                            if totalBytes > byteLen then
+                                fail (sprintf "rpc_chunk sequence exceeds declared length: %d > %d" totalBytes byteLen)
+                            elif totalBytes > maxReassembledBytes then
+                                fail (
                                     sprintf "rpc_chunk reassembly exceeds limit: %d > %d" totalBytes maxReassembledBytes
                                 )
                             else
@@ -226,10 +247,18 @@ type RpcChunkReassembler(maxReassembledBytes: int64) =
                                 received <- received + 1
 
                                 if received = cnt then
-                                    let all = chunks |> Seq.toArray |> Array.concat
-                                    let result = parseReassembled all
-                                    reset ()
-                                    result |> Result.map Some
+                                    if totalBytes <> byteLen then
+                                        fail (
+                                            sprintf
+                                                "rpc_chunk sequence length mismatch: declared %d, actual %d"
+                                                byteLen
+                                                totalBytes
+                                        )
+                                    else
+                                        let all = chunks |> Seq.toArray |> Array.concat
+                                        let result = parseReassembled all
+                                        reset ()
+                                        result |> Result.map Some
                                 else
                                     Ok None
                 | None ->
@@ -237,17 +266,24 @@ type RpcChunkReassembler(maxReassembledBytes: int64) =
                     expectedCount <- cnt
 
                     if idx <> 0 then
-                        Error(sprintf "out-of-order rpc_chunk: expected index 0, got %d" idx)
+                        fail (sprintf "out-of-order rpc_chunk: expected index 0, got %d" idx)
                     else
                         let bytes = Convert.FromBase64String data
 
-                        if bytes.Length <> int byteLen then
-                            Error(sprintf "rpc_chunk byteLength mismatch: declared %d, actual %d" byteLen bytes.Length)
+                        if bytes.Length > rpcChunkPayloadBytes then
+                            fail (
+                                sprintf
+                                    "rpc_chunk payload exceeds the transport limit: %d > %d"
+                                    bytes.Length
+                                    rpcChunkPayloadBytes
+                            )
                         else
-                            totalBytes <- byteLen
+                            totalBytes <- int64 bytes.Length
 
-                            if totalBytes > maxReassembledBytes then
-                                Error(
+                            if totalBytes > byteLen then
+                                fail (sprintf "rpc_chunk sequence exceeds declared length: %d > %d" totalBytes byteLen)
+                            elif totalBytes > maxReassembledBytes then
+                                fail (
                                     sprintf "rpc_chunk reassembly exceeds limit: %d > %d" totalBytes maxReassembledBytes
                                 )
                             else
@@ -255,10 +291,18 @@ type RpcChunkReassembler(maxReassembledBytes: int64) =
                                 received <- 1
 
                                 if received = cnt then
-                                    let all = chunks |> Seq.toArray |> Array.concat
-                                    let result = parseReassembled all
-                                    reset ()
-                                    result |> Result.map Some
+                                    if totalBytes <> byteLen then
+                                        fail (
+                                            sprintf
+                                                "rpc_chunk sequence length mismatch: declared %d, actual %d"
+                                                byteLen
+                                                totalBytes
+                                        )
+                                    else
+                                        let all = chunks |> Seq.toArray |> Array.concat
+                                        let result = parseReassembled all
+                                        reset ()
+                                        result |> Result.map Some
                                 else
                                     Ok None
         | _ -> Error "rpc_chunk frame missing chunkId/index/count/byteLength/data"
