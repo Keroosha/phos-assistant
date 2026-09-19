@@ -13,8 +13,8 @@
     <Compile Include="EntitySend.fs" />
     <Compile Include="Markdown.fs" />
     <Compile Include="VoiceProcessor.fs" />
-    <Compile Include="UpdateHandler.fs" />
     <Compile Include="PhosLog.fs" />
+    <Compile Include="UpdateHandler.fs" />
     <Compile Include="WtLog.fs" />
     <Compile Include="OutboxDelivery.fs" />
   </ItemGroup>

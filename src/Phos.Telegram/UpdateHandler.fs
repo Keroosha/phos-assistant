@@ -2,6 +2,8 @@ namespace Phos.Telegram
 
 open System
 open System.Threading.Tasks
+open Microsoft.Extensions.Logging
+open Microsoft.Extensions.Logging.Abstractions
 open Phos.Core.DomainTypes
 open Phos.Core.Whitelist
 open Phos.Storage
@@ -42,8 +44,18 @@ type UpdateHandler
         admit: CommandEnvelope -> Task<AdmitOutcome>,
         enqueueOutbox: OutboxEnvelope -> Task<unit>,
         voice: IVoiceProcessor,
-        transport: ITelegramTransport
+        transport: ITelegramTransport,
+        ?logger: ILogger
     ) =
+
+    let logger = defaultArg logger NullLogger.Instance
+
+    /// Short human-readable kind of an incoming update, for lifecycle logs.
+    let updateKind (update: IncomingUpdate) : string =
+        if update.IsSticker then "sticker"
+        elif update.Photo.IsSome then "photo"
+        elif update.Voice.IsSome then "voice"
+        else "text"
 
     /// Chunks a reply and enqueues each chunk to the outbox with a fresh,
     /// stable random_id.
@@ -121,11 +133,19 @@ type UpdateHandler
 
     member _.HandleAsync(update: IncomingUpdate) : Task<HandleResult> =
         task {
+            let (UserId userId) = update.From.Id
+            let (ChatId chatId) = update.Chat.Id
+
+            PhosLog.updateReceived.Invoke(logger, update.UpdateId, updateKind update, userId, chatId, null)
+
             if not (dedupe.TryAdd update.UpdateId) then
+                logger.LogDebug("duplicate update {UpdateId} dropped", update.UpdateId)
                 return Duplicate
             else
                 match authorize whitelist update.From update.Chat with
-                | Deny reason -> return Denied reason
+                | Deny reason ->
+                    PhosLog.updateDenied.Invoke(logger, update.UpdateId, sprintf "%A" reason, null)
+                    return Denied reason
                 | Allow _ ->
                     if update.IsSticker then
                         // A sticker is feedback-only: react with 👀 and never
@@ -169,9 +189,14 @@ type UpdateHandler
                             let! outcome = admit envelope
 
                             match outcome with
-                            | Admitted _ -> return Accepted
-                            | Failed -> return AdmitFailed
+                            | Admitted commandId ->
+                                PhosLog.commandAdmitted.Invoke(logger, commandId, chatId, null)
+                                return Accepted
+                            | Failed ->
+                                PhosLog.admitFailed.Invoke(logger, update.UpdateId, chatId, null)
+                                return AdmitFailed
                         | None ->
+                            PhosLog.photoDownloadFailed.Invoke(logger, update.UpdateId, null)
                             do! enqueueReply update.UpdateId update.Chat "⚠️ не удалось скачать фото"
                             return Accepted
                     else
@@ -198,8 +223,12 @@ type UpdateHandler
                                 let! outcome = admit envelope
 
                                 match outcome with
-                                | Admitted _ -> return Accepted
-                                | Failed -> return AdmitFailed
+                                | Admitted commandId ->
+                                    PhosLog.commandAdmitted.Invoke(logger, commandId, chatId, null)
+                                    return Accepted
+                                | Failed ->
+                                    PhosLog.admitFailed.Invoke(logger, update.UpdateId, chatId, null)
+                                    return AdmitFailed
                             | Error msg ->
                                 do! enqueueReply update.UpdateId update.Chat ("⚠️ " + msg)
                                 return Accepted
@@ -221,6 +250,10 @@ type UpdateHandler
                             let! outcome = admit envelope
 
                             match outcome with
-                            | Admitted _ -> return Accepted
-                            | Failed -> return AdmitFailed
+                            | Admitted commandId ->
+                                PhosLog.commandAdmitted.Invoke(logger, commandId, chatId, null)
+                                return Accepted
+                            | Failed ->
+                                PhosLog.admitFailed.Invoke(logger, update.UpdateId, chatId, null)
+                                return AdmitFailed
         }
