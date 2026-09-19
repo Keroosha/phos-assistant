@@ -420,11 +420,13 @@ type SessionManager
                         return Error "queue full"
                     else
                         rt.Queue.Add command
+
                         logger.LogInformation(
                             "command {Id} queued (session busy, {Count} waiting)",
                             command.Id,
                             rt.Queue.Count
                         )
+
                         rt.LastActivity <- now ()
                         return Ok()
                 else

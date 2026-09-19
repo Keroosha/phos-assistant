@@ -12,6 +12,8 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           global-json-file: global.json
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - name: Install omp (pinned)
         run: |
           curl -fsSL https://bun.sh/install | bash
