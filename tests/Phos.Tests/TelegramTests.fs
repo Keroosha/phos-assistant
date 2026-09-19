@@ -959,8 +959,10 @@ let ``missing peer defers without consuming attempts and resumes when due`` () =
                     exec.WriteAsync(fun conn ->
                         use cmd = conn.CreateCommand()
                         cmd.CommandText <- "UPDATE message_outbox SET updated_at = $t WHERE random_id = $randomId"
+
                         cmd.Parameters.AddWithValue("$t", DateTimeOffset.UtcNow.ToUnixTimeSeconds() - 1L)
                         |> ignore
+
                         cmd.Parameters.AddWithValue("$randomId", 999L) |> ignore
                         cmd.ExecuteNonQuery())
 
@@ -1027,7 +1029,7 @@ let ``failed peer probes consume a bounded retry budget`` () =
                 transport.MissingPeerNext 99
                 let delivery = OutboxDelivery(outbox, transport, NullLogger.Instance, TimeSpan.Zero)
 
-                for _ in 1 .. 6 do
+                for _ in 1..6 do
                     let! _ = delivery.DeliverOnceAsync(CancellationToken.None)
                     ()
 
@@ -1809,8 +1811,7 @@ let ``collectChannels collects channels and skips basic groups`` () =
     let group = TL.Chat()
     group.id <- 7L
 
-    let chats =
-        System.Collections.Generic.Dictionary<int64, TL.ChatBase>()
+    let chats = System.Collections.Generic.Dictionary<int64, TL.ChatBase>()
 
     chats.[1001234567890L] <- ch
     chats.[7L] <- group
@@ -1837,8 +1838,7 @@ let ``collectBasicChats collects inputPeerChat for every returned group`` () =
     let forbidden = TL.ChatForbidden()
     forbidden.id <- 8L
 
-    let chats =
-        System.Collections.Generic.Dictionary<int64, TL.ChatBase>()
+    let chats = System.Collections.Generic.Dictionary<int64, TL.ChatBase>()
 
     chats.[7L] <- group
     chats.[8L] <- forbidden
@@ -1850,11 +1850,11 @@ let ``collectBasicChats collects inputPeerChat for every returned group`` () =
 
     match candidates.TryGetValue 7L with
     | true, (:? TL.InputPeerChat as p) -> p.chat_id |> should equal 7L
-    | _ -> failwith "expected InputPeerChat candidate"
+    | _ -> failwith "expected InputPeerChat candidate for valid group"
 
     match candidates.TryGetValue 8L with
     | true, (:? TL.InputPeerChat as p) -> p.chat_id |> should equal 8L
-    | _ -> failwith "expected InputPeerChat candidate"
+    | _ -> failwith "expected InputPeerChat candidate for forbidden chat"
 
 [<Fact>]
 let ``cachePeers populates user and channel peers from updates`` () =
