@@ -182,7 +182,7 @@ type OmpWorker
 
                 match! sessions.Prompt(user, cmd) with
                 | Ok() ->
-                    logger.LogInformation("command {Id} accepted: prompt sent to OMP", cmd.Id)
+                    logger.LogInformation("command {Id} accepted", cmd.Id)
                     do! acknowledge cmd
                     do! inbox.MarkStarted cmd.Id
                     startHeartbeat cmd.Id user cmd.Envelope.ChatId

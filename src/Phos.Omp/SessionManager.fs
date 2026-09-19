@@ -134,7 +134,9 @@ type SessionManager
                 let! result = client.PromptAsync(message, id = promptIdOf command, images = command.Envelope.Images)
 
                 match result with
-                | Ok _ -> return Ok()
+                | Ok _ ->
+                    logger.LogInformation("command {Id}: prompt sent to OMP", command.Id)
+                    return Ok()
                 | Error e ->
                     logger.LogWarning("omp prompt rejected for command {Id}: {Error}", command.Id, e.Message)
                     rt.Busy <- false
@@ -418,6 +420,11 @@ type SessionManager
                         return Error "queue full"
                     else
                         rt.Queue.Add command
+                        logger.LogInformation(
+                            "command {Id} queued (session busy, {Count} waiting)",
+                            command.Id,
+                            rt.Queue.Count
+                        )
                         rt.LastActivity <- now ()
                         return Ok()
                 else
