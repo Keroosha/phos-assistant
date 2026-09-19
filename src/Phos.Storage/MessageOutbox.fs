@@ -220,12 +220,11 @@ type MessageOutbox(exec: StorageExecutor) =
                     LIMIT 1;
                 """
                         selectColumns
+
                 cmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToUnixTimeSeconds())
                 |> ignore
-                cmd.Parameters.AddWithValue(
-                    "$sendingStaleBefore",
-                    DateTimeOffset.UtcNow.ToUnixTimeSeconds() - 10L
-                )
+
+                cmd.Parameters.AddWithValue("$sendingStaleBefore", DateTimeOffset.UtcNow.ToUnixTimeSeconds() - 10L)
                 |> ignore
 
                 use reader = cmd.ExecuteReader()
@@ -249,10 +248,8 @@ type MessageOutbox(exec: StorageExecutor) =
 
                 cmd.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToUnixTimeSeconds())
                 |> ignore
-                cmd.Parameters.AddWithValue(
-                    "$sendingStaleBefore",
-                    DateTimeOffset.UtcNow.ToUnixTimeSeconds() - 10L
-                )
+
+                cmd.Parameters.AddWithValue("$sendingStaleBefore", DateTimeOffset.UtcNow.ToUnixTimeSeconds() - 10L)
                 |> ignore
 
                 cmd.ExecuteNonQuery() |> ignore
@@ -303,7 +300,8 @@ type MessageOutbox(exec: StorageExecutor) =
 
                 cmd.ExecuteNonQuery() |> ignore
                 ())
-        member _.Defer(id: int64) (availableAt: DateTimeOffset) =
+
+        member _.Defer (id: int64) (availableAt: DateTimeOffset) =
             exec.WriteAsync(fun conn ->
                 use cmd = conn.CreateCommand()
 
@@ -311,8 +309,7 @@ type MessageOutbox(exec: StorageExecutor) =
                     "UPDATE message_outbox SET status = 'pending', updated_at = $availableAt WHERE id = $id AND (status = 'sending' OR (status = 'failed' AND attempts < max_attempts));"
 
                 cmd.Parameters.AddWithValue("$id", id) |> ignore
-                cmd.Parameters.AddWithValue("$availableAt", toUnix availableAt)
-                |> ignore
+                cmd.Parameters.AddWithValue("$availableAt", toUnix availableAt) |> ignore
 
                 cmd.ExecuteNonQuery() |> ignore
                 ())

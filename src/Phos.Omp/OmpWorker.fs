@@ -122,10 +122,7 @@ type OmpWorker
                         // has already tried to hydrate once. Retyping every 4s
                         // must not produce a warning storm while the peer is
                         // unresolved — log at Debug only.
-                        logger.LogDebug(
-                            "peer for command {Id} not resolvable yet; typing skipped",
-                            cmdId
-                        )
+                        logger.LogDebug("peer for command {Id} not resolvable yet; typing skipped", cmdId)
                     | _ -> logger.LogWarning(ex, "set typing failed for command {Id}", cmdId)
             }
 

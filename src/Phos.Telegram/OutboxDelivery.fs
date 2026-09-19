@@ -19,17 +19,11 @@ open Phos.Storage
 /// Deferred rows carry a not-before timestamp, so later chats use the same
 /// delivery loop instead of waiting behind an unresolved peer.
 type OutboxDelivery
-    (
-        outbox: IMessageOutbox,
-        transport: ITelegramTransport,
-        logger: ILogger,
-        ?missingPeerBackoff: TimeSpan
-    ) =
+    (outbox: IMessageOutbox, transport: ITelegramTransport, logger: ILogger, ?missingPeerBackoff: TimeSpan) =
     /// Backoff after a pass ended on a missing-peer deferral. Keeps the loop
     /// from spinning on a chat whose peer cannot be resolved (e.g. the bot has
     /// never interacted with it).
-    let missingPeerBackoff =
-        defaultArg missingPeerBackoff (TimeSpan.FromSeconds 30.0)
+    let missingPeerBackoff = defaultArg missingPeerBackoff (TimeSpan.FromSeconds 30.0)
 
     /// Delivers at most one pending outbox entry. Returns `true` if an entry was
     /// processed (sent, marked failed, or scheduled for a flood-wait retry).

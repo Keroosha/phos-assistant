@@ -374,8 +374,7 @@ module Transport =
         : unit =
         for kv in chats do
             match kv.Value with
-            | :? TL.Channel as ch ->
-                candidates.[ch.id] <- (TL.InputPeerChannel(ch.id, ch.access_hash) :> TL.InputPeer)
+            | :? TL.Channel as ch -> candidates.[ch.id] <- (TL.InputPeerChannel(ch.id, ch.access_hash) :> TL.InputPeer)
             | _ -> ()
 
     /// Builds the `users.getUsers` request with zero access hashes.
