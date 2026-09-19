@@ -153,6 +153,8 @@ type SessionManager
     /// (no silent retry) instead of blocking the queue forever.
     let rec finalizeTurn (rt: UserRuntime) (command: Command) (outcome: TurnOutcome) : Task<unit> =
         task {
+            logger.LogInformation("command {Id}: turn ended ({Outcome})", command.Id, sprintf "%A" outcome)
+
             rt.Busy <- false
             rt.CurrentCommand <- None
             rt.PendingPromptId <- None
@@ -275,10 +277,20 @@ type SessionManager
                         rt.StreamState <- st
 
                         for e in envelopes do
+                            logger.LogInformation(
+                                "command {CommandId} chunk {ChunkIndex} queued (chat {ChatId}, {Chars} chars)",
+                                e.CommandId,
+                                e.ChunkIndex,
+                                e.ChatId,
+                                e.Payload.Length
+                            )
+
                             do! enqueueOutbox e
 
                         match Json.getString "type" frame with
-                        | Some "agent_start" -> rt.Busy <- true
+                        | Some "agent_start" ->
+                            logger.LogInformation("command {Id}: agent turn started", cmd.Id)
+                            rt.Busy <- true
                         | Some "agent_end" ->
                             // `outcome` is `Some` only for a terminal
                             // `agent_end`. A non-terminal `agent_end` means

@@ -164,7 +164,15 @@ type OmpWorker
         task {
             let user = cmd.Envelope.UserId
 
+            logger.LogInformation(
+                "command {Id} processing (chat {ChatId}, user {UserId})",
+                cmd.Id,
+                cmd.Envelope.ChatId,
+                user
+            )
+
             if isStop cmd.Envelope.Payload then
+                logger.LogInformation("command {Id}: /stop handled", cmd.Id)
                 do! acknowledge cmd
                 do! sessions.Abort user
                 do! inbox.MarkStarted cmd.Id
@@ -174,6 +182,7 @@ type OmpWorker
 
                 match! sessions.Prompt(user, cmd) with
                 | Ok() ->
+                    logger.LogInformation("command {Id} accepted: prompt sent to OMP", cmd.Id)
                     do! acknowledge cmd
                     do! inbox.MarkStarted cmd.Id
                     startHeartbeat cmd.Id user cmd.Envelope.ChatId

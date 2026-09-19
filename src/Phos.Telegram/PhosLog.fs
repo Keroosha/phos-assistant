@@ -50,3 +50,43 @@ module PhosLog =
             EventId(4, "PeerMissing"),
             "Outbox {OutboxId} deferred: peer for chat {ChatId} not resolvable yet"
         )
+
+    /// Event id 5 — an incoming Telegram update reached the handler.
+    let updateReceived: Action<ILogger, int64, string, int64, int64, Exception | null> =
+        LoggerMessage.Define<int64, string, int64, int64>(
+            LogLevel.Information,
+            EventId(5, "UpdateReceived"),
+            "Update {UpdateId} received: {Kind} from user {UserId} in chat {ChatId}"
+        )
+
+    /// Event id 6 — an update was admitted as a durable command.
+    let commandAdmitted: Action<ILogger, int64, int64, Exception | null> =
+        LoggerMessage.Define<int64, int64>(
+            LogLevel.Information,
+            EventId(6, "CommandAdmitted"),
+            "Command {CommandId} admitted (chat {ChatId})"
+        )
+
+    /// Event id 7 — admitting a command into the inbox failed.
+    let admitFailed: Action<ILogger, int64, int64, Exception | null> =
+        LoggerMessage.Define<int64, int64>(
+            LogLevel.Warning,
+            EventId(7, "AdmitFailed"),
+            "Admission failed for update {UpdateId} (chat {ChatId})"
+        )
+
+    /// Event id 8 — an update was denied by the whitelist.
+    let updateDenied: Action<ILogger, int64, string, Exception | null> =
+        LoggerMessage.Define<int64, string>(
+            LogLevel.Warning,
+            EventId(8, "UpdateDenied"),
+            "Update {UpdateId} denied: {Reason}"
+        )
+
+    /// Event id 9 — a photo attached to an update could not be downloaded.
+    let photoDownloadFailed: Action<ILogger, int64, Exception | null> =
+        LoggerMessage.Define<int64>(
+            LogLevel.Warning,
+            EventId(9, "PhotoDownloadFailed"),
+            "Photo download failed for update {UpdateId}"
+        )
