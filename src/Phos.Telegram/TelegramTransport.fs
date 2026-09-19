@@ -184,7 +184,7 @@ type TelegramTransport(config: TelegramConfig, ?logger: ILogger) =
     /// gate entirely so the steady-state update path never blocks. If hydration
     /// cannot resolve the peer either, the `NoCachedPeerException` propagates to
     /// the caller (typed, retryable at the caller's discretion).
-    let withPeer (chat: ChatId) (op: TL.InputPeer -> Task<'a>) : Task<'a> =
+    let withPeer (chat: ChatId) (op: TL.InputPeer -> Task<'A>) : Task<'A> =
         task {
             try
                 return! op (Transport.resolvePeer peers chat)

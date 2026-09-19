@@ -2178,11 +2178,11 @@ let ``collectBasicChats collects inputPeerChat for every returned group`` () =
 
     match candidates.TryGetValue 7L with
     | true, (:? TL.InputPeerChat as p) -> p.chat_id |> should equal 7L
-    | _ -> failwith "expected InputPeerChat candidate"
+    | _ -> failwith "expected InputPeerChat candidate for valid group"
 
     match candidates.TryGetValue 8L with
     | true, (:? TL.InputPeerChat as p) -> p.chat_id |> should equal 8L
-    | _ -> failwith "expected InputPeerChat candidate"
+    | _ -> failwith "expected InputPeerChat candidate for forbidden chat"
 
 [<Fact>]
 let ``cachePeers populates user and channel peers from updates`` () =
